@@ -1,8 +1,13 @@
-//! Pure-Rust geometry serialization and interchange (`.ofxg` native binary cache and Wavefront `.obj`).
+//! Pure-Rust geometry serialization and interchange (`.ofxg` native binary cache, Wavefront `.obj`,
+//! and STL import).
 //! Enforces finite-number validation, resource bounds, and BLAKE3 content integrity on ingress.
+
+mod stl;
 
 use pcc_geo::{AttrDomain, AttributeColumn, GeoDetail, GeoError, GroupDomain, PrimKind, PrimRun};
 use pcc_math::Vec3;
+
+pub use stl::from_stl_bytes;
 
 const OFXG_MAGIC: &[u8; 8] = b"OFXG\x01\x00\x00\x00";
 pub const DEFAULT_MAX_IO_ELEMENTS: usize = 10_000_000;

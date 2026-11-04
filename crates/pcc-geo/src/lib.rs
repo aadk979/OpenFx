@@ -389,6 +389,77 @@ impl AttributeColumn {
         }
     }
 
+    /// Joins two columns end to end, filling a missing side with zeros. Both sides must have the
+    /// same type where both exist.
+    fn concatenated(
+        first: Option<&Self>,
+        first_len: usize,
+        second: Option<&Self>,
+        second_len: usize,
+    ) -> Result<Self, GeoError> {
+        fn join<T: HashableValue>(
+            first: Option<&PagedColumn<T>>,
+            first_len: usize,
+            second: Option<&PagedColumn<T>>,
+            second_len: usize,
+            zero: T,
+        ) -> PagedColumn<T> {
+            let read = |column: Option<&PagedColumn<T>>, index: usize| {
+                column.and_then(|c| c.get(index)).unwrap_or(zero)
+            };
+            let mut values = Vec::with_capacity(first_len + second_len);
+            values.extend((0..first_len).map(|i| read(first, i)));
+            values.extend((0..second_len).map(|i| read(second, i)));
+            PagedColumn::from_vec(values)
+        }
+        let kind = first
+            .or(second)
+            .ok_or(GeoError::AttributeNotFound)?
+            .attr_type();
+        if first.is_some_and(|c| c.attr_type() != kind)
+            || second.is_some_and(|c| c.attr_type() != kind)
+        {
+            return Err(GeoError::AttributeTypeMismatch);
+        }
+        Ok(match kind {
+            AttrType::F32 => Self::F32(join(
+                first.and_then(Self::as_f32),
+                first_len,
+                second.and_then(Self::as_f32),
+                second_len,
+                FiniteF32::ZERO,
+            )),
+            AttrType::I32 => Self::I32(join(
+                first.and_then(Self::as_i32),
+                first_len,
+                second.and_then(Self::as_i32),
+                second_len,
+                0,
+            )),
+            AttrType::U32 => Self::U32(join(
+                first.and_then(Self::as_u32),
+                first_len,
+                second.and_then(Self::as_u32),
+                second_len,
+                0,
+            )),
+            AttrType::Bool => Self::Bool(join(
+                first.and_then(Self::as_bool),
+                first_len,
+                second.and_then(Self::as_bool),
+                second_len,
+                false,
+            )),
+            AttrType::Vec3 => Self::Vec3(join(
+                first.and_then(Self::as_vec3),
+                first_len,
+                second.and_then(Self::as_vec3),
+                second_len,
+                Vec3::ZERO,
+            )),
+        })
+    }
+
     /// Builds a new column holding `indices` of this one, in order.
     pub fn selected(&self, indices: &[usize]) -> Result<Self, GeoError> {
         fn pick<T: HashableValue>(
@@ -823,7 +894,7 @@ impl GeoDetail {
         }
         let base = Self::points(points);
         if self.prim_runs.is_empty() && other.prim_runs.is_empty() {
-            return Ok(base);
+            return base.with_merged_data(self, other);
         }
         let mut runs = Vec::with_capacity(self.prim_runs.len() + other.prim_runs.len());
         runs.extend_from_slice(&self.prim_runs);
@@ -855,7 +926,95 @@ impl GeoDetail {
                 vertex_points.push(shifted);
             }
         }
-        base.with_primitives(runs, vertex_points)
+        base.with_primitives(runs, vertex_points)?
+            .with_merged_data(self, other)
+    }
+
+    /// Fills in attributes and groups after a merge. Elements from the side lacking an attribute
+    /// read as zero and elements of a side lacking a group are unselected, while detail values come
+    /// from the first side that has them. An attribute must have one type on both sides.
+    fn with_merged_data(mut self, first: &Self, second: &Self) -> Result<Self, GeoError> {
+        let columns = |left: &BTreeMap<String, AttributeColumn>,
+                       right: &BTreeMap<String, AttributeColumn>,
+                       left_len: usize,
+                       right_len: usize|
+         -> Result<BTreeMap<String, AttributeColumn>, GeoError> {
+            let mut merged = BTreeMap::new();
+            for name in left.keys().chain(right.keys()) {
+                if !merged.contains_key(name) {
+                    let column = AttributeColumn::concatenated(
+                        left.get(name),
+                        left_len,
+                        right.get(name),
+                        right_len,
+                    )?;
+                    merged.insert(name.clone(), column);
+                }
+            }
+            Ok(merged)
+        };
+        self.point_attributes = Arc::new(columns(
+            &first.point_attributes,
+            &second.point_attributes,
+            first.len(),
+            second.len(),
+        )?);
+        self.vertex_attributes = Arc::new(columns(
+            &first.vertex_attributes,
+            &second.vertex_attributes,
+            first.vertex_count(),
+            second.vertex_count(),
+        )?);
+        self.prim_attributes = Arc::new(columns(
+            &first.prim_attributes,
+            &second.prim_attributes,
+            first.prim_count(),
+            second.prim_count(),
+        )?);
+        let mut detail = (*first.detail_attributes).clone();
+        for (name, column) in &*second.detail_attributes {
+            detail.entry(name.clone()).or_insert_with(|| column.clone());
+        }
+        self.detail_attributes = Arc::new(detail);
+        let groups = |left: &BTreeMap<String, ElementGroup>,
+                      right: &BTreeMap<String, ElementGroup>,
+                      left_len: usize,
+                      right_len: usize| {
+            let mut merged = BTreeMap::new();
+            for name in left.keys().chain(right.keys()) {
+                if merged.contains_key(name) {
+                    continue;
+                }
+                let selected = |group: Option<&ElementGroup>, index: usize| {
+                    group.is_some_and(|found| found.contains(index))
+                };
+                let mut mask = Vec::with_capacity(left_len + right_len);
+                mask.extend((0..left_len).map(|i| selected(left.get(name), i)));
+                mask.extend((0..right_len).map(|i| selected(right.get(name), i)));
+                let selected_count = mask.iter().filter(|&&selected| selected).count();
+                merged.insert(
+                    name.clone(),
+                    ElementGroup {
+                        mask: PagedColumn::from_vec(mask),
+                        selected_count,
+                    },
+                );
+            }
+            merged
+        };
+        self.point_groups = Arc::new(groups(
+            &first.point_groups,
+            &second.point_groups,
+            first.len(),
+            second.len(),
+        ));
+        self.prim_groups = Arc::new(groups(
+            &first.prim_groups,
+            &second.prim_groups,
+            first.prim_count(),
+            second.prim_count(),
+        ));
+        Ok(self)
     }
 
     #[must_use]
@@ -3199,6 +3358,127 @@ mod tests {
             TopologyIndex::build(&clean).non_manifold_vertex_count(&clean),
             0
         );
+        Ok(())
+    }
+
+    #[test]
+    fn merging_keeps_attributes_and_groups_from_both_sides() -> Result<(), GeoError> {
+        let triangle = |x: f32| -> Result<GeoDetail, GeoError> {
+            GeoDetail::points(vec![
+                Vec3::checked(x, 0.0, 0.0)?,
+                Vec3::checked(x + 1.0, 0.0, 0.0)?,
+                Vec3::checked(x, 1.0, 0.0)?,
+            ])
+            .with_primitives(
+                vec![PrimRun {
+                    kind: PrimKind::Polygon,
+                    arity: 3,
+                    prim_count: 1,
+                }],
+                vec![0, 1, 2],
+            )
+        };
+        let f32s = |values: Vec<f32>| AttributeColumn::f32_checked(values);
+        let left = triangle(0.0)?
+            .with_attribute("shared", f32s(vec![1.0, 2.0, 3.0])?)?
+            .with_attribute("left_only", AttributeColumn::i32_values(vec![7, 8, 9]))?
+            .with_domain_attribute(
+                AttrDomain::Prim,
+                "piece",
+                AttributeColumn::i32_values(vec![4]),
+            )?
+            .with_domain_attribute(
+                AttrDomain::Vertex,
+                "uv",
+                AttributeColumn::vec3_values(vec![Vec3::UP; 3]),
+            )?
+            .with_domain_attribute(
+                AttrDomain::Detail,
+                "note",
+                AttributeColumn::i32_values(vec![1]),
+            )?
+            .with_group(GroupDomain::Point, "picked", &[1])?;
+        let right = triangle(5.0)?
+            .with_attribute("shared", f32s(vec![4.0, 5.0, 6.0])?)?
+            .with_attribute("right_only", AttributeColumn::bool_values(vec![true; 3]))?
+            .with_domain_attribute(
+                AttrDomain::Prim,
+                "piece",
+                AttributeColumn::i32_values(vec![6]),
+            )?
+            .with_domain_attribute(
+                AttrDomain::Detail,
+                "note",
+                AttributeColumn::i32_values(vec![2]),
+            )?
+            .with_domain_attribute(
+                AttrDomain::Detail,
+                "extra",
+                AttributeColumn::i32_values(vec![3]),
+            )?
+            .with_group(GroupDomain::Prim, "hero", &[0])?;
+        let both = left.merged(&right, usize::MAX)?;
+        let shared = both.attribute("shared").and_then(AttributeColumn::as_f32);
+        let read = (0..6).map(|i| shared.and_then(|c| c.get(i)).map(|f| f.get()));
+        assert_eq!(
+            read.collect::<Vec<_>>(),
+            [1., 2., 3., 4., 5., 6.].map(Some).to_vec()
+        );
+        // Elements from the side lacking an attribute read as zero.
+        let only = both
+            .attribute("left_only")
+            .and_then(AttributeColumn::as_i32);
+        assert_eq!(only.and_then(|c| c.get(1)), Some(8));
+        assert_eq!(only.and_then(|c| c.get(4)), Some(0));
+        let only = both
+            .attribute("right_only")
+            .and_then(AttributeColumn::as_bool);
+        assert_eq!(only.and_then(|c| c.get(1)), Some(false));
+        assert_eq!(only.and_then(|c| c.get(4)), Some(true));
+        let piece = both
+            .domain_attribute(AttrDomain::Prim, "piece")
+            .and_then(AttributeColumn::as_i32);
+        assert_eq!(
+            (piece.and_then(|c| c.get(0)), piece.and_then(|c| c.get(1))),
+            (Some(4), Some(6))
+        );
+        let uv = both
+            .domain_attribute(AttrDomain::Vertex, "uv")
+            .and_then(AttributeColumn::as_vec3);
+        assert_eq!(uv.map(PagedColumn::len), Some(6));
+        assert_eq!(uv.and_then(|c| c.get(1)), Some(Vec3::UP));
+        assert_eq!(uv.and_then(|c| c.get(4)), Some(Vec3::ZERO));
+        // Detail values come from the first side that has them.
+        let detail = |name| {
+            both.domain_attribute(AttrDomain::Detail, name)
+                .and_then(AttributeColumn::as_i32)
+                .and_then(|c| c.get(0))
+        };
+        assert_eq!((detail("note"), detail("extra")), (Some(1), Some(3)));
+        let picked = both.group(GroupDomain::Point, "picked");
+        assert_eq!(picked.map(ElementGroup::selected_count), Some(1));
+        assert_eq!(
+            picked.map(|g| (g.contains(1), g.contains(4))),
+            Some((true, false))
+        );
+        let hero = both.group(GroupDomain::Prim, "hero");
+        assert_eq!(
+            hero.map(|g| (g.contains(0), g.contains(1))),
+            Some((false, true))
+        );
+
+        // One name with two types is an error, not a silent choice.
+        let conflict =
+            triangle(0.0)?.with_attribute("shared", AttributeColumn::i32_values(vec![1; 3]))?;
+        assert_eq!(
+            left.merged(&conflict, usize::MAX).err(),
+            Some(GeoError::AttributeTypeMismatch)
+        );
+        // Merging plain points keeps their attributes too.
+        let cloud = GeoDetail::points(vec![Vec3::ZERO]).with_attribute("mass", f32s(vec![2.5])?)?;
+        let clouds = cloud.merged(&cloud, usize::MAX)?;
+        let mass = clouds.attribute("mass").and_then(AttributeColumn::as_f32);
+        assert_eq!(mass.and_then(|c| c.get(1)).map(|f| f.get()), Some(2.5));
         Ok(())
     }
 }

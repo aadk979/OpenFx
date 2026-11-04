@@ -1,0 +1,12 @@
+[package]
+name = "pcc-sop"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+pcc-geo = { path = "../pcc-geo" }
+pcc-math = { path = "../pcc-math" }
+
+[lints]
+workspace = true

@@ -389,6 +389,26 @@ impl AttributeColumn {
         }
     }
 
+    /// Builds a new column holding `indices` of this one, in order.
+    pub fn selected(&self, indices: &[usize]) -> Result<Self, GeoError> {
+        fn pick<T: HashableValue>(
+            column: &PagedColumn<T>,
+            indices: &[usize],
+        ) -> Result<Vec<T>, GeoError> {
+            indices
+                .iter()
+                .map(|&index| column.get(index).ok_or(GeoError::IndexOutOfBounds))
+                .collect()
+        }
+        Ok(match self {
+            Self::F32(column) => Self::F32(PagedColumn::from_vec(pick(column, indices)?)),
+            Self::I32(column) => Self::I32(PagedColumn::from_vec(pick(column, indices)?)),
+            Self::U32(column) => Self::U32(PagedColumn::from_vec(pick(column, indices)?)),
+            Self::Bool(column) => Self::Bool(PagedColumn::from_vec(pick(column, indices)?)),
+            Self::Vec3(column) => Self::Vec3(PagedColumn::from_vec(pick(column, indices)?)),
+        })
+    }
+
     #[must_use]
     pub const fn as_f32(&self) -> Option<&PagedColumn<FiniteF32>> {
         match self {
@@ -1990,6 +2010,51 @@ impl GeoDetail {
             pages: Arc::from(pages),
             len: self.len(),
         };
+        Ok(next)
+    }
+
+    /// Replaces every point position while sharing topology, attributes, and groups.
+    pub fn with_positions(&self, positions: Vec<Vec3>) -> Result<Self, GeoError> {
+        if positions.len() != self.len() {
+            return Err(GeoError::AttributeLengthMismatch {
+                expected: self.len(),
+                actual: positions.len(),
+            });
+        }
+        let mut next = self.clone();
+        next.positions = PagedColumn::from_vec(positions);
+        Ok(next)
+    }
+
+    /// Reverses the vertex order of every polygon, flipping surface orientation. Vertex attributes
+    /// travel with their vertices; point and primitive data are shared. Polylines are unchanged.
+    pub fn with_reversed_winding(&self) -> Result<Self, GeoError> {
+        let mut order = Vec::with_capacity(self.vertex_count());
+        let mut cursor = 0usize;
+        for run in &*self.prim_runs {
+            let arity = run.arity as usize;
+            for _ in 0..run.prim_count {
+                match run.kind {
+                    PrimKind::Polygon => order.extend((cursor..cursor + arity).rev()),
+                    PrimKind::Polyline => order.extend(cursor..cursor + arity),
+                }
+                cursor += arity;
+            }
+        }
+        let mut vertex_points = Vec::with_capacity(order.len());
+        for &vertex in &order {
+            vertex_points.push(
+                self.vertex_point(vertex)
+                    .ok_or(GeoError::IndexOutOfBounds)?,
+            );
+        }
+        let mut vertex_attributes = BTreeMap::new();
+        for (name, column) in &*self.vertex_attributes {
+            vertex_attributes.insert(name.clone(), column.selected(&order)?);
+        }
+        let mut next = self.clone();
+        next.vertex_points = PagedColumn::from_vec(vertex_points);
+        next.vertex_attributes = Arc::new(vertex_attributes);
         Ok(next)
     }
 

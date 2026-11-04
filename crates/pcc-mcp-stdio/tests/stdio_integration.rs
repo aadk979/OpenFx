@@ -1069,3 +1069,171 @@ async fn stdio_transport_initialize_discover_probe_replace_and_conflict() {
 
     client.shutdown().await;
 }
+
+/// Sends one `tools/call` and returns its `result` object after checking the response id.
+async fn call_tool(client: &mut StdioClient, id: u64, name: &str, arguments: Value) -> Value {
+    let sent = client
+        .send(&json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": "tools/call",
+            "params": { "name": name, "arguments": arguments }
+        }))
+        .await;
+    assert!(sent.is_ok(), "{sent:?}");
+    let received = client.recv().await;
+    assert!(received.is_ok(), "{received:?}");
+    let response = received.unwrap_or(Value::Null);
+    assert_eq!(response["id"], id, "{response}");
+    response["result"].clone()
+}
+
+#[tokio::test]
+async fn agent_builds_fractures_and_verifies_a_solid_through_the_sop_operators() {
+    let client_res = StdioClient::spawn();
+    assert!(client_res.is_ok(), "{client_res:?}");
+    let Ok(mut client) = client_res else {
+        return;
+    };
+    assert!(
+        client
+            .send(&json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "initialize",
+                "params": {
+                    "protocolVersion": "2025-11-25",
+                    "capabilities": {},
+                    "clientInfo": { "name": "integration-test", "version": "0.1.0" }
+                }
+            }))
+            .await
+            .is_ok()
+    );
+    assert!(client.recv().await.is_ok());
+    assert!(
+        client
+            .send(&json!({ "jsonrpc": "2.0", "method": "notifications/initialized" }))
+            .await
+            .is_ok()
+    );
+
+    // An agent discovers the new operators and their typed parameters through the catalog.
+    let catalog = call_tool(
+        &mut client,
+        2,
+        "node_catalog_search",
+        json!({ "query": "fracture" }),
+    )
+    .await;
+    let found =
+        serde_json::from_value::<NodeCatalogSearchResponse>(catalog["structuredContent"].clone());
+    assert!(found.is_ok(), "{found:?}");
+    if let Ok(found) = found {
+        assert!(
+            found
+                .node_types
+                .iter()
+                .any(|node| node.type_name == "voronoifracture")
+        );
+    }
+    let remesh = call_tool(
+        &mut client,
+        3,
+        "node_type_inspect",
+        json!({ "type_name": "remesh" }),
+    )
+    .await;
+    let params = &remesh["structuredContent"]["params"];
+    assert_eq!(params.as_array().map(Vec::len), Some(3), "{remesh}");
+    assert_eq!(params[0]["name"], "target_length");
+
+    // Sphere -> remesh -> decimate, then fracture from surface-scattered seeds pulled inward.
+    let node_id = pcc_id::NodeId;
+    let unit = |value: f32| Vec3::checked(value, value, value).unwrap_or(Vec3::ZERO);
+    let scene = GraphSnapshot {
+        revision: RevisionId(1),
+        nodes: vec![
+            pcc_graph::Node::CreateSphere {
+                id: node_id(1),
+                radius: 1.0,
+                rows: 16,
+                cols: 24,
+            },
+            pcc_graph::Node::Remesh {
+                id: node_id(2),
+                input: node_id(1),
+                target_length: 0.25,
+                iterations: 3,
+                feature_angle_degrees: 90.0,
+            },
+            pcc_graph::Node::PolyReduce {
+                id: node_id(3),
+                input: node_id(2),
+                target_ratio: 0.5,
+            },
+            pcc_graph::Node::ScatterSurface {
+                id: node_id(4),
+                input: node_id(1),
+                count: 8,
+                seed: 21,
+                min_distance: 0.4,
+            },
+            pcc_graph::Node::Xform {
+                id: node_id(5),
+                input: node_id(4),
+                translate: Vec3::ZERO,
+                rotate_degrees: Vec3::ZERO,
+                scale: unit(0.6),
+            },
+            pcc_graph::Node::VoronoiFracture {
+                id: node_id(6),
+                input: node_id(3),
+                seeds: node_id(5),
+            },
+        ],
+    };
+    let replaced = call_tool(
+        &mut client,
+        4,
+        "replace_scene",
+        json!({ "base_revision": 1, "ofxs": scene.to_ofxs() }),
+    )
+    .await;
+    assert_eq!(replaced["isError"], false, "{replaced}");
+    assert_eq!(replaced["structuredContent"]["committed_revision"], 2);
+
+    // Every shard is closed, and together they keep the volume of a unit sphere within tolerance.
+    let report = call_tool(
+        &mut client,
+        5,
+        "geo_assert_invariants",
+        json!({
+            "frame_numerator": 0,
+            "frame_denominator": 24,
+            "spec": {
+                "min_prims": 100,
+                "require_closed_manifold": true,
+                "expected_volume": 4.18879,
+                "volume_tolerance": 0.2
+            }
+        }),
+    )
+    .await;
+    assert_eq!(report["isError"], false, "{report}");
+    let parsed = serde_json::from_value::<GeoInvariantReport>(report["structuredContent"].clone());
+    assert!(parsed.is_ok(), "{parsed:?}");
+    if let Ok(parsed) = parsed {
+        assert!(parsed.passed, "violations: {:?}", parsed.violations);
+        assert_eq!(parsed.probe.revision, RevisionId(2));
+        assert!(
+            parsed
+                .probe
+                .point_attributes
+                .iter()
+                .any(|name| name == "piece")
+        );
+    }
+
+    client.shutdown().await;
+}

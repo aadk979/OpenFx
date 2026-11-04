@@ -9,6 +9,7 @@ pcc-graph = { path = "../pcc-graph" }
 pcc-id = { path = "../pcc-id" }
 blake3.workspace = true
 pcc-math = { path = "../pcc-math" }
+pcc-sop = { path = "../pcc-sop" }
 pcc-terrain = { path = "../pcc-terrain" }
 pcc-vdb = { path = "../pcc-vdb" }
 pcc-vex = { path = "../pcc-vex" }

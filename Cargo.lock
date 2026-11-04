@@ -397,6 +397,7 @@ dependencies = [
  "pcc-graph",
  "pcc-id",
  "pcc-math",
+ "pcc-sop",
  "pcc-terrain",
  "pcc-vdb",
  "pcc-vex",
@@ -475,6 +476,14 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
+]
+
+[[package]]
+name = "pcc-sop"
+version = "0.1.0"
+dependencies = [
+ "pcc-geo",
+ "pcc-math",
 ]
 
 [[package]]

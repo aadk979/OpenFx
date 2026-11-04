@@ -1,12 +1,18 @@
 //! Deterministic DAG evaluator with whole-graph and per-node content-addressed caching
 //! and early cutoff.
 use pcc_geo::{
-    AttrDomain as GeoAttrDomain, AttributeColumn, GeoDetail, GeoError, PAGE_LEN, PrimKind, PrimRun,
-    PromoteMode as GeoPromoteMode, UvProjectMode as GeoUvProjectMode,
+    AttrDomain as GeoAttrDomain, AttributeColumn, GeoDetail, GeoError, GroupDomain, PAGE_LEN,
+    PrimKind, PrimRun, PromoteMode as GeoPromoteMode, UvProjectMode as GeoUvProjectMode,
 };
 use pcc_graph::{AttrDomain, BooleanMode, GraphSnapshot, Node, PromoteMode, UvProjectMode};
 use pcc_id::{NodeId, RevisionId};
 use pcc_math::{Philox4x32, Vec3};
+use pcc_sop::{
+    RemeshParams, SopContext, SurfaceScatter, Trs, attrib_transfer, clip_halfspace, create_line,
+    create_sphere, create_torus, create_tube, fuse_points, measure, poly_bevel, poly_reduce,
+    remesh, resample_curves, reverse_winding, scatter_surface, sweep_curves, transform_trs,
+    triangulate, uv_flatten, uv_layout, voronoi_fracture,
+};
 use pcc_terrain::{HeightField, HfErodeParams, HfNoiseParams};
 use pcc_vdb::{VdbCombineOp, VdbGrid, boolean_meshes_cancellable};
 use pcc_vex::{DEFAULT_MAX_FUEL_PER_POINT, VexError, compile_vex};
@@ -259,6 +265,170 @@ impl CookCache {
                 let canonical = if *voxel_size == 0.0 { 0.0 } else { *voxel_size };
                 hasher.update(&canonical.to_bits().to_le_bytes());
             }
+            Node::CreateSphere {
+                radius, rows, cols, ..
+            } => {
+                hasher.update(b"sphere");
+                hash_f32s(&mut hasher, &[*radius]);
+                hasher.update(&rows.to_le_bytes());
+                hasher.update(&cols.to_le_bytes());
+            }
+            Node::CreateTube {
+                radius,
+                height,
+                rows,
+                cols,
+                ..
+            } => {
+                hasher.update(b"tube");
+                hash_f32s(&mut hasher, &[*radius]);
+                hash_f32s(&mut hasher, &[*height]);
+                hasher.update(&rows.to_le_bytes());
+                hasher.update(&cols.to_le_bytes());
+            }
+            Node::CreateTorus {
+                major_radius,
+                minor_radius,
+                rows,
+                cols,
+                ..
+            } => {
+                hasher.update(b"torus");
+                hash_f32s(&mut hasher, &[*major_radius]);
+                hash_f32s(&mut hasher, &[*minor_radius]);
+                hasher.update(&rows.to_le_bytes());
+                hasher.update(&cols.to_le_bytes());
+            }
+            Node::CreateLine {
+                start, end, points, ..
+            } => {
+                hasher.update(b"line");
+                hash_f32s(&mut hasher, &[start.x, start.y, start.z]);
+                hash_f32s(&mut hasher, &[end.x, end.y, end.z]);
+                hasher.update(&points.to_le_bytes());
+            }
+            Node::Xform {
+                translate,
+                rotate_degrees,
+                scale,
+                ..
+            } => {
+                hasher.update(b"xform");
+                hash_f32s(&mut hasher, &[translate.x, translate.y, translate.z]);
+                hash_f32s(
+                    &mut hasher,
+                    &[rotate_degrees.x, rotate_degrees.y, rotate_degrees.z],
+                );
+                hash_f32s(&mut hasher, &[scale.x, scale.y, scale.z]);
+            }
+            Node::Reverse { .. } => {
+                hasher.update(b"reverse");
+            }
+            Node::Triangulate { .. } => {
+                hasher.update(b"triangulate");
+            }
+            Node::Fuse { distance, .. } => {
+                hasher.update(b"fuse");
+                hash_f32s(&mut hasher, &[*distance]);
+            }
+            Node::GroupBounds {
+                group_name,
+                domain,
+                min,
+                max,
+                ..
+            } => {
+                hasher.update(b"group_bounds");
+                hasher.update(&(group_name.len() as u64).to_le_bytes());
+                hasher.update(group_name.as_bytes());
+                hasher.update(domain.as_str().as_bytes());
+                hash_f32s(&mut hasher, &[min.x, min.y, min.z]);
+                hash_f32s(&mut hasher, &[max.x, max.y, max.z]);
+            }
+            Node::Resample { segment_length, .. } => {
+                hasher.update(b"resample");
+                hash_f32s(&mut hasher, &[*segment_length]);
+            }
+            Node::Sweep {
+                radius,
+                sides,
+                capped,
+                ..
+            } => {
+                hasher.update(b"sweep");
+                hash_f32s(&mut hasher, &[*radius]);
+                hasher.update(&sides.to_le_bytes());
+                hasher.update(&[u8::from(*capped)]);
+            }
+            Node::AttribTransfer { name, radius, .. } => {
+                hasher.update(b"attribtransfer");
+                hasher.update(&(name.len() as u64).to_le_bytes());
+                hasher.update(name.as_bytes());
+                hash_f32s(&mut hasher, &[*radius]);
+            }
+            Node::Measure { .. } => {
+                hasher.update(b"measure");
+            }
+            Node::PolyBevel {
+                distance,
+                min_angle_degrees,
+                ..
+            } => {
+                hasher.update(b"polybevel");
+                hash_f32s(&mut hasher, &[*distance]);
+                hash_f32s(&mut hasher, &[*min_angle_degrees]);
+            }
+            Node::PolyReduce { target_ratio, .. } => {
+                hasher.update(b"polyreduce");
+                hash_f32s(&mut hasher, &[*target_ratio]);
+            }
+            Node::Remesh {
+                target_length,
+                iterations,
+                feature_angle_degrees,
+                ..
+            } => {
+                hasher.update(b"remesh");
+                hash_f32s(&mut hasher, &[*target_length]);
+                hasher.update(&iterations.to_le_bytes());
+                hash_f32s(&mut hasher, &[*feature_angle_degrees]);
+            }
+            Node::Clip {
+                origin,
+                normal,
+                cap,
+                ..
+            } => {
+                hasher.update(b"clip");
+                hash_f32s(&mut hasher, &[origin.x, origin.y, origin.z]);
+                hash_f32s(&mut hasher, &[normal.x, normal.y, normal.z]);
+                hasher.update(&[u8::from(*cap)]);
+            }
+            Node::VoronoiFracture { .. } => {
+                hasher.update(b"voronoifracture");
+            }
+            Node::ScatterSurface {
+                count,
+                seed,
+                min_distance,
+                ..
+            } => {
+                hasher.update(b"scatter_surface");
+                hasher.update(&count.to_le_bytes());
+                hasher.update(&seed.to_le_bytes());
+                hash_f32s(&mut hasher, &[*min_distance]);
+            }
+            Node::UvFlatten {
+                seam_angle_degrees, ..
+            } => {
+                hasher.update(b"uvflatten");
+                hash_f32s(&mut hasher, &[*seam_angle_degrees]);
+            }
+            Node::UvLayout { padding, tiles, .. } => {
+                hasher.update(b"uvlayout");
+                hash_f32s(&mut hasher, &[*padding]);
+                hasher.update(&tiles.to_le_bytes());
+            }
         }
         hasher.update(&(upstream_hashes.len() as u64).to_le_bytes());
         for upstream in upstream_hashes {
@@ -376,6 +546,39 @@ where
 {
     let arc_geo = eval_dag(snapshot, None, None, 0, 1, ctx, &mut on_progress)?;
     Ok(Arc::try_unwrap(arc_geo).unwrap_or_else(|shared| (*shared).clone()))
+}
+
+/// Hashes floats with negative zero canonicalized, matching the `.ofxs` text form.
+fn hash_f32s(hasher: &mut blake3::Hasher, values: &[f32]) {
+    for &value in values {
+        let canonical = if value == 0.0 { 0.0 } else { value };
+        hasher.update(&canonical.to_bits().to_le_bytes());
+    }
+}
+
+/// Rejects a generator's requested size before any allocation.
+fn check_element_estimate(requested: u32, ctx: &EvalContext<'_>) -> Result<(), EvalError> {
+    if requested > ctx.budget.max_elements {
+        return Err(EvalError::ElementLimit {
+            requested,
+            limit: ctx.budget.max_elements,
+        });
+    }
+    Ok(())
+}
+
+/// Maps operator errors onto evaluator errors and enforces the element budget on the output.
+fn finish_sop(
+    result: Result<GeoDetail, GeoError>,
+    ctx: &EvalContext<'_>,
+) -> Result<GeoDetail, EvalError> {
+    let geo = result.map_err(|error| match error {
+        GeoError::Cancelled => EvalError::Cancelled,
+        other => EvalError::Resource(other),
+    })?;
+    let elements = u32::try_from(geo.len()).unwrap_or(u32::MAX);
+    check_element_estimate(elements, ctx)?;
+    Ok(geo)
 }
 
 fn eval_single_node(
@@ -1113,6 +1316,286 @@ fn eval_single_node(
             }
             Ok(out)
         }
+        Node::CreateSphere {
+            radius, rows, cols, ..
+        } => {
+            check_element_estimate(rows.saturating_mul(*cols), ctx)?;
+            let sop = SopContext::new(ctx.budget.max_memory_bytes, ctx.cancelled);
+            finish_sop(create_sphere(f64::from(*radius), *rows, *cols, &sop), ctx)
+        }
+        Node::CreateTube {
+            radius,
+            height,
+            rows,
+            cols,
+            ..
+        } => {
+            check_element_estimate(rows.saturating_add(1).saturating_mul(*cols), ctx)?;
+            let sop = SopContext::new(ctx.budget.max_memory_bytes, ctx.cancelled);
+            finish_sop(
+                create_tube(f64::from(*radius), f64::from(*height), *rows, *cols, &sop),
+                ctx,
+            )
+        }
+        Node::CreateTorus {
+            major_radius,
+            minor_radius,
+            rows,
+            cols,
+            ..
+        } => {
+            check_element_estimate(rows.saturating_mul(*cols), ctx)?;
+            let sop = SopContext::new(ctx.budget.max_memory_bytes, ctx.cancelled);
+            finish_sop(
+                create_torus(
+                    f64::from(*major_radius),
+                    f64::from(*minor_radius),
+                    *rows,
+                    *cols,
+                    &sop,
+                ),
+                ctx,
+            )
+        }
+        Node::CreateLine {
+            start, end, points, ..
+        } => {
+            check_element_estimate(*points, ctx)?;
+            let sop = SopContext::new(ctx.budget.max_memory_bytes, ctx.cancelled);
+            finish_sop(create_line(*start, *end, *points, &sop), ctx)
+        }
+        Node::Xform {
+            input,
+            translate,
+            rotate_degrees,
+            scale,
+            ..
+        } => {
+            let input_geo = outputs.get(input).ok_or(EvalError::InvalidGraph)?;
+            let sop = SopContext::new(ctx.budget.max_memory_bytes, ctx.cancelled);
+            finish_sop(
+                transform_trs(
+                    input_geo,
+                    &Trs {
+                        translate: *translate,
+                        rotate_degrees: *rotate_degrees,
+                        scale: *scale,
+                    },
+                    &sop,
+                ),
+                ctx,
+            )
+        }
+        Node::Reverse { input, .. } => {
+            let input_geo = outputs.get(input).ok_or(EvalError::InvalidGraph)?;
+            let sop = SopContext::new(ctx.budget.max_memory_bytes, ctx.cancelled);
+            finish_sop(reverse_winding(input_geo, &sop), ctx)
+        }
+        Node::Triangulate { input, .. } => {
+            let input_geo = outputs.get(input).ok_or(EvalError::InvalidGraph)?;
+            let sop = SopContext::new(ctx.budget.max_memory_bytes, ctx.cancelled);
+            finish_sop(triangulate(input_geo, &sop), ctx)
+        }
+        Node::Fuse {
+            input, distance, ..
+        } => {
+            let input_geo = outputs.get(input).ok_or(EvalError::InvalidGraph)?;
+            let sop = SopContext::new(ctx.budget.max_memory_bytes, ctx.cancelled);
+            finish_sop(fuse_points(input_geo, f64::from(*distance), &sop), ctx)
+        }
+        Node::Resample {
+            input,
+            segment_length,
+            ..
+        } => {
+            let input_geo = outputs.get(input).ok_or(EvalError::InvalidGraph)?;
+            let sop = SopContext::new(ctx.budget.max_memory_bytes, ctx.cancelled);
+            finish_sop(
+                resample_curves(input_geo, f64::from(*segment_length), &sop),
+                ctx,
+            )
+        }
+        Node::Sweep {
+            input,
+            radius,
+            sides,
+            capped,
+            ..
+        } => {
+            let input_geo = outputs.get(input).ok_or(EvalError::InvalidGraph)?;
+            let sop = SopContext::new(ctx.budget.max_memory_bytes, ctx.cancelled);
+            finish_sop(
+                sweep_curves(input_geo, f64::from(*radius), *sides, *capped, &sop),
+                ctx,
+            )
+        }
+        Node::AttribTransfer {
+            input,
+            source,
+            name,
+            radius,
+            ..
+        } => {
+            let input_geo = outputs.get(input).ok_or(EvalError::InvalidGraph)?;
+            let source_geo = outputs.get(source).ok_or(EvalError::InvalidGraph)?;
+            let sop = SopContext::new(ctx.budget.max_memory_bytes, ctx.cancelled);
+            finish_sop(
+                attrib_transfer(input_geo, source_geo, name, f64::from(*radius), &sop),
+                ctx,
+            )
+        }
+        Node::Measure { input, .. } => {
+            let input_geo = outputs.get(input).ok_or(EvalError::InvalidGraph)?;
+            let sop = SopContext::new(ctx.budget.max_memory_bytes, ctx.cancelled);
+            finish_sop(measure(input_geo, &sop), ctx)
+        }
+        Node::PolyBevel {
+            input,
+            distance,
+            min_angle_degrees,
+            ..
+        } => {
+            let input_geo = outputs.get(input).ok_or(EvalError::InvalidGraph)?;
+            let sop = SopContext::new(ctx.budget.max_memory_bytes, ctx.cancelled);
+            finish_sop(
+                poly_bevel(
+                    input_geo,
+                    f64::from(*distance),
+                    f64::from(*min_angle_degrees),
+                    &sop,
+                ),
+                ctx,
+            )
+        }
+        Node::PolyReduce {
+            input,
+            target_ratio,
+            ..
+        } => {
+            let input_geo = outputs.get(input).ok_or(EvalError::InvalidGraph)?;
+            let sop = SopContext::new(ctx.budget.max_memory_bytes, ctx.cancelled);
+            finish_sop(poly_reduce(input_geo, f64::from(*target_ratio), &sop), ctx)
+        }
+        Node::Remesh {
+            input,
+            target_length,
+            iterations,
+            feature_angle_degrees,
+            ..
+        } => {
+            let input_geo = outputs.get(input).ok_or(EvalError::InvalidGraph)?;
+            let sop = SopContext::new(ctx.budget.max_memory_bytes, ctx.cancelled);
+            finish_sop(
+                remesh(
+                    input_geo,
+                    &RemeshParams {
+                        target_length: f64::from(*target_length),
+                        iterations: *iterations,
+                        feature_angle_degrees: f64::from(*feature_angle_degrees),
+                    },
+                    &sop,
+                ),
+                ctx,
+            )
+        }
+        Node::Clip {
+            input,
+            origin,
+            normal,
+            cap,
+            ..
+        } => {
+            let input_geo = outputs.get(input).ok_or(EvalError::InvalidGraph)?;
+            let sop = SopContext::new(ctx.budget.max_memory_bytes, ctx.cancelled);
+            finish_sop(
+                clip_halfspace(
+                    input_geo,
+                    [
+                        f64::from(origin.x),
+                        f64::from(origin.y),
+                        f64::from(origin.z),
+                    ],
+                    [
+                        f64::from(normal.x),
+                        f64::from(normal.y),
+                        f64::from(normal.z),
+                    ],
+                    *cap,
+                    &sop,
+                ),
+                ctx,
+            )
+        }
+        Node::VoronoiFracture { input, seeds, .. } => {
+            let input_geo = outputs.get(input).ok_or(EvalError::InvalidGraph)?;
+            let seeds_geo = outputs.get(seeds).ok_or(EvalError::InvalidGraph)?;
+            let sop = SopContext::new(ctx.budget.max_memory_bytes, ctx.cancelled);
+            finish_sop(voronoi_fracture(input_geo, seeds_geo, &sop), ctx)
+        }
+        Node::ScatterSurface {
+            input,
+            count,
+            seed,
+            min_distance,
+            ..
+        } => {
+            check_element_estimate(*count, ctx)?;
+            let input_geo = outputs.get(input).ok_or(EvalError::InvalidGraph)?;
+            let sop = SopContext::new(ctx.budget.max_memory_bytes, ctx.cancelled);
+            finish_sop(
+                scatter_surface(
+                    input_geo,
+                    &SurfaceScatter {
+                        count: *count,
+                        seed: *seed,
+                        min_distance: f64::from(*min_distance),
+                    },
+                    &sop,
+                ),
+                ctx,
+            )
+        }
+        Node::UvFlatten {
+            input,
+            seam_angle_degrees,
+            ..
+        } => {
+            let input_geo = outputs.get(input).ok_or(EvalError::InvalidGraph)?;
+            let sop = SopContext::new(ctx.budget.max_memory_bytes, ctx.cancelled);
+            finish_sop(
+                uv_flatten(input_geo, f64::from(*seam_angle_degrees), &sop),
+                ctx,
+            )
+        }
+        Node::UvLayout {
+            input,
+            padding,
+            tiles,
+            ..
+        } => {
+            let input_geo = outputs.get(input).ok_or(EvalError::InvalidGraph)?;
+            let sop = SopContext::new(ctx.budget.max_memory_bytes, ctx.cancelled);
+            finish_sop(uv_layout(input_geo, f64::from(*padding), *tiles, &sop), ctx)
+        }
+        Node::GroupBounds {
+            input,
+            group_name,
+            domain,
+            min,
+            max,
+            ..
+        } => {
+            let input_geo = outputs.get(input).ok_or(EvalError::InvalidGraph)?;
+            let group_domain = match domain {
+                AttrDomain::Point => GroupDomain::Point,
+                AttrDomain::Prim => GroupDomain::Prim,
+                AttrDomain::Detail => return Err(EvalError::InvalidGraph),
+            };
+            finish_sop(
+                input_geo.group_by_bounds(group_domain, group_name.as_str(), *min, *max),
+                ctx,
+            )
+        }
     }
 }
 
@@ -1814,5 +2297,391 @@ mod tests {
             assert!(boolean_out.topology_index().is_closed_manifold());
             assert!(boolean_out.enclosed_volume() > 8.0);
         }
+    }
+    fn sop_ctx(cancelled: &AtomicBool) -> EvalContext<'_> {
+        EvalContext {
+            cancelled,
+            budget: CookBudget {
+                max_memory_bytes: 256 << 20,
+                max_elements: 2_000_000,
+            },
+        }
+    }
+
+    fn v3(x: f32, y: f32, z: f32) -> Vec3 {
+        Vec3 { x, y, z }
+    }
+
+    /// Cooks one node, turning every failure into a readable test failure message.
+    fn cook_at(
+        cache: &CookCache,
+        snapshot: &GraphSnapshot,
+        id: u64,
+        ctx: &EvalContext<'_>,
+    ) -> Result<Arc<GeoDetail>, String> {
+        cook_node_cached(cache, snapshot, NodeId(id), 0, 1, ctx)
+            .map_err(|error| format!("node {id}: {error:?}"))
+    }
+
+    #[test]
+    fn hard_surface_pipeline_keeps_solids_closed_and_volumes_consistent() -> Result<(), String> {
+        let cancelled = AtomicBool::new(false);
+        let ctx = sop_ctx(&cancelled);
+        let cache = CookCache::default();
+        let snapshot = GraphSnapshot {
+            revision: RevisionId(1),
+            nodes: vec![
+                Node::CreateTube {
+                    id: NodeId(1),
+                    radius: 1.0,
+                    height: 2.0,
+                    rows: 1,
+                    cols: 32,
+                },
+                Node::PolyBevel {
+                    id: NodeId(2),
+                    input: NodeId(1),
+                    distance: 0.05,
+                    min_angle_degrees: 45.0,
+                },
+                Node::Xform {
+                    id: NodeId(3),
+                    input: NodeId(2),
+                    translate: v3(0.0, 1.0, 0.0),
+                    rotate_degrees: v3(0.0, 30.0, 0.0),
+                    scale: v3(1.0, 1.0, 1.0),
+                },
+                Node::Clip {
+                    id: NodeId(4),
+                    input: NodeId(3),
+                    origin: v3(0.0, 1.0, 0.0),
+                    normal: v3(0.0, 1.0, 0.0),
+                    cap: true,
+                },
+                Node::Triangulate {
+                    id: NodeId(5),
+                    input: NodeId(4),
+                },
+                Node::Fuse {
+                    id: NodeId(6),
+                    input: NodeId(5),
+                    distance: 1e-5,
+                },
+                Node::PolyReduce {
+                    id: NodeId(7),
+                    input: NodeId(6),
+                    target_ratio: 0.5,
+                },
+                Node::Remesh {
+                    id: NodeId(8),
+                    input: NodeId(7),
+                    target_length: 0.25,
+                    iterations: 3,
+                    feature_angle_degrees: 30.0,
+                },
+                Node::UvFlatten {
+                    id: NodeId(9),
+                    input: NodeId(8),
+                    seam_angle_degrees: 60.0,
+                },
+                Node::UvLayout {
+                    id: NodeId(10),
+                    input: NodeId(9),
+                    padding: 0.01,
+                    tiles: 2,
+                },
+                Node::Measure {
+                    id: NodeId(11),
+                    input: NodeId(10),
+                },
+            ],
+        };
+        let volume = |id| -> Result<f64, String> {
+            let geo = cook_at(&cache, &snapshot, id, &ctx)?;
+            assert!(
+                geo.topology_index().is_closed_manifold(),
+                "node {id} is not closed"
+            );
+            Ok(pcc_sop::signed_volume(&geo))
+        };
+        let tube = volume(1)?;
+        let bevelled = volume(2)?;
+        assert!(
+            bevelled < tube && bevelled > 0.97 * tube,
+            "{bevelled} vs {tube}"
+        );
+        // A rigid transform preserves volume, and the mid-plane clip keeps exactly half.
+        assert!((volume(3)? - bevelled).abs() < 1e-4 * bevelled);
+        let half = volume(4)?;
+        assert!(
+            (half - bevelled / 2.0).abs() < 1e-3 * bevelled,
+            "{half} vs {bevelled}"
+        );
+        assert!((volume(5)? - half).abs() < 1e-5);
+        let reduced = volume(7)?;
+        assert!((reduced - half).abs() < 0.02 * half, "{reduced} vs {half}");
+        let remeshed = volume(8)?;
+        assert!(
+            (remeshed - half).abs() < 0.03 * half,
+            "{remeshed} vs {half}"
+        );
+
+        let measured = cook_at(&cache, &snapshot, 11, &ctx)?;
+        assert!(
+            measured
+                .domain_attribute(GeoAttrDomain::Vertex, "uv")
+                .is_some()
+        );
+        assert!(
+            measured
+                .domain_attribute(GeoAttrDomain::Prim, "uv_island")
+                .is_some()
+        );
+        let total = measured
+            .domain_attribute(GeoAttrDomain::Detail, "total_volume")
+            .and_then(AttributeColumn::as_f32)
+            .and_then(|column| column.get(0))
+            .map(|value| f64::from(value.get()));
+        assert_eq!(
+            total.map(|t| (t - remeshed).abs() < 1e-3),
+            Some(true),
+            "{total:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn scattered_seeds_fracture_a_sphere_conserving_volume() -> Result<(), String> {
+        let cancelled = AtomicBool::new(false);
+        let ctx = sop_ctx(&cancelled);
+        let cache = CookCache::default();
+        let snapshot = GraphSnapshot {
+            revision: RevisionId(1),
+            nodes: vec![
+                Node::CreateSphere {
+                    id: NodeId(1),
+                    radius: 1.0,
+                    rows: 16,
+                    cols: 24,
+                },
+                Node::ScatterSurface {
+                    id: NodeId(2),
+                    input: NodeId(1),
+                    count: 12,
+                    seed: 5,
+                    min_distance: 0.3,
+                },
+                Node::Xform {
+                    id: NodeId(3),
+                    input: NodeId(2),
+                    translate: Vec3::ZERO,
+                    rotate_degrees: Vec3::ZERO,
+                    scale: v3(0.7, 0.7, 0.7),
+                },
+                Node::VoronoiFracture {
+                    id: NodeId(4),
+                    input: NodeId(1),
+                    seeds: NodeId(3),
+                },
+            ],
+        };
+        let whole = pcc_sop::signed_volume(&*cook_at(&cache, &snapshot, 1, &ctx)?);
+        let seeds = cook_at(&cache, &snapshot, 3, &ctx)?;
+        assert_eq!(seeds.len(), 12);
+        let shards = cook_at(&cache, &snapshot, 4, &ctx)?;
+        assert!(shards.topology_index().is_closed_manifold());
+        let total = pcc_sop::signed_volume(&shards);
+        assert!((total - whole).abs() < 1e-3 * whole, "{total} vs {whole}");
+        Ok(())
+    }
+
+    #[test]
+    fn curves_groups_and_attribute_transfer_compose_in_one_graph() -> Result<(), String> {
+        let cancelled = AtomicBool::new(false);
+        let ctx = sop_ctx(&cancelled);
+        let cache = CookCache::default();
+        let snapshot = GraphSnapshot {
+            revision: RevisionId(1),
+            nodes: vec![
+                Node::CreateLine {
+                    id: NodeId(1),
+                    start: Vec3::ZERO,
+                    end: v3(0.0, 4.0, 0.0),
+                    points: 2,
+                },
+                Node::Resample {
+                    id: NodeId(2),
+                    input: NodeId(1),
+                    segment_length: 0.5,
+                },
+                Node::Sweep {
+                    id: NodeId(3),
+                    input: NodeId(2),
+                    radius: 0.25,
+                    sides: 8,
+                    capped: true,
+                },
+                Node::PointWrangle {
+                    id: NodeId(4),
+                    input: NodeId(3),
+                    snippet: "@heat = @P.y;".to_owned(),
+                },
+                Node::CreateSphere {
+                    id: NodeId(5),
+                    radius: 3.0,
+                    rows: 16,
+                    cols: 24,
+                },
+                Node::AttribTransfer {
+                    id: NodeId(6),
+                    input: NodeId(5),
+                    source: NodeId(4),
+                    name: "heat".to_owned(),
+                    radius: 2.0,
+                },
+                Node::GroupBounds {
+                    id: NodeId(7),
+                    input: NodeId(6),
+                    group_name: "upper".to_owned(),
+                    domain: AttrDomain::Prim,
+                    min: v3(-4.0, 0.0, -4.0),
+                    max: v3(4.0, 4.0, 4.0),
+                },
+                Node::Blast {
+                    id: NodeId(8),
+                    input: NodeId(7),
+                    group_name: "upper".to_owned(),
+                    negate: false,
+                },
+            ],
+        };
+        let resampled = cook_at(&cache, &snapshot, 2, &ctx)?;
+        assert_eq!(resampled.len(), 9);
+        let tube = cook_at(&cache, &snapshot, 3, &ctx)?;
+        assert_eq!(tube.len(), 9 * 8);
+        assert!(tube.topology_index().is_closed_manifold());
+        let transferred = cook_at(&cache, &snapshot, 6, &ctx)?;
+        let heat = transferred
+            .attribute("heat")
+            .and_then(AttributeColumn::as_f32)
+            .ok_or("heat was not transferred")?;
+        // Top pole (y=3) is near the tube's upper end; bottom pole (y=-3) has no source in range.
+        let top = heat.get(0).map(|value| value.get()).unwrap_or(0.0);
+        assert!(top > 2.5 && top < 4.0, "top heat {top}");
+        let bottom = heat
+            .get(transferred.len() - 1)
+            .map(|value| value.get())
+            .unwrap_or(1.0);
+        assert_eq!(bottom, 0.0);
+        let blasted = cook_at(&cache, &snapshot, 8, &ctx)?;
+        assert!(blasted.prim_count() > 0 && blasted.prim_count() < transferred.prim_count());
+        let (_, high) = blasted.bounds().ok_or("no bounds")?;
+        assert!(high.y < 0.5, "upper half survived: {high:?}");
+        Ok(())
+    }
+
+    #[test]
+    fn sop_nodes_share_the_cache_contract_and_budgets() -> Result<(), String> {
+        let cancelled = AtomicBool::new(false);
+        let ctx = sop_ctx(&cancelled);
+        let cache = CookCache::default();
+        let graph = |ratio: f32| GraphSnapshot {
+            revision: RevisionId(1),
+            nodes: vec![
+                Node::CreateSphere {
+                    id: NodeId(1),
+                    radius: 1.0,
+                    rows: 12,
+                    cols: 16,
+                },
+                Node::PolyReduce {
+                    id: NodeId(2),
+                    input: NodeId(1),
+                    target_ratio: ratio,
+                },
+            ],
+        };
+        let first = cook_at(&cache, &graph(0.5), 2, &ctx)?;
+        let hits_before = cache.node_cache_hits();
+        let again = cook_at(&cache, &graph(0.5), 2, &ctx)?;
+        assert_eq!(first.hash(), again.hash());
+        assert_eq!(
+            cache.node_cache_hits(),
+            hits_before + 2,
+            "both nodes must hit"
+        );
+        // A changed parameter re-cooks only the node it belongs to.
+        let other = cook_at(&cache, &graph(0.25), 2, &ctx)?;
+        assert_eq!(cache.node_cache_hits(), hits_before + 3);
+        assert_ne!(other.hash(), first.hash());
+
+        let tight = EvalContext {
+            cancelled: &cancelled,
+            budget: CookBudget {
+                max_memory_bytes: 1 << 30,
+                max_elements: 1_000,
+            },
+        };
+        let oversized = GraphSnapshot {
+            revision: RevisionId(1),
+            nodes: vec![
+                Node::CreateSphere {
+                    id: NodeId(1),
+                    radius: 1.0,
+                    rows: 2_000,
+                    cols: 2_000,
+                },
+                Node::Reverse {
+                    id: NodeId(2),
+                    input: NodeId(1),
+                },
+            ],
+        };
+        assert_eq!(
+            cook(&oversized, &tight).err(),
+            Some(EvalError::ElementLimit {
+                requested: 4_000_000,
+                limit: 1_000
+            })
+        );
+        let starved = EvalContext {
+            cancelled: &cancelled,
+            budget: CookBudget {
+                max_memory_bytes: 64,
+                max_elements: 1_000_000,
+            },
+        };
+        assert_eq!(
+            cook(&graph(0.5), &starved).err(),
+            Some(EvalError::Resource(GeoError::LimitExceeded))
+        );
+        let stopped = AtomicBool::new(true);
+        assert_eq!(
+            cook(&graph(0.5), &sop_ctx(&stopped)).err(),
+            Some(EvalError::Cancelled)
+        );
+        // Fracturing a surface that is not a closed solid surfaces the operator's error.
+        let open_input = GraphSnapshot {
+            revision: RevisionId(1),
+            nodes: vec![
+                Node::CreateGrid {
+                    id: NodeId(1),
+                    rows: 3,
+                    cols: 3,
+                    size_x: 1.0,
+                    size_z: 1.0,
+                },
+                Node::VoronoiFracture {
+                    id: NodeId(2),
+                    input: NodeId(1),
+                    seeds: NodeId(1),
+                },
+            ],
+        };
+        assert_eq!(
+            cook(&open_input, &ctx).err(),
+            Some(EvalError::Resource(GeoError::InvalidTopology))
+        );
+        Ok(())
     }
 }

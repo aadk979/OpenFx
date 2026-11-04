@@ -2,6 +2,9 @@
 //! number mesh voxelization (`VDBFromPolygons`), level-set CSG and morphological reshape
 //! (`VDBReshape`, `VDBCombine`), and guaranteed-manifold Dual Surface Nets polygon extraction (`ConvertVDB`).
 
+mod fast_winding;
+
+use fast_winding::MeshField;
 use pcc_geo::{
     AttrDomain, AttributeColumn, FiniteF32, GeoDetail, GeoError, PAGE_LEN, PrimKind, PrimRun,
 };
@@ -10,7 +13,7 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     sync::{
         Arc,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
 };
 
@@ -241,41 +244,47 @@ impl VdbGrid {
             return Err(GeoError::LimitExceeded);
         }
 
-        let mut brick_vecs: BTreeMap<(i32, i32, i32), Vec<FiniteF32>> = BTreeMap::new();
-        let mut eval_counter = 0usize;
-        for vz in min_vz..=max_vz {
+        let field = MeshField::build(triangles);
+        let band_squared = band * band;
+        let slices = evaluate_slices(min_vz..=max_vz, cancelled, |vz| {
+            let mut slice = Vec::new();
             for vy in min_vy..=max_vy {
+                if cancelled.load(Ordering::Acquire) {
+                    return Err(GeoError::Cancelled);
+                }
                 for vx in min_vx..=max_vx {
-                    if eval_counter.is_multiple_of(1024) && cancelled.load(Ordering::Acquire) {
-                        return Err(GeoError::Cancelled);
-                    }
-                    eval_counter += 1;
                     let p = Vec3::checked(
                         (vx as f32 + 0.5) * voxel_size,
                         (vy as f32 + 0.5) * voxel_size,
                         (vz as f32 + 0.5) * voxel_size,
                     )?;
-                    let mut min_dist_sq = f32::INFINITY;
-                    for &(a, b, c) in &triangles {
-                        let d2 = point_triangle_dist_sq(p, a, b, c);
-                        if d2 < min_dist_sq {
-                            min_dist_sq = d2;
-                        }
-                    }
-                    let dist = min_dist_sq.sqrt();
-                    let wn = generalized_winding_number(p, &triangles);
-                    let sign = if wn >= 0.5 { -1.0 } else { 1.0 };
+                    let dist = field.distance_squared_within(p, band_squared).sqrt();
+                    // Winding magnitude, so that inside-out shells still read as solid.
+                    let sign = if field.winding(p).abs() >= 0.5 {
+                        -1.0
+                    } else {
+                        1.0
+                    };
                     let phi = (sign * dist).clamp(-band, band);
                     if phi < band {
-                        let (bx, lx) = split_coord(vx);
-                        let (by, ly) = split_coord(vy);
-                        let (bz, lz) = split_coord(vz);
-                        let entry = brick_vecs
-                            .entry((bx, by, bz))
-                            .or_insert_with(|| vec![bg; BRICK_LEN]);
-                        entry[local_index(lx, ly, lz)] = FiniteF32::checked(phi)?;
+                        slice.push((vx, vy, FiniteF32::checked(phi)?));
                     }
                 }
+            }
+            Ok(slice)
+        })?;
+
+        // Merging in slice order makes the result independent of thread scheduling.
+        let mut brick_vecs: BTreeMap<(i32, i32, i32), Vec<FiniteF32>> = BTreeMap::new();
+        for (vz, slice) in (min_vz..=max_vz).zip(slices) {
+            for (vx, vy, phi) in slice {
+                let (bx, lx) = split_coord(vx);
+                let (by, ly) = split_coord(vy);
+                let (bz, lz) = split_coord(vz);
+                let entry = brick_vecs
+                    .entry((bx, by, bz))
+                    .or_insert_with(|| vec![bg; BRICK_LEN]);
+                entry[local_index(lx, ly, lz)] = phi;
             }
         }
 
@@ -474,8 +483,7 @@ impl VdbGrid {
             return Ok(GeoDetail::points(Vec::new()));
         }
 
-        // Regularize any 2D checkerboard saddle squares `(1,0,1,0)` so every dual edge has degree 2
-        regularize_checkerboard_pinches(&mut inside);
+        regularize_ambiguous_cells(&mut inside, cancelled)?;
 
         // Determine candidate dual cells: any cell (cx, cy, cz) whose 8 corners (cx+dx, cy+dy, cz+dz)
         // contain at least one inside and one outside voxel.
@@ -788,42 +796,162 @@ pub fn boolean_meshes_cancellable(
     combined.to_polygons_cancellable(memory_limit, cancelled)
 }
 
-fn regularize_checkerboard_pinches(inside: &mut BTreeSet<(i32, i32, i32)>) {
-    for _pass in 0..8 {
-        let mut to_add = Vec::new();
-        for &(x, y, z) in inside.iter() {
-            // Check 2D diagonal pinches in XY, YZ, XZ planes around (x, y, z)
-            for (dx, dy) in [(-1, -1), (-1, 1), (1, -1), (1, 1)] {
-                if inside.contains(&(x + dx, y + dy, z))
-                    && !inside.contains(&(x + dx, y, z))
-                    && !inside.contains(&(x, y + dy, z))
-                {
-                    to_add.push((x + dx, y, z));
-                    to_add.push((x, y + dy, z));
+/// Runs `evaluate` for every slice on all available cores, returning results in slice order.
+fn evaluate_slices<T: Send>(
+    slices: std::ops::RangeInclusive<i32>,
+    cancelled: &AtomicBool,
+    evaluate: impl Fn(i32) -> Result<T, GeoError> + Sync,
+) -> Result<Vec<T>, GeoError> {
+    let all: Vec<i32> = slices.collect();
+    let next = AtomicUsize::new(0);
+    let workers = std::thread::available_parallelism()
+        .map_or(1, |n| n.get())
+        .min(all.len().max(1));
+    let run_worker = || -> Result<Vec<(usize, T)>, GeoError> {
+        let mut done = Vec::new();
+        loop {
+            let index = next.fetch_add(1, Ordering::Relaxed);
+            let Some(&slice) = all.get(index) else {
+                return Ok(done);
+            };
+            if cancelled.load(Ordering::Acquire) {
+                return Err(GeoError::Cancelled);
+            }
+            done.push((index, evaluate(slice)?));
+        }
+    };
+    let batches: Vec<Result<Vec<(usize, T)>, GeoError>> = std::thread::scope(|scope| {
+        let handles: Vec<_> = (0..workers).map(|_| scope.spawn(run_worker)).collect();
+        handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap_or(Err(GeoError::LimitExceeded)))
+            .collect()
+    });
+    let mut indexed = Vec::with_capacity(all.len());
+    for batch in batches {
+        indexed.extend(batch?);
+    }
+    indexed.sort_by_key(|&(index, _)| index);
+    Ok(indexed.into_iter().map(|(_, value)| value).collect())
+}
+
+/// Groups the set bits of a cube-corner mask into components connected along cube edges.
+fn corner_components(mask: u8) -> Vec<u8> {
+    let mut remaining = mask;
+    let mut components = Vec::new();
+    while remaining != 0 {
+        let mut component = remaining & remaining.wrapping_neg();
+        loop {
+            let mut grown = component;
+            for corner in 0..8u8 {
+                if component & (1 << corner) != 0 {
+                    for axis in [1u8, 2, 4] {
+                        grown |= (1 << (corner ^ axis)) & mask;
+                    }
                 }
-                if inside.contains(&(x, y + dx, z + dy))
-                    && !inside.contains(&(x, y + dx, z))
-                    && !inside.contains(&(x, y, z + dy))
-                {
-                    to_add.push((x, y + dx, z));
-                    to_add.push((x, y, z + dy));
-                }
-                if inside.contains(&(x + dx, y, z + dy))
-                    && !inside.contains(&(x + dx, y, z))
-                    && !inside.contains(&(x, y, z + dy))
-                {
-                    to_add.push((x + dx, y, z));
-                    to_add.push((x, y, z + dy));
+            }
+            if grown == component {
+                break;
+            }
+            component = grown;
+        }
+        components.push(component);
+        remaining &= !component;
+    }
+    components
+}
+
+/// Corners to mark inside so that this cell holds exactly one surface sheet, or 0 if it already
+/// does. Inside corners that are split fill their bounding sub-box; split outside corners fill all
+/// but the largest group. Neither reaches past the bounds of the inside corners already present
+/// in a way that can grow without limit, because a full cell has no surface left to pinch.
+fn cell_repair(mask: u8) -> u8 {
+    let inside = corner_components(mask);
+    if inside.len() > 1 {
+        let (mut low, mut high) = (7u8, 0u8);
+        for corner in 0..8u8 {
+            if mask & (1 << corner) != 0 {
+                low &= corner;
+                high |= corner;
+            }
+        }
+        let mut fill = 0u8;
+        for corner in 0..8u8 {
+            if corner & !high == 0 && low & !corner == 0 {
+                fill |= 1 << corner;
+            }
+        }
+        return fill & !mask;
+    }
+    let mut outside = corner_components(!mask);
+    if outside.len() > 1 {
+        outside.sort_by_key(|group| (std::cmp::Reverse(group.count_ones()), *group));
+        return outside[1..].iter().fold(0, |fill, group| fill | group);
+    }
+    0
+}
+
+/// Fills voxels until every grid cell holds at most one surface sheet: its inside corners are one
+/// edge-connected group, and so are its outside corners.
+///
+/// This is exactly the condition under which Surface Nets is manifold. Each output vertex then has
+/// a single closed fan of quads, because the boundary between the two groups is one loop on the
+/// cell. Each output edge has exactly two quads, because a checkerboard grid face, the only face
+/// with four crossings, has split corners and cannot survive. Voxels are only ever added and only
+/// within finitely many cells, so the loop terminates.
+fn regularize_ambiguous_cells(
+    inside: &mut BTreeSet<(i32, i32, i32)>,
+    cancelled: &AtomicBool,
+) -> Result<(), GeoError> {
+    let repairs: Vec<u8> = (0..=255u8).map(cell_repair).collect();
+    let cells_touching = |voxel: (i32, i32, i32), cells: &mut BTreeSet<(i32, i32, i32)>| {
+        for dz in -1..=0 {
+            for dy in -1..=0 {
+                for dx in -1..=0 {
+                    cells.insert((voxel.0 + dx, voxel.1 + dy, voxel.2 + dz));
                 }
             }
         }
-        if to_add.is_empty() {
-            break;
+    };
+    let mut pending = BTreeSet::new();
+    for &voxel in inside.iter() {
+        cells_touching(voxel, &mut pending);
+    }
+    while !pending.is_empty() {
+        if cancelled.load(Ordering::Acquire) {
+            return Err(GeoError::Cancelled);
         }
-        for v in to_add {
-            inside.insert(v);
+        let mut added = Vec::new();
+        for &(cx, cy, cz) in &pending {
+            let corner_at = |corner: u8| {
+                (
+                    cx + i32::from(corner & 1),
+                    cy + i32::from((corner >> 1) & 1),
+                    cz + i32::from((corner >> 2) & 1),
+                )
+            };
+            let mut mask = 0u8;
+            for corner in 0..8u8 {
+                if inside.contains(&corner_at(corner)) {
+                    mask |= 1 << corner;
+                }
+            }
+            let fill = repairs[mask as usize];
+            for corner in 0..8u8 {
+                if fill & (1 << corner) != 0 {
+                    added.push(corner_at(corner));
+                }
+            }
+        }
+        // Applying a whole pass at once keeps the result independent of visit order.
+        pending.clear();
+        for voxel in added {
+            if inside.insert(voxel) {
+                cells_touching(voxel, &mut pending);
+            }
         }
     }
+    Ok(())
 }
 
 fn extract_triangles(geo: &GeoDetail) -> Result<Vec<(Vec3, Vec3, Vec3)>, GeoError> {
@@ -1075,5 +1203,138 @@ mod tests {
             assert!(vol_d > 0.5 && vol_d < vol_a);
             assert!(vol_i > 0.5 && vol_i < vol_a);
         }
+    }
+
+    fn assert_surface_is_manifold(grid: &VdbGrid, label: &str) -> Result<GeoDetail, GeoError> {
+        let paused = AtomicBool::new(false);
+        let mesh = grid.to_polygons_cancellable(1 << 28, &paused)?;
+        let topology = mesh.topology_index();
+        assert!(
+            topology.is_closed_manifold(),
+            "{label}: {} boundary, {} non-manifold edges",
+            topology.boundary_edge_count(),
+            topology.non_manifold_edge_count()
+        );
+        assert_eq!(topology.non_manifold_vertex_count(&mesh), 0, "{label}");
+        assert!(pcc_sop::signed_volume(&mesh) > 0.0, "{label}: inside out");
+        Ok(mesh)
+    }
+
+    #[test]
+    fn surface_nets_is_manifold_on_every_ambiguous_cell_configuration() -> Result<(), GeoError> {
+        // All 254 non-trivial corner assignments of one cell, as the worst possible neighbourhood.
+        for mask in 1..=254u8 {
+            let mut grid = VdbGrid::new(1.0, 3.0)?;
+            for corner in 0..8i32 {
+                if mask & (1 << corner) != 0 {
+                    grid =
+                        grid.with_voxel(corner & 1, (corner >> 1) & 1, (corner >> 2) & 1, -1.0)?;
+                }
+            }
+            assert_surface_is_manifold(&grid, &format!("mask {mask:#010b}"))?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn surface_nets_is_manifold_on_random_voxel_noise() -> Result<(), GeoError> {
+        let rng = pcc_math::Philox4x32::new(0xD00D);
+        for (round, density) in [0.05f32, 0.2, 0.35, 0.5, 0.65, 0.8, 0.95]
+            .into_iter()
+            .cycle()
+            .take(70)
+            .enumerate()
+        {
+            let mut grid = VdbGrid::new(1.0, 3.0)?;
+            for x in 0..10i32 {
+                for y in 0..10i32 {
+                    for z in 0..10i32 {
+                        let u = rng.generate_unit_f32([x as u32, y as u32, z as u32, round as u32]);
+                        if u[0] < density {
+                            grid = grid.with_voxel(x, y, z, -1.0)?;
+                        }
+                    }
+                }
+            }
+            assert_surface_is_manifold(&grid, &format!("round {round} density {density}"))?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn cell_repair_leaves_single_sheet_cells_alone_and_splits_nothing_new() {
+        for mask in 0..=255u8 {
+            let single = corner_components(mask).len() <= 1 && corner_components(!mask).len() <= 1;
+            let repair = cell_repair(mask);
+            assert_eq!(repair == 0, single, "mask {mask:#010b}");
+            assert_eq!(
+                repair & mask,
+                0,
+                "mask {mask:#010b} refilled an inside corner"
+            );
+        }
+        // Opposite body corners fill the whole cell; a face diagonal fills only its face.
+        assert_eq!(cell_repair(0b1000_0001), 0b0111_1110);
+        assert_eq!(cell_repair(0b0000_1001), 0b0000_0110);
+        // Split outside corners fill the smaller group, keeping the output closest to the input.
+        assert_eq!(cell_repair(!0b1000_0011), 0b1000_0000);
+        // Equal groups break the tie deterministically: the lowest group stays outside.
+        assert_eq!(cell_repair(!0b1000_0001), 0b1000_0000);
+    }
+
+    #[test]
+    fn voxelization_is_independent_of_scheduling_and_inside_out_shells_are_solid()
+    -> Result<(), GeoError> {
+        let paused = AtomicBool::new(false);
+        let ctx = pcc_sop::SopContext::new(1 << 28, &paused);
+        let sphere = pcc_sop::create_sphere(1.0, 16, 24, &ctx)?;
+        let first = VdbGrid::from_polygons_cancellable(&sphere, 0.2, 3, 1 << 28, &paused)?;
+        for _ in 0..4 {
+            let again = VdbGrid::from_polygons_cancellable(&sphere, 0.2, 3, 1 << 28, &paused)?;
+            assert_eq!(first.hash(), again.hash());
+        }
+        let inverted = sphere.with_reversed_winding()?;
+        let flipped = VdbGrid::from_polygons_cancellable(&inverted, 0.2, 3, 1 << 28, &paused)?;
+        let mesh = assert_surface_is_manifold(&flipped, "inverted sphere")?;
+        let exact = 4.0 / 3.0 * std::f64::consts::PI;
+        assert!((pcc_sop::signed_volume(&mesh) - exact).abs() < 0.1 * exact);
+        Ok(())
+    }
+    #[test]
+    fn voxels_land_at_the_correct_height_on_an_asymmetric_solid() -> Result<(), GeoError> {
+        let paused = AtomicBool::new(false);
+        // A tetrahedron with its broad base at z = 0 and apex at z = 4. Mirroring the slices about
+        // the grid's middle would keep a symmetric shape intact, but not this one.
+        let v = |x, y, z| Vec3::checked(x, y, z);
+        let wedge = GeoDetail::points(vec![
+            v(-3.0, -3.0, 0.0)?,
+            v(3.0, -3.0, 0.0)?,
+            v(0.0, 3.0, 0.0)?,
+            v(0.0, -1.0, 4.0)?,
+        ])
+        .with_primitives(
+            vec![PrimRun {
+                kind: PrimKind::Polygon,
+                arity: 3,
+                prim_count: 4,
+            }],
+            vec![0, 2, 1, 0, 1, 3, 1, 2, 3, 2, 0, 3],
+        )?;
+        let grid = VdbGrid::from_polygons_cancellable(&wedge, 0.25, 3, 1 << 28, &paused)?;
+        let phi_at = |x: f32, y: f32, z: f32| {
+            let voxel = |c: f32| (c / 0.25).floor() as i32;
+            grid.get(voxel(x), voxel(y), voxel(z))
+        };
+        assert!(
+            phi_at(0.0, -1.0, 0.5) < 0.0,
+            "just above the base is inside"
+        );
+        assert!(phi_at(0.0, -1.0, 3.0) < 0.0, "under the apex is inside");
+        assert!(
+            phi_at(2.0, 1.5, 3.0) > 0.0,
+            "the same height off-axis is outside"
+        );
+        assert!(phi_at(0.0, -1.0, -1.0) > 0.0, "below the base is outside");
+        Ok(())
     }
 }

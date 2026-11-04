@@ -9,5 +9,8 @@ blake3.workspace = true
 pcc-geo = { path = "../pcc-geo" }
 pcc-math = { path = "../pcc-math" }
 
+[dev-dependencies]
+pcc-sop = { path = "../pcc-sop" }
+
 [lints]
 workspace = true

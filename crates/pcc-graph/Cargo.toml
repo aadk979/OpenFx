@@ -8,5 +8,8 @@ pcc-id = { path = "../pcc-id" }
 pcc-math = { path = "../pcc-math" }
 schemars.workspace = true
 serde.workspace = true
+[dev-dependencies]
+serde_json.workspace = true
+
 [lints]
 workspace = true

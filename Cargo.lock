@@ -419,6 +419,7 @@ dependencies = [
  "pcc-math",
  "schemars",
  "serde",
+ "serde_json",
 ]
 
 [[package]]

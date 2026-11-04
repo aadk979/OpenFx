@@ -1632,21 +1632,17 @@ mod tests {
                 GraphEdit::RemoveNode { id: NodeId(2) },
                 GraphEdit::RemoveNode { id: NodeId(1) },
                 GraphEdit::AddNode {
-                    node: Node::CreateGrid {
-                        id: NodeId(10),
-                        rows: 3,
-                        cols: 3,
-                        size_x: 4.0,
-                        size_z: 4.0,
-                    },
+                    node: Node::new("grid", NodeId(10))
+                        .with_u32("rows", 3)
+                        .with_u32("cols", 3)
+                        .with_f32("size_x", 4.0)
+                        .with_f32("size_z", 4.0),
                 },
                 GraphEdit::AddNode {
-                    node: Node::Scatter {
-                        id: NodeId(20),
-                        input: NodeId(10),
-                        count: 25,
-                        seed: 7,
-                    },
+                    node: Node::new("scatter", NodeId(20))
+                        .with_input(NodeId(10))
+                        .with_u32("count", 25)
+                        .with_u64("seed", 7),
                 },
             ],
         );

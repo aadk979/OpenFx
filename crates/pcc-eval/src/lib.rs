@@ -4,7 +4,10 @@ use pcc_geo::{
     AttrDomain as GeoAttrDomain, AttributeColumn, GeoDetail, GeoError, GroupDomain, PAGE_LEN,
     PrimKind, PrimRun, PromoteMode as GeoPromoteMode, UvProjectMode as GeoUvProjectMode,
 };
-use pcc_graph::{AttrDomain, BooleanMode, GraphSnapshot, Node, PromoteMode, UvProjectMode};
+use pcc_graph::{
+    AttrDomain, BooleanMode, GraphSnapshot, Node, NodeDef, NodeRegistrationError, PromoteMode,
+    UvProjectMode, node_def, register_node_def,
+};
 use pcc_id::{NodeId, RevisionId};
 use pcc_math::{Philox4x32, Vec3};
 use pcc_sop::{
@@ -19,7 +22,7 @@ use pcc_vex::{DEFAULT_MAX_FUEL_PER_POINT, VexError, compile_vex};
 use std::{
     collections::BTreeMap,
     sync::{
-        Arc, Mutex,
+        Arc, Mutex, OnceLock, RwLock,
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
 };
@@ -122,342 +125,18 @@ impl CookCache {
         frame_denominator: u32,
     ) -> NodeCacheKey {
         let mut hasher = blake3::Hasher::new();
-        hasher.update(b"pcc-eval-node-cache-v1");
-        match node {
-            Node::CreatePoints { count, .. } => {
-                hasher.update(b"create");
-                hasher.update(&count.to_le_bytes());
-            }
-            Node::CreateGrid {
-                rows,
-                cols,
-                size_x,
-                size_z,
-                ..
-            } => {
-                hasher.update(b"grid");
-                hasher.update(&rows.to_le_bytes());
-                hasher.update(&cols.to_le_bytes());
-                for c in [*size_x, *size_z] {
-                    let canonical = if c == 0.0 { 0.0 } else { c };
-                    hasher.update(&canonical.to_bits().to_le_bytes());
-                }
-            }
-            Node::CreateBox { size, .. } => {
-                hasher.update(b"box");
-                for c in [size.x, size.y, size.z] {
-                    let canonical = if c == 0.0 { 0.0 } else { c };
-                    hasher.update(&canonical.to_bits().to_le_bytes());
-                }
-            }
-            Node::Transform { offset, .. } => {
-                hasher.update(b"transform");
-                for c in [offset.x, offset.y, offset.z] {
-                    let canonical = if c == 0.0 { 0.0 } else { c };
-                    hasher.update(&canonical.to_bits().to_le_bytes());
-                }
-            }
-            Node::Normal { .. } => {
-                hasher.update(b"normal");
-            }
-            Node::PointWrangle { snippet, .. } => {
-                hasher.update(b"wrangle");
-                hasher.update(&(snippet.len() as u64).to_le_bytes());
-                hasher.update(snippet.as_bytes());
-            }
-            Node::Scatter {
-                id, count, seed, ..
-            } => {
-                hasher.update(b"scatter");
-                hasher.update(&id.0.to_le_bytes());
-                hasher.update(&count.to_le_bytes());
-                hasher.update(&seed.to_le_bytes());
-            }
-            Node::CopyToPoints { .. } => {
-                hasher.update(b"copytopoints");
-            }
-            Node::Merge { .. } => {
-                hasher.update(b"merge");
-            }
-            Node::Subdivide { iterations, .. } => {
-                hasher.update(b"subdivide");
-                hasher.update(&iterations.to_le_bytes());
-            }
-            Node::PolyExtrude {
-                distance, inset, ..
-            } => {
-                hasher.update(b"extrude");
-                for c in [*distance, *inset] {
-                    let canonical = if c == 0.0 { 0.0 } else { c };
-                    hasher.update(&canonical.to_bits().to_le_bytes());
-                }
-            }
-            Node::AttribPromote {
-                name,
-                from_domain,
-                to_domain,
-                mode,
-                ..
-            } => {
-                hasher.update(b"attribpromote");
-                hasher.update(&(name.len() as u64).to_le_bytes());
-                hasher.update(name.as_bytes());
-                hasher.update(from_domain.as_str().as_bytes());
-                hasher.update(b"->");
-                hasher.update(to_domain.as_str().as_bytes());
-                hasher.update(mode.as_str().as_bytes());
-            }
-            Node::Blast {
-                group_name, negate, ..
-            } => {
-                hasher.update(b"blast");
-                hasher.update(&(group_name.len() as u64).to_le_bytes());
-                hasher.update(group_name.as_bytes());
-                hasher.update(&[u8::from(*negate)]);
-            }
-            Node::UvProject { mode, .. } => {
-                hasher.update(b"uvproject");
-                hasher.update(mode.as_str().as_bytes());
-            }
-            Node::HeightField {
-                rows,
-                cols,
-                size_x,
-                size_z,
-                ..
-            } => {
-                hasher.update(b"heightfield");
-                hasher.update(&rows.to_le_bytes());
-                hasher.update(&cols.to_le_bytes());
-                for c in [*size_x, *size_z] {
-                    let canonical = if c == 0.0 { 0.0 } else { c };
-                    hasher.update(&canonical.to_bits().to_le_bytes());
-                }
-            }
-            Node::HeightFieldNoise {
-                amplitude,
-                frequency,
-                octaves,
-                seed,
-                ..
-            } => {
-                hasher.update(b"hf_noise");
-                for c in [*amplitude, *frequency] {
-                    let canonical = if c == 0.0 { 0.0 } else { c };
-                    hasher.update(&canonical.to_bits().to_le_bytes());
-                }
-                hasher.update(&octaves.to_le_bytes());
-                hasher.update(&seed.to_le_bytes());
-            }
-            Node::HeightFieldErode {
-                iterations,
-                rain_rate,
-                talus_angle,
-                seed,
-                ..
-            } => {
-                hasher.update(b"hf_erode");
-                hasher.update(&iterations.to_le_bytes());
-                for c in [*rain_rate, *talus_angle] {
-                    let canonical = if c == 0.0 { 0.0 } else { c };
-                    hasher.update(&canonical.to_bits().to_le_bytes());
-                }
-                hasher.update(&seed.to_le_bytes());
-            }
-            Node::VdbFromPolygons { voxel_size, .. } => {
-                hasher.update(b"vdb_from_polygons");
-                let canonical = if *voxel_size == 0.0 { 0.0 } else { *voxel_size };
-                hasher.update(&canonical.to_bits().to_le_bytes());
-            }
-            Node::VdbReshape {
-                offset,
-                smooth_iterations,
-                ..
-            } => {
-                hasher.update(b"vdb_reshape");
-                let canonical = if *offset == 0.0 { 0.0 } else { *offset };
-                hasher.update(&canonical.to_bits().to_le_bytes());
-                hasher.update(&smooth_iterations.to_le_bytes());
-            }
-            Node::ConvertVdb { .. } => {
-                hasher.update(b"convert_vdb");
-            }
-            Node::Boolean {
-                mode, voxel_size, ..
-            } => {
-                hasher.update(b"boolean");
-                hasher.update(mode.as_str().as_bytes());
-                let canonical = if *voxel_size == 0.0 { 0.0 } else { *voxel_size };
-                hasher.update(&canonical.to_bits().to_le_bytes());
-            }
-            Node::GeoAsset { content_hash, .. } => {
-                hasher.update(b"asset");
-                hasher.update(content_hash.as_bytes());
-            }
-            Node::CreateSphere {
-                radius, rows, cols, ..
-            } => {
-                hasher.update(b"sphere");
-                hash_f32s(&mut hasher, &[*radius]);
-                hasher.update(&rows.to_le_bytes());
-                hasher.update(&cols.to_le_bytes());
-            }
-            Node::CreateTube {
-                radius,
-                height,
-                rows,
-                cols,
-                ..
-            } => {
-                hasher.update(b"tube");
-                hash_f32s(&mut hasher, &[*radius]);
-                hash_f32s(&mut hasher, &[*height]);
-                hasher.update(&rows.to_le_bytes());
-                hasher.update(&cols.to_le_bytes());
-            }
-            Node::CreateTorus {
-                major_radius,
-                minor_radius,
-                rows,
-                cols,
-                ..
-            } => {
-                hasher.update(b"torus");
-                hash_f32s(&mut hasher, &[*major_radius]);
-                hash_f32s(&mut hasher, &[*minor_radius]);
-                hasher.update(&rows.to_le_bytes());
-                hasher.update(&cols.to_le_bytes());
-            }
-            Node::CreateLine {
-                start, end, points, ..
-            } => {
-                hasher.update(b"line");
-                hash_f32s(&mut hasher, &[start.x, start.y, start.z]);
-                hash_f32s(&mut hasher, &[end.x, end.y, end.z]);
-                hasher.update(&points.to_le_bytes());
-            }
-            Node::Xform {
-                translate,
-                rotate_degrees,
-                scale,
-                ..
-            } => {
-                hasher.update(b"xform");
-                hash_f32s(&mut hasher, &[translate.x, translate.y, translate.z]);
-                hash_f32s(
-                    &mut hasher,
-                    &[rotate_degrees.x, rotate_degrees.y, rotate_degrees.z],
-                );
-                hash_f32s(&mut hasher, &[scale.x, scale.y, scale.z]);
-            }
-            Node::Reverse { .. } => {
-                hasher.update(b"reverse");
-            }
-            Node::Triangulate { .. } => {
-                hasher.update(b"triangulate");
-            }
-            Node::Fuse { distance, .. } => {
-                hasher.update(b"fuse");
-                hash_f32s(&mut hasher, &[*distance]);
-            }
-            Node::GroupBounds {
-                group_name,
-                domain,
-                min,
-                max,
-                ..
-            } => {
-                hasher.update(b"group_bounds");
-                hasher.update(&(group_name.len() as u64).to_le_bytes());
-                hasher.update(group_name.as_bytes());
-                hasher.update(domain.as_str().as_bytes());
-                hash_f32s(&mut hasher, &[min.x, min.y, min.z]);
-                hash_f32s(&mut hasher, &[max.x, max.y, max.z]);
-            }
-            Node::Resample { segment_length, .. } => {
-                hasher.update(b"resample");
-                hash_f32s(&mut hasher, &[*segment_length]);
-            }
-            Node::Sweep {
-                radius,
-                sides,
-                capped,
-                ..
-            } => {
-                hasher.update(b"sweep");
-                hash_f32s(&mut hasher, &[*radius]);
-                hasher.update(&sides.to_le_bytes());
-                hasher.update(&[u8::from(*capped)]);
-            }
-            Node::AttribTransfer { name, radius, .. } => {
-                hasher.update(b"attribtransfer");
-                hasher.update(&(name.len() as u64).to_le_bytes());
-                hasher.update(name.as_bytes());
-                hash_f32s(&mut hasher, &[*radius]);
-            }
-            Node::Measure { .. } => {
-                hasher.update(b"measure");
-            }
-            Node::PolyBevel {
-                distance,
-                min_angle_degrees,
-                ..
-            } => {
-                hasher.update(b"polybevel");
-                hash_f32s(&mut hasher, &[*distance]);
-                hash_f32s(&mut hasher, &[*min_angle_degrees]);
-            }
-            Node::PolyReduce { target_ratio, .. } => {
-                hasher.update(b"polyreduce");
-                hash_f32s(&mut hasher, &[*target_ratio]);
-            }
-            Node::Remesh {
-                target_length,
-                iterations,
-                feature_angle_degrees,
-                ..
-            } => {
-                hasher.update(b"remesh");
-                hash_f32s(&mut hasher, &[*target_length]);
-                hasher.update(&iterations.to_le_bytes());
-                hash_f32s(&mut hasher, &[*feature_angle_degrees]);
-            }
-            Node::Clip {
-                origin,
-                normal,
-                cap,
-                ..
-            } => {
-                hasher.update(b"clip");
-                hash_f32s(&mut hasher, &[origin.x, origin.y, origin.z]);
-                hash_f32s(&mut hasher, &[normal.x, normal.y, normal.z]);
-                hasher.update(&[u8::from(*cap)]);
-            }
-            Node::VoronoiFracture { .. } => {
-                hasher.update(b"voronoifracture");
-            }
-            Node::ScatterSurface {
-                count,
-                seed,
-                min_distance,
-                ..
-            } => {
-                hasher.update(b"scatter_surface");
-                hasher.update(&count.to_le_bytes());
-                hasher.update(&seed.to_le_bytes());
-                hash_f32s(&mut hasher, &[*min_distance]);
-            }
-            Node::UvFlatten {
-                seam_angle_degrees, ..
-            } => {
-                hasher.update(b"uvflatten");
-                hash_f32s(&mut hasher, &[*seam_angle_degrees]);
-            }
-            Node::UvLayout { padding, tiles, .. } => {
-                hasher.update(b"uvlayout");
-                hash_f32s(&mut hasher, &[*padding]);
-                hasher.update(&tiles.to_le_bytes());
-            }
+        hasher.update(b"pcc-eval-node-cache-v2");
+        hasher.update(&(node.op.len() as u64).to_le_bytes());
+        hasher.update(node.op.as_bytes());
+        if node_def(&node.op).is_some_and(|def| def.seeded_by_node_id) {
+            hasher.update(&node.id.0.to_le_bytes());
+        }
+        for (name, value) in &node.params {
+            hasher.update(&(name.len() as u64).to_le_bytes());
+            hasher.update(name.as_bytes());
+            value.update_hash(|bytes| {
+                hasher.update(bytes);
+            });
         }
         hasher.update(&(upstream_hashes.len() as u64).to_le_bytes());
         for upstream in upstream_hashes {
@@ -577,12 +256,66 @@ where
     Ok(Arc::try_unwrap(arc_geo).unwrap_or_else(|shared| (*shared).clone()))
 }
 
-/// Hashes floats with negative zero canonicalized, matching the `.ofxs` text form.
-fn hash_f32s(hasher: &mut blake3::Hasher, values: &[f32]) {
-    for &value in values {
-        let canonical = if value == 0.0 { 0.0 } else { value };
-        hasher.update(&canonical.to_bits().to_le_bytes());
+fn param_f32(node: &Node, name: &str) -> Result<f32, EvalError> {
+    node.f32(name).ok_or(EvalError::InvalidGraph)
+}
+
+fn param_u32(node: &Node, name: &str) -> Result<u32, EvalError> {
+    node.u32(name).ok_or(EvalError::InvalidGraph)
+}
+
+fn param_u64(node: &Node, name: &str) -> Result<u64, EvalError> {
+    node.u64(name).ok_or(EvalError::InvalidGraph)
+}
+
+fn param_bool(node: &Node, name: &str) -> Result<bool, EvalError> {
+    node.boolean(name).ok_or(EvalError::InvalidGraph)
+}
+
+fn param_vec3(node: &Node, name: &str) -> Result<Vec3, EvalError> {
+    node.vec3(name).ok_or(EvalError::InvalidGraph)
+}
+
+fn param_text<'a>(node: &'a Node, name: &str) -> Result<&'a str, EvalError> {
+    node.text(name).ok_or(EvalError::InvalidGraph)
+}
+
+fn param_choice<T, E>(
+    node: &Node,
+    name: &str,
+    from_token: impl Fn(&str) -> Result<T, E>,
+) -> Result<T, EvalError> {
+    from_token(param_text(node, name)?).map_err(|_| EvalError::InvalidGraph)
+}
+
+fn input_slot(node: &Node, slot: usize) -> Result<NodeId, EvalError> {
+    node.inputs
+        .get(slot)
+        .copied()
+        .ok_or(EvalError::InvalidGraph)
+}
+
+/// Cooks one node of a runtime-registered operator from its evaluated inputs.
+pub type CookFn = fn(&Node, &[Arc<GeoDetail>], &EvalContext<'_>) -> Result<GeoDetail, EvalError>;
+
+fn cook_table() -> &'static RwLock<BTreeMap<&'static str, CookFn>> {
+    static TABLE: OnceLock<RwLock<BTreeMap<&'static str, CookFn>>> = OnceLock::new();
+    TABLE.get_or_init(|| RwLock::new(BTreeMap::new()))
+}
+
+fn registered_cook(op: &str) -> Option<CookFn> {
+    cook_table().read().ok()?.get(op).copied()
+}
+
+/// Adds an operator at runtime: its definition makes it part of the catalog, validation, and
+/// `.ofxs`, and `cook` evaluates it. This is the seam that external plugins will use.
+pub fn register_operator(def: NodeDef, cook: CookFn) -> Result<(), NodeRegistrationError> {
+    let name = def.type_name;
+    register_node_def(def)?;
+    if let Ok(mut table) = cook_table().write() {
+        table.insert(name, cook);
     }
+    Ok(())
 }
 
 /// Rejects a generator's requested size before any allocation.
@@ -620,8 +353,10 @@ fn eval_single_node(
     if ctx.cancelled.load(Ordering::Acquire) {
         return Err(EvalError::Cancelled);
     }
-    match node {
-        Node::CreatePoints { count, .. } => {
+    match node.op.as_str() {
+        "create" => {
+            let count = &param_u32(node, "count")?;
+
             if *count > ctx.budget.max_elements {
                 return Err(EvalError::ElementLimit {
                     requested: *count,
@@ -644,13 +379,12 @@ fn eval_single_node(
             }
             Ok(GeoDetail::points(points))
         }
-        Node::CreateGrid {
-            rows,
-            cols,
-            size_x,
-            size_z,
-            ..
-        } => {
+        "grid" => {
+            let rows = &param_u32(node, "rows")?;
+            let cols = &param_u32(node, "cols")?;
+            let size_x = &param_f32(node, "size_x")?;
+            let size_z = &param_f32(node, "size_z")?;
+
             if *rows < 2 || *cols < 2 || !size_x.is_finite() || !size_z.is_finite() {
                 return Err(EvalError::InvalidGraph);
             }
@@ -720,7 +454,9 @@ fn eval_single_node(
                 )
                 .map_err(EvalError::Resource)
         }
-        Node::CreateBox { size, .. } => {
+        "box" => {
+            let size = &param_vec3(node, "size")?;
+
             if size.x <= 0.0 || size.y <= 0.0 || size.z <= 0.0 {
                 return Err(EvalError::InvalidGraph);
             }
@@ -766,7 +502,11 @@ fn eval_single_node(
                 )
                 .map_err(EvalError::Resource)
         }
-        Node::Transform { id, input, offset } => {
+        "transform" => {
+            let id = &node.id;
+            let input = &input_slot(node, 0)?;
+            let offset = &param_vec3(node, "offset")?;
+
             if *id == *input {
                 return Err(EvalError::InvalidGraph);
             }
@@ -778,7 +518,10 @@ fn eval_single_node(
                     other => EvalError::Resource(other),
                 })
         }
-        Node::Normal { id, input } => {
+        "normal" => {
+            let id = &node.id;
+            let input = &input_slot(node, 0)?;
+
             if *id == *input {
                 return Err(EvalError::InvalidGraph);
             }
@@ -790,7 +533,11 @@ fn eval_single_node(
                     other => EvalError::Resource(other),
                 })
         }
-        Node::PointWrangle { id, input, snippet } => {
+        "wrangle" => {
+            let id = &node.id;
+            let input = &input_slot(node, 0)?;
+            let snippet = param_text(node, "snippet")?;
+
             if *id == *input {
                 return Err(EvalError::InvalidGraph);
             }
@@ -810,12 +557,12 @@ fn eval_single_node(
                 other => EvalError::Vex(other),
             })
         }
-        Node::Scatter {
-            id,
-            input,
-            count,
-            seed,
-        } => {
+        "scatter" => {
+            let id = &node.id;
+            let input = &input_slot(node, 0)?;
+            let count = &param_u32(node, "count")?;
+            let seed = &param_u64(node, "seed")?;
+
             if *id == *input {
                 return Err(EvalError::InvalidGraph);
             }
@@ -853,7 +600,11 @@ fn eval_single_node(
             }
             Ok(GeoDetail::points(points))
         }
-        Node::CopyToPoints { id, source, target } => {
+        "copytopoints" => {
+            let id = &node.id;
+            let source = &input_slot(node, 0)?;
+            let target = &input_slot(node, 1)?;
+
             if *id == *source || *id == *target {
                 return Err(EvalError::InvalidGraph);
             }
@@ -940,7 +691,11 @@ fn eval_single_node(
                     .map_err(EvalError::Resource)
             }
         }
-        Node::Merge { id, left, right } => {
+        "merge" => {
+            let id = &node.id;
+            let left = &input_slot(node, 0)?;
+            let right = &input_slot(node, 1)?;
+
             if *id == *left || *id == *right {
                 return Err(EvalError::InvalidGraph);
             }
@@ -964,11 +719,11 @@ fn eval_single_node(
                     other => EvalError::Resource(other),
                 })
         }
-        Node::Subdivide {
-            id,
-            input,
-            iterations,
-        } => {
+        "subdivide" => {
+            let id = &node.id;
+            let input = &input_slot(node, 0)?;
+            let iterations = &param_u32(node, "iterations")?;
+
             if *id == *input {
                 return Err(EvalError::InvalidGraph);
             }
@@ -989,12 +744,12 @@ fn eval_single_node(
             }
             Ok(out)
         }
-        Node::PolyExtrude {
-            id,
-            input,
-            distance,
-            inset,
-        } => {
+        "extrude" => {
+            let id = &node.id;
+            let input = &input_slot(node, 0)?;
+            let distance = &param_f32(node, "distance")?;
+            let inset = &param_f32(node, "inset")?;
+
             if *id == *input {
                 return Err(EvalError::InvalidGraph);
             }
@@ -1020,14 +775,14 @@ fn eval_single_node(
             }
             Ok(out)
         }
-        Node::AttribPromote {
-            id,
-            input,
-            name,
-            from_domain,
-            to_domain,
-            mode,
-        } => {
+        "attribpromote" => {
+            let id = &node.id;
+            let input = &input_slot(node, 0)?;
+            let name = param_text(node, "name")?;
+            let from_domain = &param_choice(node, "from_domain", AttrDomain::from_token)?;
+            let to_domain = &param_choice(node, "to_domain", AttrDomain::from_token)?;
+            let mode = &param_choice(node, "mode", PromoteMode::from_token)?;
+
             if *id == *input {
                 return Err(EvalError::InvalidGraph);
             }
@@ -1052,12 +807,12 @@ fn eval_single_node(
                 )
                 .map_err(EvalError::Resource)
         }
-        Node::Blast {
-            id,
-            input,
-            group_name,
-            negate,
-        } => {
+        "blast" => {
+            let id = &node.id;
+            let input = &input_slot(node, 0)?;
+            let group_name = param_text(node, "group_name")?;
+            let negate = &param_bool(node, "negate")?;
+
             if *id == *input {
                 return Err(EvalError::InvalidGraph);
             }
@@ -1074,7 +829,11 @@ fn eval_single_node(
                     other => EvalError::Resource(other),
                 })
         }
-        Node::UvProject { id, input, mode } => {
+        "uvproject" => {
+            let id = &node.id;
+            let input = &input_slot(node, 0)?;
+            let mode = &param_choice(node, "mode", UvProjectMode::from_token)?;
+
             if *id == *input {
                 return Err(EvalError::InvalidGraph);
             }
@@ -1094,13 +853,12 @@ fn eval_single_node(
                     other => EvalError::Resource(other),
                 })
         }
-        Node::HeightField {
-            rows,
-            cols,
-            size_x,
-            size_z,
-            ..
-        } => {
+        "heightfield" => {
+            let rows = &param_u32(node, "rows")?;
+            let cols = &param_u32(node, "cols")?;
+            let size_x = &param_f32(node, "size_x")?;
+            let size_z = &param_f32(node, "size_z")?;
+
             if *rows < 2 || *cols < 2 || !size_x.is_finite() || !size_z.is_finite() {
                 return Err(EvalError::InvalidGraph);
             }
@@ -1121,14 +879,14 @@ fn eval_single_node(
                     other => EvalError::Resource(other),
                 })
         }
-        Node::HeightFieldNoise {
-            id,
-            input,
-            amplitude,
-            frequency,
-            octaves,
-            seed,
-        } => {
+        "hf_noise" => {
+            let id = &node.id;
+            let input = &input_slot(node, 0)?;
+            let amplitude = &param_f32(node, "amplitude")?;
+            let frequency = &param_f32(node, "frequency")?;
+            let octaves = &param_u32(node, "octaves")?;
+            let seed = &param_u64(node, "seed")?;
+
             if *id == *input {
                 return Err(EvalError::InvalidGraph);
             }
@@ -1162,14 +920,14 @@ fn eval_single_node(
                     other => EvalError::Resource(other),
                 })
         }
-        Node::HeightFieldErode {
-            id,
-            input,
-            iterations,
-            rain_rate,
-            talus_angle,
-            seed,
-        } => {
+        "hf_erode" => {
+            let id = &node.id;
+            let input = &input_slot(node, 0)?;
+            let iterations = &param_u32(node, "iterations")?;
+            let rain_rate = &param_f32(node, "rain_rate")?;
+            let talus_angle = &param_f32(node, "talus_angle")?;
+            let seed = &param_u64(node, "seed")?;
+
             if *id == *input {
                 return Err(EvalError::InvalidGraph);
             }
@@ -1203,11 +961,11 @@ fn eval_single_node(
                     other => EvalError::Resource(other),
                 })
         }
-        Node::VdbFromPolygons {
-            id,
-            input,
-            voxel_size,
-        } => {
+        "vdb_from_polygons" => {
+            let id = &node.id;
+            let input = &input_slot(node, 0)?;
+            let voxel_size = &param_f32(node, "voxel_size")?;
+
             if *id == *input {
                 return Err(EvalError::InvalidGraph);
             }
@@ -1239,12 +997,12 @@ fn eval_single_node(
             }
             Ok(out)
         }
-        Node::VdbReshape {
-            id,
-            input,
-            offset,
-            smooth_iterations,
-        } => {
+        "vdb_reshape" => {
+            let id = &node.id;
+            let input = &input_slot(node, 0)?;
+            let offset = &param_f32(node, "offset")?;
+            let smooth_iterations = &param_u32(node, "smooth_iterations")?;
+
             if *id == *input {
                 return Err(EvalError::InvalidGraph);
             }
@@ -1276,7 +1034,10 @@ fn eval_single_node(
                     other => EvalError::Resource(other),
                 })
         }
-        Node::ConvertVdb { id, input } => {
+        "convert_vdb" => {
+            let id = &node.id;
+            let input = &input_slot(node, 0)?;
+
             if *id == *input {
                 return Err(EvalError::InvalidGraph);
             }
@@ -1306,13 +1067,13 @@ fn eval_single_node(
             }
             Ok(out)
         }
-        Node::Boolean {
-            id,
-            left,
-            right,
-            mode,
-            voxel_size,
-        } => {
+        "boolean" => {
+            let id = &node.id;
+            let left = &input_slot(node, 0)?;
+            let right = &input_slot(node, 1)?;
+            let mode = &param_choice(node, "mode", BooleanMode::from_token)?;
+            let voxel_size = &param_f32(node, "voxel_size")?;
+
             if *id == *left || *id == *right {
                 return Err(EvalError::InvalidGraph);
             }
@@ -1345,7 +1106,9 @@ fn eval_single_node(
             }
             Ok(out)
         }
-        Node::GeoAsset { content_hash, .. } => {
+        "asset" => {
+            let content_hash = param_text(node, "content_hash")?;
+
             let geo = ctx.assets.resolve(content_hash).map_err(EvalError::Asset)?;
             let bytes = geo
                 .len()
@@ -1359,20 +1122,21 @@ fn eval_single_node(
             }
             finish_sop(Ok((*geo).clone()), ctx)
         }
-        Node::CreateSphere {
-            radius, rows, cols, ..
-        } => {
+        "sphere" => {
+            let radius = &param_f32(node, "radius")?;
+            let rows = &param_u32(node, "rows")?;
+            let cols = &param_u32(node, "cols")?;
+
             check_element_estimate(rows.saturating_mul(*cols), ctx)?;
             let sop = SopContext::new(ctx.budget.max_memory_bytes, ctx.cancelled);
             finish_sop(create_sphere(f64::from(*radius), *rows, *cols, &sop), ctx)
         }
-        Node::CreateTube {
-            radius,
-            height,
-            rows,
-            cols,
-            ..
-        } => {
+        "tube" => {
+            let radius = &param_f32(node, "radius")?;
+            let height = &param_f32(node, "height")?;
+            let rows = &param_u32(node, "rows")?;
+            let cols = &param_u32(node, "cols")?;
+
             check_element_estimate(rows.saturating_add(1).saturating_mul(*cols), ctx)?;
             let sop = SopContext::new(ctx.budget.max_memory_bytes, ctx.cancelled);
             finish_sop(
@@ -1380,13 +1144,12 @@ fn eval_single_node(
                 ctx,
             )
         }
-        Node::CreateTorus {
-            major_radius,
-            minor_radius,
-            rows,
-            cols,
-            ..
-        } => {
+        "torus" => {
+            let major_radius = &param_f32(node, "major_radius")?;
+            let minor_radius = &param_f32(node, "minor_radius")?;
+            let rows = &param_u32(node, "rows")?;
+            let cols = &param_u32(node, "cols")?;
+
             check_element_estimate(rows.saturating_mul(*cols), ctx)?;
             let sop = SopContext::new(ctx.budget.max_memory_bytes, ctx.cancelled);
             finish_sop(
@@ -1400,20 +1163,21 @@ fn eval_single_node(
                 ctx,
             )
         }
-        Node::CreateLine {
-            start, end, points, ..
-        } => {
+        "line" => {
+            let start = &param_vec3(node, "start")?;
+            let end = &param_vec3(node, "end")?;
+            let points = &param_u32(node, "points")?;
+
             check_element_estimate(*points, ctx)?;
             let sop = SopContext::new(ctx.budget.max_memory_bytes, ctx.cancelled);
             finish_sop(create_line(*start, *end, *points, &sop), ctx)
         }
-        Node::Xform {
-            input,
-            translate,
-            rotate_degrees,
-            scale,
-            ..
-        } => {
+        "xform" => {
+            let input = &input_slot(node, 0)?;
+            let translate = &param_vec3(node, "translate")?;
+            let rotate_degrees = &param_vec3(node, "rotate_degrees")?;
+            let scale = &param_vec3(node, "scale")?;
+
             let input_geo = outputs.get(input).ok_or(EvalError::InvalidGraph)?;
             let sop = SopContext::new(ctx.budget.max_memory_bytes, ctx.cancelled);
             finish_sop(
@@ -1429,28 +1193,32 @@ fn eval_single_node(
                 ctx,
             )
         }
-        Node::Reverse { input, .. } => {
+        "reverse" => {
+            let input = &input_slot(node, 0)?;
+
             let input_geo = outputs.get(input).ok_or(EvalError::InvalidGraph)?;
             let sop = SopContext::new(ctx.budget.max_memory_bytes, ctx.cancelled);
             finish_sop(reverse_winding(input_geo, &sop), ctx)
         }
-        Node::Triangulate { input, .. } => {
+        "triangulate" => {
+            let input = &input_slot(node, 0)?;
+
             let input_geo = outputs.get(input).ok_or(EvalError::InvalidGraph)?;
             let sop = SopContext::new(ctx.budget.max_memory_bytes, ctx.cancelled);
             finish_sop(triangulate(input_geo, &sop), ctx)
         }
-        Node::Fuse {
-            input, distance, ..
-        } => {
+        "fuse" => {
+            let input = &input_slot(node, 0)?;
+            let distance = &param_f32(node, "distance")?;
+
             let input_geo = outputs.get(input).ok_or(EvalError::InvalidGraph)?;
             let sop = SopContext::new(ctx.budget.max_memory_bytes, ctx.cancelled);
             finish_sop(fuse_points(input_geo, f64::from(*distance), &sop), ctx)
         }
-        Node::Resample {
-            input,
-            segment_length,
-            ..
-        } => {
+        "resample" => {
+            let input = &input_slot(node, 0)?;
+            let segment_length = &param_f32(node, "segment_length")?;
+
             let input_geo = outputs.get(input).ok_or(EvalError::InvalidGraph)?;
             let sop = SopContext::new(ctx.budget.max_memory_bytes, ctx.cancelled);
             finish_sop(
@@ -1458,13 +1226,12 @@ fn eval_single_node(
                 ctx,
             )
         }
-        Node::Sweep {
-            input,
-            radius,
-            sides,
-            capped,
-            ..
-        } => {
+        "sweep" => {
+            let input = &input_slot(node, 0)?;
+            let radius = &param_f32(node, "radius")?;
+            let sides = &param_u32(node, "sides")?;
+            let capped = &param_bool(node, "capped")?;
+
             let input_geo = outputs.get(input).ok_or(EvalError::InvalidGraph)?;
             let sop = SopContext::new(ctx.budget.max_memory_bytes, ctx.cancelled);
             finish_sop(
@@ -1472,13 +1239,12 @@ fn eval_single_node(
                 ctx,
             )
         }
-        Node::AttribTransfer {
-            input,
-            source,
-            name,
-            radius,
-            ..
-        } => {
+        "attribtransfer" => {
+            let input = &input_slot(node, 0)?;
+            let source = &input_slot(node, 1)?;
+            let name = param_text(node, "name")?;
+            let radius = &param_f32(node, "radius")?;
+
             let input_geo = outputs.get(input).ok_or(EvalError::InvalidGraph)?;
             let source_geo = outputs.get(source).ok_or(EvalError::InvalidGraph)?;
             let sop = SopContext::new(ctx.budget.max_memory_bytes, ctx.cancelled);
@@ -1487,17 +1253,18 @@ fn eval_single_node(
                 ctx,
             )
         }
-        Node::Measure { input, .. } => {
+        "measure" => {
+            let input = &input_slot(node, 0)?;
+
             let input_geo = outputs.get(input).ok_or(EvalError::InvalidGraph)?;
             let sop = SopContext::new(ctx.budget.max_memory_bytes, ctx.cancelled);
             finish_sop(measure(input_geo, &sop), ctx)
         }
-        Node::PolyBevel {
-            input,
-            distance,
-            min_angle_degrees,
-            ..
-        } => {
+        "polybevel" => {
+            let input = &input_slot(node, 0)?;
+            let distance = &param_f32(node, "distance")?;
+            let min_angle_degrees = &param_f32(node, "min_angle_degrees")?;
+
             let input_geo = outputs.get(input).ok_or(EvalError::InvalidGraph)?;
             let sop = SopContext::new(ctx.budget.max_memory_bytes, ctx.cancelled);
             finish_sop(
@@ -1510,22 +1277,20 @@ fn eval_single_node(
                 ctx,
             )
         }
-        Node::PolyReduce {
-            input,
-            target_ratio,
-            ..
-        } => {
+        "polyreduce" => {
+            let input = &input_slot(node, 0)?;
+            let target_ratio = &param_f32(node, "target_ratio")?;
+
             let input_geo = outputs.get(input).ok_or(EvalError::InvalidGraph)?;
             let sop = SopContext::new(ctx.budget.max_memory_bytes, ctx.cancelled);
             finish_sop(poly_reduce(input_geo, f64::from(*target_ratio), &sop), ctx)
         }
-        Node::Remesh {
-            input,
-            target_length,
-            iterations,
-            feature_angle_degrees,
-            ..
-        } => {
+        "remesh" => {
+            let input = &input_slot(node, 0)?;
+            let target_length = &param_f32(node, "target_length")?;
+            let iterations = &param_u32(node, "iterations")?;
+            let feature_angle_degrees = &param_f32(node, "feature_angle_degrees")?;
+
             let input_geo = outputs.get(input).ok_or(EvalError::InvalidGraph)?;
             let sop = SopContext::new(ctx.budget.max_memory_bytes, ctx.cancelled);
             finish_sop(
@@ -1541,13 +1306,12 @@ fn eval_single_node(
                 ctx,
             )
         }
-        Node::Clip {
-            input,
-            origin,
-            normal,
-            cap,
-            ..
-        } => {
+        "clip" => {
+            let input = &input_slot(node, 0)?;
+            let origin = &param_vec3(node, "origin")?;
+            let normal = &param_vec3(node, "normal")?;
+            let cap = &param_bool(node, "cap")?;
+
             let input_geo = outputs.get(input).ok_or(EvalError::InvalidGraph)?;
             let sop = SopContext::new(ctx.budget.max_memory_bytes, ctx.cancelled);
             finish_sop(
@@ -1569,19 +1333,21 @@ fn eval_single_node(
                 ctx,
             )
         }
-        Node::VoronoiFracture { input, seeds, .. } => {
+        "voronoifracture" => {
+            let input = &input_slot(node, 0)?;
+            let seeds = &input_slot(node, 1)?;
+
             let input_geo = outputs.get(input).ok_or(EvalError::InvalidGraph)?;
             let seeds_geo = outputs.get(seeds).ok_or(EvalError::InvalidGraph)?;
             let sop = SopContext::new(ctx.budget.max_memory_bytes, ctx.cancelled);
             finish_sop(voronoi_fracture(input_geo, seeds_geo, &sop), ctx)
         }
-        Node::ScatterSurface {
-            input,
-            count,
-            seed,
-            min_distance,
-            ..
-        } => {
+        "scatter_surface" => {
+            let input = &input_slot(node, 0)?;
+            let count = &param_u32(node, "count")?;
+            let seed = &param_u64(node, "seed")?;
+            let min_distance = &param_f32(node, "min_distance")?;
+
             check_element_estimate(*count, ctx)?;
             let input_geo = outputs.get(input).ok_or(EvalError::InvalidGraph)?;
             let sop = SopContext::new(ctx.budget.max_memory_bytes, ctx.cancelled);
@@ -1598,11 +1364,10 @@ fn eval_single_node(
                 ctx,
             )
         }
-        Node::UvFlatten {
-            input,
-            seam_angle_degrees,
-            ..
-        } => {
+        "uvflatten" => {
+            let input = &input_slot(node, 0)?;
+            let seam_angle_degrees = &param_f32(node, "seam_angle_degrees")?;
+
             let input_geo = outputs.get(input).ok_or(EvalError::InvalidGraph)?;
             let sop = SopContext::new(ctx.budget.max_memory_bytes, ctx.cancelled);
             finish_sop(
@@ -1610,24 +1375,22 @@ fn eval_single_node(
                 ctx,
             )
         }
-        Node::UvLayout {
-            input,
-            padding,
-            tiles,
-            ..
-        } => {
+        "uvlayout" => {
+            let input = &input_slot(node, 0)?;
+            let padding = &param_f32(node, "padding")?;
+            let tiles = &param_u32(node, "tiles")?;
+
             let input_geo = outputs.get(input).ok_or(EvalError::InvalidGraph)?;
             let sop = SopContext::new(ctx.budget.max_memory_bytes, ctx.cancelled);
             finish_sop(uv_layout(input_geo, f64::from(*padding), *tiles, &sop), ctx)
         }
-        Node::GroupBounds {
-            input,
-            group_name,
-            domain,
-            min,
-            max,
-            ..
-        } => {
+        "group_bounds" => {
+            let input = &input_slot(node, 0)?;
+            let group_name = param_text(node, "group_name")?;
+            let domain = &param_choice(node, "domain", AttrDomain::from_token)?;
+            let min = &param_vec3(node, "min")?;
+            let max = &param_vec3(node, "max")?;
+
             let input_geo = outputs.get(input).ok_or(EvalError::InvalidGraph)?;
             let group_domain = match domain {
                 AttrDomain::Point => GroupDomain::Point,
@@ -1635,9 +1398,17 @@ fn eval_single_node(
                 AttrDomain::Detail => return Err(EvalError::InvalidGraph),
             };
             finish_sop(
-                input_geo.group_by_bounds(group_domain, group_name.as_str(), *min, *max),
+                input_geo.group_by_bounds(group_domain, group_name, *min, *max),
                 ctx,
             )
+        }
+        other => {
+            let cook = registered_cook(other).ok_or(EvalError::InvalidGraph)?;
+            let mut inputs = Vec::with_capacity(node.inputs.len());
+            for id in &node.inputs {
+                inputs.push(Arc::clone(outputs.get(id).ok_or(EvalError::InvalidGraph)?));
+            }
+            cook(node, &inputs, ctx)
         }
     }
 }
@@ -1866,15 +1637,10 @@ mod tests {
         let valid_custom_ids = GraphSnapshot {
             revision: RevisionId(3),
             nodes: vec![
-                Node::CreatePoints {
-                    id: pcc_id::NodeId(5),
-                    count: 4,
-                },
-                Node::Transform {
-                    id: pcc_id::NodeId(9),
-                    input: pcc_id::NodeId(5),
-                    offset: Vec3::checked(2.0, 0.0, 0.0).unwrap_or(Vec3::ZERO),
-                },
+                Node::new("create", pcc_id::NodeId(5)).with_u32("count", 4),
+                Node::new("transform", pcc_id::NodeId(9))
+                    .with_input(pcc_id::NodeId(5))
+                    .with_vec3("offset", Vec3::checked(2.0, 0.0, 0.0).unwrap_or(Vec3::ZERO)),
             ],
         };
         assert_eq!(cook(&valid_custom_ids, &ctx).map(|g| g.len()), Ok(4));
@@ -1882,15 +1648,10 @@ mod tests {
         let invalid_self_loop = GraphSnapshot {
             revision: RevisionId(3),
             nodes: vec![
-                Node::CreatePoints {
-                    id: pcc_id::NodeId(5),
-                    count: 4,
-                },
-                Node::Transform {
-                    id: pcc_id::NodeId(5),
-                    input: pcc_id::NodeId(5),
-                    offset: Vec3::ZERO,
-                },
+                Node::new("create", pcc_id::NodeId(5)).with_u32("count", 4),
+                Node::new("transform", pcc_id::NodeId(5))
+                    .with_input(pcc_id::NodeId(5))
+                    .with_vec3("offset", Vec3::ZERO),
             ],
         };
         assert!(matches!(
@@ -1915,25 +1676,16 @@ mod tests {
         let diamond_r1 = GraphSnapshot {
             revision: RevisionId(1),
             nodes: vec![
-                Node::CreatePoints {
-                    id: NodeId(1),
-                    count: 10,
-                },
-                Node::Transform {
-                    id: NodeId(2),
-                    input: NodeId(1),
-                    offset: Vec3::checked(1.0, 0.0, 0.0).unwrap_or(Vec3::ZERO),
-                },
-                Node::Transform {
-                    id: NodeId(3),
-                    input: NodeId(1),
-                    offset: Vec3::checked(0.0, 2.0, 0.0).unwrap_or(Vec3::ZERO),
-                },
-                Node::Merge {
-                    id: NodeId(4),
-                    left: NodeId(2),
-                    right: NodeId(3),
-                },
+                Node::new("create", NodeId(1)).with_u32("count", 10),
+                Node::new("transform", NodeId(2))
+                    .with_input(NodeId(1))
+                    .with_vec3("offset", Vec3::checked(1.0, 0.0, 0.0).unwrap_or(Vec3::ZERO)),
+                Node::new("transform", NodeId(3))
+                    .with_input(NodeId(1))
+                    .with_vec3("offset", Vec3::checked(0.0, 2.0, 0.0).unwrap_or(Vec3::ZERO)),
+                Node::new("merge", NodeId(4))
+                    .with_input(NodeId(2))
+                    .with_input(NodeId(3)),
             ],
         };
         let first = cook_cached(&cache, &diamond_r1, 0, 1, &ctx);
@@ -1944,9 +1696,12 @@ mod tests {
         // should hit the per-node content-addressed cache!
         let edited = diamond_r1.apply_edits(
             RevisionId(2),
-            &[GraphEdit::SetTransformOffset {
+            &[GraphEdit::SetParam {
                 id: NodeId(3),
-                offset: Vec3::checked(0.0, 5.0, 0.0).unwrap_or(Vec3::ZERO),
+                name: "offset".to_owned(),
+                value: pcc_graph::ParamValue::Vec3(
+                    Vec3::checked(0.0, 5.0, 0.0).unwrap_or(Vec3::ZERO),
+                ),
             }],
         );
         assert!(edited.is_ok());
@@ -1972,19 +1727,15 @@ mod tests {
         let snapshot = GraphSnapshot {
             revision: RevisionId(1),
             nodes: vec![
-                Node::CreateGrid {
-                    id: NodeId(1),
-                    rows: 4,
-                    cols: 5,
-                    size_x: 10.0,
-                    size_z: 8.0,
-                },
-                Node::Scatter {
-                    id: NodeId(2),
-                    input: NodeId(1),
-                    count: 50,
-                    seed: 42,
-                },
+                Node::new("grid", NodeId(1))
+                    .with_u32("rows", 4)
+                    .with_u32("cols", 5)
+                    .with_f32("size_x", 10.0)
+                    .with_f32("size_z", 8.0),
+                Node::new("scatter", NodeId(2))
+                    .with_input(NodeId(1))
+                    .with_u32("count", 50)
+                    .with_u64("seed", 42),
             ],
         };
         // Cook intermediate node 1 (CreateGrid): 4 * 5 = 20 points, (4-1)*(5-1) = 12 quad polygons, 48 vertices.
@@ -2030,28 +1781,19 @@ mod tests {
         let snapshot = GraphSnapshot {
             revision: RevisionId(1),
             nodes: vec![
-                Node::CreateBox {
-                    id: NodeId(1),
-                    size: Vec3::checked(2.0, 2.0, 2.0).unwrap_or(Vec3::ZERO),
-                },
-                Node::Normal {
-                    id: NodeId(2),
-                    input: NodeId(1),
-                },
-                Node::CreatePoints {
-                    id: NodeId(3),
-                    count: 3,
-                },
-                Node::PointWrangle {
-                    id: NodeId(4),
-                    input: NodeId(3),
-                    snippet: "f@pscale = 0.5; @P.x = float(@ptnum) * 10.0;".to_owned(),
-                },
-                Node::CopyToPoints {
-                    id: NodeId(5),
-                    source: NodeId(2),
-                    target: NodeId(4),
-                },
+                Node::new("box", NodeId(1))
+                    .with_vec3("size", Vec3::checked(2.0, 2.0, 2.0).unwrap_or(Vec3::ZERO)),
+                Node::new("normal", NodeId(2)).with_input(NodeId(1)),
+                Node::new("create", NodeId(3)).with_u32("count", 3),
+                Node::new("wrangle", NodeId(4))
+                    .with_input(NodeId(3))
+                    .with_text(
+                        "snippet",
+                        "f@pscale = 0.5; @P.x = float(@ptnum) * 10.0;".to_owned(),
+                    ),
+                Node::new("copytopoints", NodeId(5))
+                    .with_input(NodeId(2))
+                    .with_input(NodeId(4)),
             ],
         };
 
@@ -2093,53 +1835,37 @@ mod tests {
         let snapshot = GraphSnapshot {
             revision: RevisionId(1),
             nodes: vec![
-                Node::CreateBox {
-                    id: NodeId(1),
-                    size: Vec3::checked(2.0, 2.0, 2.0).unwrap_or(Vec3::ZERO),
-                },
-                Node::Subdivide {
-                    id: NodeId(2),
-                    input: NodeId(1),
-                    iterations: 1,
-                },
-                Node::Subdivide {
-                    id: NodeId(3),
-                    input: NodeId(2),
-                    iterations: 1,
-                },
-                Node::PolyExtrude {
-                    id: NodeId(4),
-                    input: NodeId(1),
-                    distance: 0.5,
-                    inset: 0.1,
-                },
-                Node::PointWrangle {
-                    id: NodeId(5),
-                    input: NodeId(1),
-                    snippet: "f@elev = @P.y; i@top = @P.y > 1.0;".to_owned(),
-                },
-                Node::AttribPromote {
-                    id: NodeId(6),
-                    input: NodeId(5),
-                    name: "elev".to_owned(),
-                    from_domain: AttrDomain::Point,
-                    to_domain: AttrDomain::Prim,
-                    mode: PromoteMode::Average,
-                },
-                Node::AttribPromote {
-                    id: NodeId(7),
-                    input: NodeId(6),
-                    name: "elev".to_owned(),
-                    from_domain: AttrDomain::Prim,
-                    to_domain: AttrDomain::Detail,
-                    mode: PromoteMode::Max,
-                },
-                Node::Blast {
-                    id: NodeId(8),
-                    input: NodeId(5),
-                    group_name: "top".to_owned(),
-                    negate: false,
-                },
+                Node::new("box", NodeId(1))
+                    .with_vec3("size", Vec3::checked(2.0, 2.0, 2.0).unwrap_or(Vec3::ZERO)),
+                Node::new("subdivide", NodeId(2))
+                    .with_input(NodeId(1))
+                    .with_u32("iterations", 1),
+                Node::new("subdivide", NodeId(3))
+                    .with_input(NodeId(2))
+                    .with_u32("iterations", 1),
+                Node::new("extrude", NodeId(4))
+                    .with_input(NodeId(1))
+                    .with_f32("distance", 0.5)
+                    .with_f32("inset", 0.1),
+                Node::new("wrangle", NodeId(5))
+                    .with_input(NodeId(1))
+                    .with_text("snippet", "f@elev = @P.y; i@top = @P.y > 1.0;".to_owned()),
+                Node::new("attribpromote", NodeId(6))
+                    .with_input(NodeId(5))
+                    .with_text("name", "elev".to_owned())
+                    .with_text("from_domain", AttrDomain::Point.as_str())
+                    .with_text("to_domain", AttrDomain::Prim.as_str())
+                    .with_text("mode", PromoteMode::Average.as_str()),
+                Node::new("attribpromote", NodeId(7))
+                    .with_input(NodeId(6))
+                    .with_text("name", "elev".to_owned())
+                    .with_text("from_domain", AttrDomain::Prim.as_str())
+                    .with_text("to_domain", AttrDomain::Detail.as_str())
+                    .with_text("mode", PromoteMode::Max.as_str()),
+                Node::new("blast", NodeId(8))
+                    .with_input(NodeId(5))
+                    .with_text("group_name", "top".to_owned())
+                    .with_bool("negate", false),
             ],
         };
 
@@ -2224,38 +1950,27 @@ mod tests {
         let snapshot = GraphSnapshot {
             revision: RevisionId(1),
             nodes: vec![
-                Node::HeightField {
-                    id: NodeId(1),
-                    rows: 12,
-                    cols: 12,
-                    size_x: 24.0,
-                    size_z: 24.0,
-                },
-                Node::HeightFieldNoise {
-                    id: NodeId(2),
-                    input: NodeId(1),
-                    amplitude: 6.0,
-                    frequency: 0.1,
-                    octaves: 4,
-                    seed: 42,
-                },
-                Node::HeightFieldErode {
-                    id: NodeId(3),
-                    input: NodeId(2),
-                    iterations: 10,
-                    rain_rate: 0.06,
-                    talus_angle: 35.0,
-                    seed: 7,
-                },
-                Node::UvProject {
-                    id: NodeId(4),
-                    input: NodeId(3),
-                    mode: UvProjectMode::PlanarY,
-                },
-                Node::Normal {
-                    id: NodeId(5),
-                    input: NodeId(4),
-                },
+                Node::new("heightfield", NodeId(1))
+                    .with_u32("rows", 12)
+                    .with_u32("cols", 12)
+                    .with_f32("size_x", 24.0)
+                    .with_f32("size_z", 24.0),
+                Node::new("hf_noise", NodeId(2))
+                    .with_input(NodeId(1))
+                    .with_f32("amplitude", 6.0)
+                    .with_f32("frequency", 0.1)
+                    .with_u32("octaves", 4)
+                    .with_u64("seed", 42),
+                Node::new("hf_erode", NodeId(3))
+                    .with_input(NodeId(2))
+                    .with_u32("iterations", 10)
+                    .with_f32("rain_rate", 0.06)
+                    .with_f32("talus_angle", 35.0)
+                    .with_u64("seed", 7),
+                Node::new("uvproject", NodeId(4))
+                    .with_input(NodeId(3))
+                    .with_text("mode", UvProjectMode::PlanarY.as_str()),
+                Node::new("normal", NodeId(5)).with_input(NodeId(4)),
             ],
         };
 
@@ -2291,37 +2006,24 @@ mod tests {
         let snapshot = GraphSnapshot {
             revision: RevisionId(1),
             nodes: vec![
-                Node::CreateBox {
-                    id: NodeId(1),
-                    size: Vec3::checked(2.0, 2.0, 2.0).unwrap_or(Vec3::ZERO),
-                },
-                Node::Transform {
-                    id: NodeId(2),
-                    input: NodeId(1),
-                    offset: Vec3::checked(1.0, 0.0, 0.0).unwrap_or(Vec3::ZERO),
-                },
-                Node::VdbFromPolygons {
-                    id: NodeId(3),
-                    input: NodeId(1),
-                    voxel_size: 0.5,
-                },
-                Node::VdbReshape {
-                    id: NodeId(4),
-                    input: NodeId(3),
-                    offset: 0.25,
-                    smooth_iterations: 1,
-                },
-                Node::ConvertVdb {
-                    id: NodeId(5),
-                    input: NodeId(4),
-                },
-                Node::Boolean {
-                    id: NodeId(6),
-                    left: NodeId(1),
-                    right: NodeId(2),
-                    mode: BooleanMode::Union,
-                    voxel_size: 0.5,
-                },
+                Node::new("box", NodeId(1))
+                    .with_vec3("size", Vec3::checked(2.0, 2.0, 2.0).unwrap_or(Vec3::ZERO)),
+                Node::new("transform", NodeId(2))
+                    .with_input(NodeId(1))
+                    .with_vec3("offset", Vec3::checked(1.0, 0.0, 0.0).unwrap_or(Vec3::ZERO)),
+                Node::new("vdb_from_polygons", NodeId(3))
+                    .with_input(NodeId(1))
+                    .with_f32("voxel_size", 0.5),
+                Node::new("vdb_reshape", NodeId(4))
+                    .with_input(NodeId(3))
+                    .with_f32("offset", 0.25)
+                    .with_u32("smooth_iterations", 1),
+                Node::new("convert_vdb", NodeId(5)).with_input(NodeId(4)),
+                Node::new("boolean", NodeId(6))
+                    .with_input(NodeId(1))
+                    .with_input(NodeId(2))
+                    .with_text("mode", BooleanMode::Union.as_str())
+                    .with_f32("voxel_size", 0.5),
             ],
         };
 
@@ -2385,69 +2087,45 @@ mod tests {
         let snapshot = GraphSnapshot {
             revision: RevisionId(1),
             nodes: vec![
-                Node::CreateTube {
-                    id: NodeId(1),
-                    radius: 1.0,
-                    height: 2.0,
-                    rows: 1,
-                    cols: 32,
-                },
-                Node::PolyBevel {
-                    id: NodeId(2),
-                    input: NodeId(1),
-                    distance: 0.05,
-                    min_angle_degrees: 45.0,
-                },
-                Node::Xform {
-                    id: NodeId(3),
-                    input: NodeId(2),
-                    translate: v3(0.0, 1.0, 0.0),
-                    rotate_degrees: v3(0.0, 30.0, 0.0),
-                    scale: v3(1.0, 1.0, 1.0),
-                },
-                Node::Clip {
-                    id: NodeId(4),
-                    input: NodeId(3),
-                    origin: v3(0.0, 1.0, 0.0),
-                    normal: v3(0.0, 1.0, 0.0),
-                    cap: true,
-                },
-                Node::Triangulate {
-                    id: NodeId(5),
-                    input: NodeId(4),
-                },
-                Node::Fuse {
-                    id: NodeId(6),
-                    input: NodeId(5),
-                    distance: 1e-5,
-                },
-                Node::PolyReduce {
-                    id: NodeId(7),
-                    input: NodeId(6),
-                    target_ratio: 0.5,
-                },
-                Node::Remesh {
-                    id: NodeId(8),
-                    input: NodeId(7),
-                    target_length: 0.25,
-                    iterations: 3,
-                    feature_angle_degrees: 30.0,
-                },
-                Node::UvFlatten {
-                    id: NodeId(9),
-                    input: NodeId(8),
-                    seam_angle_degrees: 60.0,
-                },
-                Node::UvLayout {
-                    id: NodeId(10),
-                    input: NodeId(9),
-                    padding: 0.01,
-                    tiles: 2,
-                },
-                Node::Measure {
-                    id: NodeId(11),
-                    input: NodeId(10),
-                },
+                Node::new("tube", NodeId(1))
+                    .with_f32("radius", 1.0)
+                    .with_f32("height", 2.0)
+                    .with_u32("rows", 1)
+                    .with_u32("cols", 32),
+                Node::new("polybevel", NodeId(2))
+                    .with_input(NodeId(1))
+                    .with_f32("distance", 0.05)
+                    .with_f32("min_angle_degrees", 45.0),
+                Node::new("xform", NodeId(3))
+                    .with_input(NodeId(2))
+                    .with_vec3("translate", v3(0.0, 1.0, 0.0))
+                    .with_vec3("rotate_degrees", v3(0.0, 30.0, 0.0))
+                    .with_vec3("scale", v3(1.0, 1.0, 1.0)),
+                Node::new("clip", NodeId(4))
+                    .with_input(NodeId(3))
+                    .with_vec3("origin", v3(0.0, 1.0, 0.0))
+                    .with_vec3("normal", v3(0.0, 1.0, 0.0))
+                    .with_bool("cap", true),
+                Node::new("triangulate", NodeId(5)).with_input(NodeId(4)),
+                Node::new("fuse", NodeId(6))
+                    .with_input(NodeId(5))
+                    .with_f32("distance", 1e-5),
+                Node::new("polyreduce", NodeId(7))
+                    .with_input(NodeId(6))
+                    .with_f32("target_ratio", 0.5),
+                Node::new("remesh", NodeId(8))
+                    .with_input(NodeId(7))
+                    .with_f32("target_length", 0.25)
+                    .with_u32("iterations", 3)
+                    .with_f32("feature_angle_degrees", 30.0),
+                Node::new("uvflatten", NodeId(9))
+                    .with_input(NodeId(8))
+                    .with_f32("seam_angle_degrees", 60.0),
+                Node::new("uvlayout", NodeId(10))
+                    .with_input(NodeId(9))
+                    .with_f32("padding", 0.01)
+                    .with_u32("tiles", 2),
+                Node::new("measure", NodeId(11)).with_input(NodeId(10)),
             ],
         };
         let volume = |id| -> Result<f64, String> {
@@ -2512,31 +2190,23 @@ mod tests {
         let snapshot = GraphSnapshot {
             revision: RevisionId(1),
             nodes: vec![
-                Node::CreateSphere {
-                    id: NodeId(1),
-                    radius: 1.0,
-                    rows: 16,
-                    cols: 24,
-                },
-                Node::ScatterSurface {
-                    id: NodeId(2),
-                    input: NodeId(1),
-                    count: 12,
-                    seed: 5,
-                    min_distance: 0.3,
-                },
-                Node::Xform {
-                    id: NodeId(3),
-                    input: NodeId(2),
-                    translate: Vec3::ZERO,
-                    rotate_degrees: Vec3::ZERO,
-                    scale: v3(0.7, 0.7, 0.7),
-                },
-                Node::VoronoiFracture {
-                    id: NodeId(4),
-                    input: NodeId(1),
-                    seeds: NodeId(3),
-                },
+                Node::new("sphere", NodeId(1))
+                    .with_f32("radius", 1.0)
+                    .with_u32("rows", 16)
+                    .with_u32("cols", 24),
+                Node::new("scatter_surface", NodeId(2))
+                    .with_input(NodeId(1))
+                    .with_u32("count", 12)
+                    .with_u64("seed", 5)
+                    .with_f32("min_distance", 0.3),
+                Node::new("xform", NodeId(3))
+                    .with_input(NodeId(2))
+                    .with_vec3("translate", Vec3::ZERO)
+                    .with_vec3("rotate_degrees", Vec3::ZERO)
+                    .with_vec3("scale", v3(0.7, 0.7, 0.7)),
+                Node::new("voronoifracture", NodeId(4))
+                    .with_input(NodeId(1))
+                    .with_input(NodeId(3)),
             ],
         };
         let whole = pcc_sop::signed_volume(&*cook_at(&cache, &snapshot, 1, &ctx)?);
@@ -2557,56 +2227,40 @@ mod tests {
         let snapshot = GraphSnapshot {
             revision: RevisionId(1),
             nodes: vec![
-                Node::CreateLine {
-                    id: NodeId(1),
-                    start: Vec3::ZERO,
-                    end: v3(0.0, 4.0, 0.0),
-                    points: 2,
-                },
-                Node::Resample {
-                    id: NodeId(2),
-                    input: NodeId(1),
-                    segment_length: 0.5,
-                },
-                Node::Sweep {
-                    id: NodeId(3),
-                    input: NodeId(2),
-                    radius: 0.25,
-                    sides: 8,
-                    capped: true,
-                },
-                Node::PointWrangle {
-                    id: NodeId(4),
-                    input: NodeId(3),
-                    snippet: "@heat = @P.y;".to_owned(),
-                },
-                Node::CreateSphere {
-                    id: NodeId(5),
-                    radius: 3.0,
-                    rows: 16,
-                    cols: 24,
-                },
-                Node::AttribTransfer {
-                    id: NodeId(6),
-                    input: NodeId(5),
-                    source: NodeId(4),
-                    name: "heat".to_owned(),
-                    radius: 2.0,
-                },
-                Node::GroupBounds {
-                    id: NodeId(7),
-                    input: NodeId(6),
-                    group_name: "upper".to_owned(),
-                    domain: AttrDomain::Prim,
-                    min: v3(-4.0, 0.0, -4.0),
-                    max: v3(4.0, 4.0, 4.0),
-                },
-                Node::Blast {
-                    id: NodeId(8),
-                    input: NodeId(7),
-                    group_name: "upper".to_owned(),
-                    negate: false,
-                },
+                Node::new("line", NodeId(1))
+                    .with_vec3("start", Vec3::ZERO)
+                    .with_vec3("end", v3(0.0, 4.0, 0.0))
+                    .with_u32("points", 2),
+                Node::new("resample", NodeId(2))
+                    .with_input(NodeId(1))
+                    .with_f32("segment_length", 0.5),
+                Node::new("sweep", NodeId(3))
+                    .with_input(NodeId(2))
+                    .with_f32("radius", 0.25)
+                    .with_u32("sides", 8)
+                    .with_bool("capped", true),
+                Node::new("wrangle", NodeId(4))
+                    .with_input(NodeId(3))
+                    .with_text("snippet", "@heat = @P.y;".to_owned()),
+                Node::new("sphere", NodeId(5))
+                    .with_f32("radius", 3.0)
+                    .with_u32("rows", 16)
+                    .with_u32("cols", 24),
+                Node::new("attribtransfer", NodeId(6))
+                    .with_input(NodeId(5))
+                    .with_input(NodeId(4))
+                    .with_text("name", "heat".to_owned())
+                    .with_f32("radius", 2.0),
+                Node::new("group_bounds", NodeId(7))
+                    .with_input(NodeId(6))
+                    .with_text("group_name", "upper".to_owned())
+                    .with_text("domain", AttrDomain::Prim.as_str())
+                    .with_vec3("min", v3(-4.0, 0.0, -4.0))
+                    .with_vec3("max", v3(4.0, 4.0, 4.0)),
+                Node::new("blast", NodeId(8))
+                    .with_input(NodeId(7))
+                    .with_text("group_name", "upper".to_owned())
+                    .with_bool("negate", false),
             ],
         };
         let resampled = cook_at(&cache, &snapshot, 2, &ctx)?;
@@ -2642,17 +2296,13 @@ mod tests {
         let graph = |ratio: f32| GraphSnapshot {
             revision: RevisionId(1),
             nodes: vec![
-                Node::CreateSphere {
-                    id: NodeId(1),
-                    radius: 1.0,
-                    rows: 12,
-                    cols: 16,
-                },
-                Node::PolyReduce {
-                    id: NodeId(2),
-                    input: NodeId(1),
-                    target_ratio: ratio,
-                },
+                Node::new("sphere", NodeId(1))
+                    .with_f32("radius", 1.0)
+                    .with_u32("rows", 12)
+                    .with_u32("cols", 16),
+                Node::new("polyreduce", NodeId(2))
+                    .with_input(NodeId(1))
+                    .with_f32("target_ratio", ratio),
             ],
         };
         let first = cook_at(&cache, &graph(0.5), 2, &ctx)?;
@@ -2680,16 +2330,11 @@ mod tests {
         let oversized = GraphSnapshot {
             revision: RevisionId(1),
             nodes: vec![
-                Node::CreateSphere {
-                    id: NodeId(1),
-                    radius: 1.0,
-                    rows: 2_000,
-                    cols: 2_000,
-                },
-                Node::Reverse {
-                    id: NodeId(2),
-                    input: NodeId(1),
-                },
+                Node::new("sphere", NodeId(1))
+                    .with_f32("radius", 1.0)
+                    .with_u32("rows", 2_000)
+                    .with_u32("cols", 2_000),
+                Node::new("reverse", NodeId(2)).with_input(NodeId(1)),
             ],
         };
         assert_eq!(
@@ -2720,18 +2365,14 @@ mod tests {
         let open_input = GraphSnapshot {
             revision: RevisionId(1),
             nodes: vec![
-                Node::CreateGrid {
-                    id: NodeId(1),
-                    rows: 3,
-                    cols: 3,
-                    size_x: 1.0,
-                    size_z: 1.0,
-                },
-                Node::VoronoiFracture {
-                    id: NodeId(2),
-                    input: NodeId(1),
-                    seeds: NodeId(1),
-                },
+                Node::new("grid", NodeId(1))
+                    .with_u32("rows", 3)
+                    .with_u32("cols", 3)
+                    .with_f32("size_x", 1.0)
+                    .with_f32("size_z", 1.0),
+                Node::new("voronoifracture", NodeId(2))
+                    .with_input(NodeId(1))
+                    .with_input(NodeId(1)),
             ],
         };
         assert_eq!(
@@ -2764,14 +2405,8 @@ mod tests {
         let graph = |content_hash: String| GraphSnapshot {
             revision: RevisionId(1),
             nodes: vec![
-                Node::GeoAsset {
-                    id: NodeId(1),
-                    content_hash,
-                },
-                Node::Normal {
-                    id: NodeId(2),
-                    input: NodeId(1),
-                },
+                Node::new("asset", NodeId(1)).with_text("content_hash", content_hash),
+                Node::new("normal", NodeId(2)).with_input(NodeId(1)),
             ],
         };
         let budget = CookBudget {
@@ -2817,5 +2452,131 @@ mod tests {
             Some(EvalError::Resource(GeoError::LimitExceeded))
         );
         Ok(())
+    }
+
+    /// Moves every point up by `height`, reading only its definition's parameters.
+    fn cook_lift(
+        node: &Node,
+        inputs: &[Arc<GeoDetail>],
+        ctx: &EvalContext<'_>,
+    ) -> Result<GeoDetail, EvalError> {
+        let height = param_f32(node, "height")?;
+        let offset = Vec3::checked(0.0, height, 0.0).map_err(|_| EvalError::InvalidGraph)?;
+        let input = inputs.first().ok_or(EvalError::InvalidGraph)?;
+        input
+            .translated_cancellable(offset, ctx.budget.max_memory_bytes, ctx.cancelled)
+            .map_err(EvalError::Resource)
+    }
+
+    static LIFT_INPUTS: [pcc_graph::NodeInput; 1] = [pcc_graph::NodeInput {
+        name: "input",
+        description: "Geometry to lift.",
+    }];
+    static LIFT_PARAMS: [pcc_graph::NodeParam; 1] = [pcc_graph::NodeParam {
+        name: "height",
+        kind: pcc_graph::ParamKind::F32,
+        check: pcc_graph::Check::Any,
+        description: "Distance to move up.",
+    }];
+
+    #[test]
+    fn a_runtime_operator_cooks_and_caches_like_a_built_in() -> Result<(), String> {
+        let def = NodeDef::new(
+            "test:lift",
+            "deform",
+            "Moves points up, defined entirely outside the built-in table.",
+            &LIFT_INPUTS,
+            &LIFT_PARAMS,
+        );
+        assert_eq!(register_operator(def, cook_lift), Ok(()));
+        assert_eq!(
+            register_operator(def, cook_lift),
+            Err(NodeRegistrationError::AlreadyDefined)
+        );
+        let cancelled = AtomicBool::new(false);
+        let ctx = sop_ctx(&cancelled);
+        let cache = CookCache::default();
+        let scene = |height: f32| GraphSnapshot {
+            revision: RevisionId(1),
+            nodes: vec![
+                Node::new("create", NodeId(1)).with_u32("count", 2),
+                Node::new("test:lift", NodeId(2))
+                    .with_input(NodeId(1))
+                    .with_f32("height", height),
+                // A built-in downstream of a custom operator.
+                Node::new("normal", NodeId(3)).with_input(NodeId(2)),
+            ],
+        };
+        let lifted = cook_at(&cache, &scene(2.5), 3, &ctx)?;
+        assert_eq!(lifted.point(1).map(|p| (p.x, p.y)), Some((1.0, 2.5)));
+        let hits = cache.node_cache_hits();
+        let again = cook_at(&cache, &scene(2.5), 3, &ctx)?;
+        assert_eq!(again.hash(), lifted.hash());
+        assert_eq!(
+            cache.node_cache_hits(),
+            hits + 3,
+            "all three nodes must hit"
+        );
+        // A parameter change invalidates the entry, as it does for a built-in.
+        let higher = cook_at(&cache, &scene(9.0), 3, &ctx)?;
+        assert_eq!(higher.point(0).map(|p| p.y), Some(9.0));
+        Ok(())
+    }
+
+    #[test]
+    fn cache_keys_ignore_ids_except_for_operators_seeded_by_their_id() {
+        let key = |node: &Node| CookCache::node_key(node, &[], 0, 1);
+        let box_at = |id| Node::new("box", NodeId(id)).with_vec3("size", v3(1.0, 1.0, 1.0));
+        assert_eq!(
+            key(&box_at(1)),
+            key(&box_at(2)),
+            "same work must share a cache entry"
+        );
+        let scatter_at = |id| {
+            Node::new("scatter", NodeId(id))
+                .with_input(NodeId(9))
+                .with_u32("count", 5)
+                .with_u64("seed", 1)
+        };
+        assert_ne!(
+            key(&scatter_at(1)),
+            key(&scatter_at(2)),
+            "its output depends on its id"
+        );
+        // Parameters and their values both matter, and negative zero equals zero.
+        let sized = |x: f32| Node::new("box", NodeId(1)).with_vec3("size", v3(x, 1.0, 1.0));
+        assert_ne!(key(&sized(1.0)), key(&sized(2.0)));
+        let offset = |x: f32| {
+            Node::new("transform", NodeId(1))
+                .with_input(NodeId(9))
+                .with_vec3("offset", Vec3 { x, y: 0.0, z: 0.0 })
+        };
+        assert_eq!(key(&offset(0.0)), key(&offset(-0.0)));
+        // Operators with the same parameters are still different operators.
+        let grid = Node::new("grid", NodeId(1))
+            .with_u32("rows", 2)
+            .with_u32("cols", 2)
+            .with_f32("size_x", 1.0)
+            .with_f32("size_z", 1.0);
+        let field = Node::new("heightfield", NodeId(1))
+            .with_u32("rows", 2)
+            .with_u32("cols", 2)
+            .with_f32("size_x", 1.0)
+            .with_f32("size_z", 1.0);
+        assert_ne!(key(&grid), key(&field));
+    }
+
+    #[test]
+    fn unregistered_operators_cannot_cook() {
+        let cancelled = AtomicBool::new(false);
+        let ctx = sop_ctx(&cancelled);
+        let scene = GraphSnapshot {
+            revision: RevisionId(1),
+            nodes: vec![
+                Node::new("create", NodeId(1)).with_u32("count", 2),
+                Node::new("test:never_registered", NodeId(2)).with_input(NodeId(1)),
+            ],
+        };
+        assert_eq!(cook(&scene, &ctx).err(), Some(EvalError::InvalidGraph));
     }
 }

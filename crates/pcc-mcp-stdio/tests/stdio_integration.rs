@@ -1,5 +1,5 @@
 //! Integration tests launching `pcc-mcp-stdio` over actual child-process stdio pipes.
-use pcc_graph::GraphSnapshot;
+use pcc_graph::{GraphSnapshot, Node};
 use pcc_id::{JobId, RevisionId};
 use pcc_math::Vec3;
 use pcc_mcp::{
@@ -496,7 +496,7 @@ async fn stdio_transport_initialize_discover_probe_replace_and_conflict() {
                     "arguments": {
                         "base_revision": 2,
                         "edits": [
-                            { "edit": "set_create_count", "id": 1, "count": 8 }
+                            { "edit": "set_param", "id": 1, "name": "count", "value": 8 }
                         ]
                     }
                 }
@@ -640,7 +640,7 @@ async fn stdio_transport_initialize_discover_probe_replace_and_conflict() {
                     "arguments": {
                         "tx_id": 1,
                         "edits": [
-                            { "edit": "set_create_count", "id": 1, "count": 12 }
+                            { "edit": "set_param", "id": 1, "name": "count", "value": 12 }
                         ]
                     }
                 }
@@ -770,25 +770,16 @@ async fn stdio_transport_initialize_discover_probe_replace_and_conflict() {
     let modeling_scene = GraphSnapshot {
         revision: RevisionId(6),
         nodes: vec![
-            pcc_graph::Node::CreateBox {
-                id: pcc_id::NodeId(1),
-                size: Vec3::checked(2.0, 2.0, 2.0).unwrap_or(Vec3::ZERO),
-            },
-            pcc_graph::Node::Subdivide {
-                id: pcc_id::NodeId(2),
-                input: pcc_id::NodeId(1),
-                iterations: 1,
-            },
-            pcc_graph::Node::PolyExtrude {
-                id: pcc_id::NodeId(3),
-                input: pcc_id::NodeId(2),
-                distance: 0.25,
-                inset: 0.05,
-            },
-            pcc_graph::Node::Normal {
-                id: pcc_id::NodeId(4),
-                input: pcc_id::NodeId(3),
-            },
+            Node::new("box", pcc_id::NodeId(1))
+                .with_vec3("size", Vec3::checked(2.0, 2.0, 2.0).unwrap_or(Vec3::ZERO)),
+            Node::new("subdivide", pcc_id::NodeId(2))
+                .with_input(pcc_id::NodeId(1))
+                .with_u32("iterations", 1),
+            Node::new("extrude", pcc_id::NodeId(3))
+                .with_input(pcc_id::NodeId(2))
+                .with_f32("distance", 0.25)
+                .with_f32("inset", 0.05),
+            Node::new("normal", pcc_id::NodeId(4)).with_input(pcc_id::NodeId(3)),
         ],
     };
     assert!(
@@ -859,38 +850,27 @@ async fn stdio_transport_initialize_discover_probe_replace_and_conflict() {
     let terrain_scene = GraphSnapshot {
         revision: RevisionId(7),
         nodes: vec![
-            pcc_graph::Node::HeightField {
-                id: pcc_id::NodeId(1),
-                rows: 10,
-                cols: 10,
-                size_x: 20.0,
-                size_z: 20.0,
-            },
-            pcc_graph::Node::HeightFieldNoise {
-                id: pcc_id::NodeId(2),
-                input: pcc_id::NodeId(1),
-                amplitude: 5.0,
-                frequency: 0.12,
-                octaves: 3,
-                seed: 42,
-            },
-            pcc_graph::Node::HeightFieldErode {
-                id: pcc_id::NodeId(3),
-                input: pcc_id::NodeId(2),
-                iterations: 8,
-                rain_rate: 0.05,
-                talus_angle: 35.0,
-                seed: 7,
-            },
-            pcc_graph::Node::UvProject {
-                id: pcc_id::NodeId(4),
-                input: pcc_id::NodeId(3),
-                mode: pcc_graph::UvProjectMode::PlanarY,
-            },
-            pcc_graph::Node::Normal {
-                id: pcc_id::NodeId(5),
-                input: pcc_id::NodeId(4),
-            },
+            Node::new("heightfield", pcc_id::NodeId(1))
+                .with_u32("rows", 10)
+                .with_u32("cols", 10)
+                .with_f32("size_x", 20.0)
+                .with_f32("size_z", 20.0),
+            Node::new("hf_noise", pcc_id::NodeId(2))
+                .with_input(pcc_id::NodeId(1))
+                .with_f32("amplitude", 5.0)
+                .with_f32("frequency", 0.12)
+                .with_u32("octaves", 3)
+                .with_u64("seed", 42),
+            Node::new("hf_erode", pcc_id::NodeId(3))
+                .with_input(pcc_id::NodeId(2))
+                .with_u32("iterations", 8)
+                .with_f32("rain_rate", 0.05)
+                .with_f32("talus_angle", 35.0)
+                .with_u64("seed", 7),
+            Node::new("uvproject", pcc_id::NodeId(4))
+                .with_input(pcc_id::NodeId(3))
+                .with_text("mode", pcc_graph::UvProjectMode::PlanarY.as_str()),
+            Node::new("normal", pcc_id::NodeId(5)).with_input(pcc_id::NodeId(4)),
         ],
     };
     assert!(
@@ -970,41 +950,25 @@ async fn stdio_transport_initialize_discover_probe_replace_and_conflict() {
     let vdb_boolean_scene = GraphSnapshot {
         revision: RevisionId(8),
         nodes: vec![
-            pcc_graph::Node::CreateBox {
-                id: pcc_id::NodeId(1),
-                size: Vec3::checked(2.0, 2.0, 2.0).unwrap_or(Vec3::ZERO),
-            },
-            pcc_graph::Node::Transform {
-                id: pcc_id::NodeId(2),
-                input: pcc_id::NodeId(1),
-                offset: Vec3::checked(1.0, 0.0, 0.0).unwrap_or(Vec3::ZERO),
-            },
-            pcc_graph::Node::Boolean {
-                id: pcc_id::NodeId(3),
-                left: pcc_id::NodeId(1),
-                right: pcc_id::NodeId(2),
-                mode: pcc_graph::BooleanMode::Union,
-                voxel_size: 0.5,
-            },
-            pcc_graph::Node::VdbFromPolygons {
-                id: pcc_id::NodeId(4),
-                input: pcc_id::NodeId(3),
-                voxel_size: 0.5,
-            },
-            pcc_graph::Node::VdbReshape {
-                id: pcc_id::NodeId(5),
-                input: pcc_id::NodeId(4),
-                offset: 0.1,
-                smooth_iterations: 1,
-            },
-            pcc_graph::Node::ConvertVdb {
-                id: pcc_id::NodeId(6),
-                input: pcc_id::NodeId(5),
-            },
-            pcc_graph::Node::Normal {
-                id: pcc_id::NodeId(7),
-                input: pcc_id::NodeId(6),
-            },
+            Node::new("box", pcc_id::NodeId(1))
+                .with_vec3("size", Vec3::checked(2.0, 2.0, 2.0).unwrap_or(Vec3::ZERO)),
+            Node::new("transform", pcc_id::NodeId(2))
+                .with_input(pcc_id::NodeId(1))
+                .with_vec3("offset", Vec3::checked(1.0, 0.0, 0.0).unwrap_or(Vec3::ZERO)),
+            Node::new("boolean", pcc_id::NodeId(3))
+                .with_input(pcc_id::NodeId(1))
+                .with_input(pcc_id::NodeId(2))
+                .with_text("mode", pcc_graph::BooleanMode::Union.as_str())
+                .with_f32("voxel_size", 0.5),
+            Node::new("vdb_from_polygons", pcc_id::NodeId(4))
+                .with_input(pcc_id::NodeId(3))
+                .with_f32("voxel_size", 0.5),
+            Node::new("vdb_reshape", pcc_id::NodeId(5))
+                .with_input(pcc_id::NodeId(4))
+                .with_f32("offset", 0.1)
+                .with_u32("smooth_iterations", 1),
+            Node::new("convert_vdb", pcc_id::NodeId(6)).with_input(pcc_id::NodeId(5)),
+            Node::new("normal", pcc_id::NodeId(7)).with_input(pcc_id::NodeId(6)),
         ],
     };
     assert!(
@@ -1211,43 +1175,31 @@ async fn agent_builds_fractures_and_verifies_a_solid_through_the_sop_operators()
     let scene = GraphSnapshot {
         revision: RevisionId(1),
         nodes: vec![
-            pcc_graph::Node::CreateSphere {
-                id: node_id(1),
-                radius: 1.0,
-                rows: 16,
-                cols: 24,
-            },
-            pcc_graph::Node::Remesh {
-                id: node_id(2),
-                input: node_id(1),
-                target_length: 0.25,
-                iterations: 3,
-                feature_angle_degrees: 90.0,
-            },
-            pcc_graph::Node::PolyReduce {
-                id: node_id(3),
-                input: node_id(2),
-                target_ratio: 0.5,
-            },
-            pcc_graph::Node::ScatterSurface {
-                id: node_id(4),
-                input: node_id(1),
-                count: 8,
-                seed: 21,
-                min_distance: 0.4,
-            },
-            pcc_graph::Node::Xform {
-                id: node_id(5),
-                input: node_id(4),
-                translate: Vec3::ZERO,
-                rotate_degrees: Vec3::ZERO,
-                scale: unit(0.6),
-            },
-            pcc_graph::Node::VoronoiFracture {
-                id: node_id(6),
-                input: node_id(3),
-                seeds: node_id(5),
-            },
+            Node::new("sphere", node_id(1))
+                .with_f32("radius", 1.0)
+                .with_u32("rows", 16)
+                .with_u32("cols", 24),
+            Node::new("remesh", node_id(2))
+                .with_input(node_id(1))
+                .with_f32("target_length", 0.25)
+                .with_u32("iterations", 3)
+                .with_f32("feature_angle_degrees", 90.0),
+            Node::new("polyreduce", node_id(3))
+                .with_input(node_id(2))
+                .with_f32("target_ratio", 0.5),
+            Node::new("scatter_surface", node_id(4))
+                .with_input(node_id(1))
+                .with_u32("count", 8)
+                .with_u64("seed", 21)
+                .with_f32("min_distance", 0.4),
+            Node::new("xform", node_id(5))
+                .with_input(node_id(4))
+                .with_vec3("translate", Vec3::ZERO)
+                .with_vec3("rotate_degrees", Vec3::ZERO)
+                .with_vec3("scale", unit(0.6)),
+            Node::new("voronoifracture", node_id(6))
+                .with_input(node_id(3))
+                .with_input(node_id(5)),
         ],
     };
     let replaced = call_tool(
@@ -1327,22 +1279,15 @@ async fn agent_imports_a_mesh_processes_it_and_exports_the_result() {
     let scene = GraphSnapshot {
         revision: RevisionId(1),
         nodes: vec![
-            pcc_graph::Node::GeoAsset {
-                id: node_id(1),
-                content_hash: hash.clone(),
-            },
-            pcc_graph::Node::Remesh {
-                id: node_id(2),
-                input: node_id(1),
-                target_length: 0.25,
-                iterations: 2,
-                feature_angle_degrees: 30.0,
-            },
-            pcc_graph::Node::UvFlatten {
-                id: node_id(3),
-                input: node_id(2),
-                seam_angle_degrees: 60.0,
-            },
+            Node::new("asset", node_id(1)).with_text("content_hash", hash.clone()),
+            Node::new("remesh", node_id(2))
+                .with_input(node_id(1))
+                .with_f32("target_length", 0.25)
+                .with_u32("iterations", 2)
+                .with_f32("feature_angle_degrees", 30.0),
+            Node::new("uvflatten", node_id(3))
+                .with_input(node_id(2))
+                .with_f32("seam_angle_degrees", 60.0),
         ],
     };
     let replaced = call_tool(
@@ -1416,14 +1361,8 @@ async fn agent_imports_a_mesh_processes_it_and_exports_the_result() {
     let unknown = GraphSnapshot {
         revision: RevisionId(2),
         nodes: vec![
-            pcc_graph::Node::GeoAsset {
-                id: node_id(1),
-                content_hash: "a".repeat(64),
-            },
-            pcc_graph::Node::Reverse {
-                id: node_id(2),
-                input: node_id(1),
-            },
+            Node::new("asset", node_id(1)).with_text("content_hash", "a".repeat(64)),
+            Node::new("reverse", node_id(2)).with_input(node_id(1)),
         ],
     };
     let _ = call_tool(

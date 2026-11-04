@@ -1,0 +1,11 @@
+[package]
+name = "pcc-expr"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+pcc-math = { path = "../pcc-math" }
+
+[lints]
+workspace = true

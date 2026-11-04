@@ -126,7 +126,7 @@ fn audit_tree(path: &Path, errors: &mut Vec<String>) {
 }
 fn crate_tier(name: &str) -> Option<u8> {
     match name {
-        "pcc-id" | "pcc-math" => Some(0),
+        "pcc-expr" | "pcc-id" | "pcc-math" => Some(0),
         "pcc-geo" | "pcc-graph" | "pcc-sop" | "pcc-terrain" | "pcc-vdb" => Some(1),
         "pcc-store" | "pcc-cmd" | "pcc-eval" | "pcc-io" | "pcc-vex" => Some(2),
         "pcc-mcp" => Some(3),

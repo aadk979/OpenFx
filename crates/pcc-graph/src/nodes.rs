@@ -594,6 +594,14 @@ impl Node {
         }
     }
 
+    /// This node's `.ofxs` line, which fully describes it, with any expressions unresolved.
+    #[must_use]
+    pub fn canonical_line(&self) -> String {
+        let mut line = String::new();
+        self.write_ofxs_line(&mut line);
+        line
+    }
+
     /// Appends this node's `.ofxs` line: operator, id, inputs, then parameters in table order.
     pub(crate) fn write_ofxs_line(&self, out: &mut String) {
         let canonical = |v: f32| if v == 0.0 { 0.0 } else { v };
@@ -865,6 +873,63 @@ pub fn node_catalog() -> Vec<crate::NodeTypeSpec> {
 }
 
 static BUILTIN_NODES: &[NodeDef] = &[
+    NodeDef::new(
+        "solver",
+        "state",
+        "Runs its body once per tick, each tick starting from the previous tick's result. Seeking restores the latest checkpoint at or before the requested tick and replays from there. Inside the body, `$F` is the tick.",
+        &[
+            input("initial", "The state at tick zero."),
+            input(
+                "body_output",
+                "The body's result, which becomes the next tick's state.",
+            ),
+        ],
+        &[param(
+            "ticks",
+            ParamKind::U32,
+            Check::Any,
+            "How many ticks to run. Use the expression `$F` to advance with the timeline.",
+        )],
+    ),
+    NodeDef::new(
+        "state_prev",
+        "state",
+        "Inside a solver body, outputs the state committed by the previous tick.",
+        &[],
+        &[param(
+            "zone",
+            ParamKind::U64,
+            Check::Any,
+            "The id of the owning `solver` node.",
+        )],
+    ),
+    NodeDef::new(
+        "foreach",
+        "state",
+        "Runs its body once per piece of the input, in ascending order of a primitive attribute, and merges the results. Inside the body, `$F` is the piece's ordinal.",
+        &[
+            input("input", "Geometry to split into pieces."),
+            input("body_output", "The body's result for one piece."),
+        ],
+        &[param(
+            "attribute",
+            ParamKind::Text,
+            Check::Identifier,
+            "An integer primitive attribute. Primitives with equal values form one piece.",
+        )],
+    ),
+    NodeDef::new(
+        "foreach_piece",
+        "state",
+        "Inside a foreach body, outputs the current piece.",
+        &[],
+        &[param(
+            "zone",
+            ParamKind::U64,
+            Check::Any,
+            "The id of the owning `foreach` node.",
+        )],
+    ),
     NodeDef::new(
         "create",
         "generator",

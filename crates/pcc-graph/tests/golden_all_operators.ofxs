@@ -42,3 +42,9 @@ scatter_surface 40 4 100 18446744073709551615 5e-2
 voronoifracture 41 4 40
 uvflatten 42 3 6.6e1
 uvlayout 43 42 1e-2 4
+state_prev 44 46
+reverse 45 44
+solver 46 3 45 3
+foreach_piece 47 49
+normal 48 47
+foreach 49 41 48 piece

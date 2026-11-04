@@ -454,7 +454,10 @@ async fn stdio_transport_initialize_discover_probe_replace_and_conflict() {
         let search_out = serde_json::from_value::<NodeCatalogSearchResponse>(
             resp["result"]["structuredContent"].clone(),
         );
-        assert_eq!(search_out.map(|s| s.node_types.len()).ok(), Some(1));
+        let names: Option<Vec<String>> = search_out
+            .ok()
+            .map(|found| found.node_types.into_iter().map(|t| t.type_name).collect());
+        assert_eq!(names, Some(vec!["foreach".to_owned(), "merge".to_owned()]));
     }
 
     assert!(
@@ -1461,5 +1464,75 @@ async fn agent_animates_a_parameter_with_an_expression_and_probes_two_frames() {
     let refused = call_tool(&mut client, 6, "graph_batch_edit", typo).await;
     assert_eq!(refused["isError"], true, "{refused}");
     assert_eq!(error_code(&refused), "scene_field_invalid", "{refused}");
+    client.shutdown().await;
+}
+
+#[tokio::test]
+async fn agent_runs_a_solver_and_seeks_the_timeline() {
+    let client_res = StdioClient::spawn();
+    assert!(client_res.is_ok(), "{client_res:?}");
+    let Ok(mut client) = client_res else {
+        return;
+    };
+    initialize(&mut client).await;
+    let node_id = pcc_id::NodeId;
+    let zero = Vec3::ZERO;
+    let one = Vec3::checked(1.0, 1.0, 1.0).unwrap_or(zero);
+    // A box rising by one metre per tick, advancing with the timeline.
+    let scene = GraphSnapshot {
+        revision: RevisionId(1),
+        nodes: vec![
+            Node::new("box", node_id(1)).with_vec3("size", one),
+            Node::new("state_prev", node_id(2)).with_u64("zone", 4),
+            Node::new("xform", node_id(3))
+                .with_input(node_id(2))
+                .with_vec3_expr("translate", ["0", "1", "0"])
+                .with_vec3("rotate_degrees", zero)
+                .with_vec3("scale", one),
+            Node::new("solver", node_id(4))
+                .with_input(node_id(1))
+                .with_input(node_id(3))
+                .with_expr("ticks", "$F"),
+        ],
+    };
+    let replaced = call_tool(
+        &mut client,
+        2,
+        "replace_scene",
+        json!({ "base_revision": 1, "ofxs": scene.to_ofxs() }),
+    )
+    .await;
+    assert_eq!(replaced["isError"], false, "{replaced}");
+    let frame = |numerator: i64| json!({ "frame_numerator": numerator, "frame_denominator": 1 });
+    let low_y = |probe: &Value| probe["structuredContent"]["bounds"][0]["y"].as_f64();
+    let start = call_tool(&mut client, 3, "geo_probe", frame(0)).await;
+    let base = low_y(&start).unwrap_or(f64::NAN);
+    // Seek forward, backward, and forward again, as a timeline scrub does.
+    for (id, frames) in [(4u64, 30i64), (5, 7), (6, 12), (7, 30)] {
+        let probe = call_tool(&mut client, id, "geo_probe", frame(frames)).await;
+        assert_eq!(probe["isError"], false, "{probe}");
+        let risen = low_y(&probe).unwrap_or(f64::NAN) - base;
+        assert!(
+            (risen - frames as f64).abs() < 1e-3,
+            "frame {frames}: {risen}"
+        );
+    }
+    // A body reading from outside its zone is refused when the edit is made.
+    let leaky = scene
+        .to_ofxs()
+        .replacen("solver 4 1 3", "reverse 5 3\nsolver 4 1 3", 1);
+    let refused = call_tool(
+        &mut client,
+        8,
+        "replace_scene",
+        json!({ "base_revision": 2, "ofxs": leaky }),
+    )
+    .await;
+    assert_eq!(refused["isError"], true, "{refused}");
+    assert_eq!(
+        error_code(&refused),
+        "scene_node_order_invalid",
+        "{refused}"
+    );
     client.shutdown().await;
 }

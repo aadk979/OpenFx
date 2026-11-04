@@ -7,8 +7,11 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
 mod nodes;
+mod zones;
 
 use nodes::parse_u64_strict;
+
+pub use zones::{FOREACH_OP, FOREACH_PIECE_OP, SOLVER_OP, STATE_PREV_OP, StateZone, ZoneKind};
 
 pub use nodes::{
     Check, Node, NodeDef, NodeInput, NodeParam, NodeRegistrationError, ParamKind, ParamValue,
@@ -268,6 +271,13 @@ impl GraphSnapshot {
                 .validate(node)?;
             defined.insert(id);
         }
+        for (entry, source) in zones::entry_source_edges(&self.nodes) {
+            let position = |id: NodeId| self.nodes.iter().position(|node| node.id == id);
+            if position(source) > position(entry) {
+                return Err(SceneError::NodeOrder);
+            }
+        }
+        self.zones()?;
         Ok(())
     }
 
@@ -400,6 +410,14 @@ fn topological_sort(nodes: &[Node]) -> Result<Vec<Node>, SceneError> {
             dependents[upstream_idx].push(idx);
             in_degree[idx] += 1;
         }
+    }
+    for (entry, source) in zones::entry_source_edges(nodes) {
+        let Some((&entry_idx, &source_idx)) = index_by_id.get(&entry).zip(index_by_id.get(&source))
+        else {
+            return Err(SceneError::NodeOrder);
+        };
+        dependents[source_idx].push(entry_idx);
+        in_degree[entry_idx] += 1;
     }
     let mut ready: Vec<usize> = in_degree
         .iter()
@@ -1176,8 +1194,16 @@ mod tests {
             assert_eq!(cycle, Err(SceneError::NodeOrder));
         }
 
-        assert_eq!(search_node_catalog("").len(), 43);
-        assert_eq!(search_node_catalog("merge").len(), 1);
+        assert_eq!(search_node_catalog("").len(), 47);
+        let matches: Vec<String> = search_node_catalog("merge")
+            .into_iter()
+            .map(|spec| spec.type_name)
+            .collect();
+        assert_eq!(
+            matches,
+            ["foreach", "merge"],
+            "matched by name or by description"
+        );
         assert!(inspect_node_type("transform").is_some());
         assert!(inspect_node_type("grid").is_some());
         assert!(inspect_node_type("box").is_some());

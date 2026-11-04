@@ -654,3 +654,179 @@ fn channel_references_are_dependencies_and_cannot_form_cycles() {
     );
     assert_eq!(cycle, Err(SceneError::NodeOrder));
 }
+
+fn zone_box(id: u64) -> Node {
+    Node::new("box", NodeId(id)).with_vec3("size", v3(1.0, 1.0, 1.0))
+}
+
+fn prev(id: u64, zone: u64) -> Node {
+    Node::new("state_prev", NodeId(id)).with_u64("zone", zone)
+}
+
+fn step(id: u64, input: u64) -> Node {
+    Node::new("reverse", NodeId(id)).with_input(NodeId(input))
+}
+
+fn solver(id: u64, initial: u64, output: u64) -> Node {
+    Node::new("solver", NodeId(id))
+        .with_input(NodeId(initial))
+        .with_input(NodeId(output))
+        .with_u32("ticks", 3)
+}
+
+fn snapshot(nodes: Vec<Node>) -> GraphSnapshot {
+    GraphSnapshot {
+        revision: RevisionId(1),
+        nodes,
+    }
+}
+
+#[test]
+fn a_zone_lists_its_members_in_scene_order() {
+    let scene = snapshot(vec![
+        zone_box(1),
+        zone_box(2),
+        prev(3, 7),
+        step(4, 3),
+        // A node reading outside the body too is still part of it.
+        Node::new("merge", NodeId(5))
+            .with_input(NodeId(4))
+            .with_input(NodeId(2)),
+        step(6, 5),
+        solver(7, 1, 6),
+        step(8, 7),
+    ]);
+    assert_eq!(scene.validate(), Ok(()));
+    let zones = scene.zones();
+    assert_eq!(zones.as_ref().map(Vec::len), Ok(1));
+    if let Ok(zones) = zones {
+        let zone = &zones[0];
+        assert_eq!(zone.owner, NodeId(7));
+        assert_eq!(zone.source, NodeId(1));
+        assert_eq!(zone.output, NodeId(6));
+        assert_eq!(zone.entries, vec![NodeId(3)]);
+        assert_eq!(zone.body, vec![NodeId(3), NodeId(4), NodeId(5), NodeId(6)]);
+    }
+    // The body may be nothing but its entry.
+    let identity = snapshot(vec![zone_box(1), prev(2, 3), solver(3, 1, 2)]);
+    assert_eq!(identity.validate(), Ok(()));
+}
+
+#[test]
+fn zones_are_sealed_so_no_value_escapes_except_the_committed_result() {
+    let order = Err(SceneError::NodeOrder);
+    let field = Err(SceneError::Field);
+    let check = |nodes: Vec<Node>| snapshot(nodes).validate();
+
+    // An entry must name an existing owner of its own kind.
+    assert_eq!(check(vec![zone_box(1), prev(2, 77), step(3, 2)]), order);
+    assert_eq!(check(vec![zone_box(1), prev(2, 1), step(3, 2)]), order);
+    let wrong_kind = Node::new("foreach_piece", NodeId(2)).with_u64("zone", 3);
+    assert_eq!(check(vec![zone_box(1), wrong_kind, solver(3, 1, 2)]), order);
+
+    // Outside code cannot read a live value from inside, by input or by channel.
+    let peek = vec![
+        zone_box(1),
+        prev(2, 4),
+        step(3, 2),
+        solver(4, 1, 3),
+        step(5, 3),
+    ];
+    assert_eq!(check(peek), order);
+    let channel = Node::new("sphere", NodeId(5))
+        .with_expr("radius", "ch(3, \"nope\")")
+        .with_u32("rows", 4)
+        .with_u32("cols", 4);
+    let peek = vec![
+        zone_box(1),
+        prev(2, 4),
+        step(3, 2),
+        solver(4, 1, 3),
+        channel,
+        step(6, 5),
+    ];
+    assert_eq!(check(peek), order);
+
+    // The owner itself may read its output, but nothing else inside.
+    let snooping = Node::new("solver", NodeId(5))
+        .with_input(NodeId(1))
+        .with_input(NodeId(4))
+        .with_expr("ticks", "ch(3, \"nope\")");
+    let peek = vec![zone_box(1), prev(2, 5), step(3, 2), step(4, 3), snooping];
+    assert_eq!(check(peek), order);
+
+    // A body that ignores its state would only repeat a constant.
+    let ignores = vec![
+        zone_box(1),
+        zone_box(2),
+        prev(3, 5),
+        step(4, 2),
+        solver(5, 1, 4),
+    ];
+    assert_eq!(check(ignores), field);
+    // An entry that feeds nothing is a mistake, not a no-op.
+    let unused = vec![
+        zone_box(1),
+        prev(2, 5),
+        prev(3, 5),
+        step(4, 2),
+        solver(5, 1, 4),
+    ];
+    assert_eq!(check(unused), order);
+
+    // The initial state must exist before the body, and come from outside it.
+    let late = vec![zone_box(1), prev(2, 4), zone_box(3), solver(4, 3, 2)];
+    assert_eq!(check(late), order);
+    let from_inside = vec![zone_box(1), prev(2, 4), step(3, 2), solver(4, 3, 3)];
+    assert_eq!(check(from_inside), order);
+
+    // Nested zones are not supported yet, and must say so.
+    let nested = vec![
+        zone_box(1),
+        prev(2, 6),
+        prev(3, 4),
+        solver(4, 2, 3),
+        step(5, 4),
+        solver(6, 1, 5),
+    ];
+    assert_eq!(check(nested), field);
+    let shared = vec![
+        zone_box(1),
+        prev(2, 5),
+        prev(3, 6),
+        Node::new("merge", NodeId(4))
+            .with_input(NodeId(2))
+            .with_input(NodeId(3)),
+        solver(5, 1, 4),
+        solver(6, 1, 4),
+    ];
+    // Sharing a body breaks the seal, since the second owner reads inside the first zone.
+    assert_eq!(check(shared), order);
+}
+
+#[test]
+fn edits_order_an_entry_after_its_source_and_can_build_a_zone() {
+    let base = snapshot(vec![zone_box(1), step(2, 1)]);
+    // The entry has no dependency of its own, so only the zone rule can place it after node 10.
+    let edited = base.apply_edits(
+        RevisionId(2),
+        &[
+            GraphEdit::AddNode { node: prev(3, 12) },
+            GraphEdit::AddNode { node: step(4, 3) },
+            GraphEdit::AddNode { node: zone_box(10) },
+            GraphEdit::AddNode {
+                node: solver(12, 10, 4),
+            },
+        ],
+    );
+    assert_eq!(edited.as_ref().err(), None);
+    if let Ok(edited) = edited {
+        let at = |id: u64| edited.nodes.iter().position(|n| n.id == NodeId(id));
+        assert!(at(10) < at(3), "the source must precede the entry");
+        assert!(at(4) < at(12));
+        assert_eq!(
+            GraphSnapshot::from_ofxs(&edited.to_ofxs()).as_ref(),
+            Ok(&edited)
+        );
+    }
+}

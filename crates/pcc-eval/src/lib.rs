@@ -7,7 +7,8 @@ use pcc_geo::{
 };
 use pcc_graph::{
     AttrDomain, BooleanMode, GraphSnapshot, Node, NodeDef, NodeRegistrationError, ParamKind,
-    ParamValue, PromoteMode, SceneError, UvProjectMode, node_def, register_node_def,
+    ParamValue, PromoteMode, SceneError, StateZone, UvProjectMode, ZoneKind, node_def,
+    register_node_def,
 };
 use pcc_id::{NodeId, RevisionId};
 use pcc_math::{Philox4x32, Vec3};
@@ -39,6 +40,11 @@ pub enum EvalError {
         limit: u32,
     },
     Asset(AssetError),
+    /// A zone asked for more ticks or pieces than the budget allows.
+    StateTickLimit {
+        requested: u32,
+        limit: u32,
+    },
     /// A parameter expression failed, or produced a value its parameter does not allow.
     Param {
         node: NodeId,
@@ -50,7 +56,12 @@ pub enum EvalError {
 pub struct CookBudget {
     pub max_memory_bytes: usize,
     pub max_elements: u32,
+    /// The most solver ticks or foreach pieces one zone may run in a single cook.
+    pub max_state_ticks: u32,
 }
+
+/// Enough for an hour at 24 frames per second with four substeps.
+pub const DEFAULT_MAX_STATE_TICKS: u32 = 345_600;
 impl CookBudget {
     /// Enforces that child/job budgets never exceed the parent budget.
     #[must_use]
@@ -58,6 +69,7 @@ impl CookBudget {
         Self {
             max_memory_bytes: self.max_memory_bytes.min(parent.max_memory_bytes),
             max_elements: self.max_elements.min(parent.max_elements),
+            max_state_ticks: self.max_state_ticks.min(parent.max_state_ticks),
         }
     }
 }
@@ -101,7 +113,12 @@ struct CacheEntry {
     geo: Arc<GeoDetail>,
 }
 
+/// A zone's identity, and the tick its state was stored at.
+type CheckpointKey = ([u8; 32], u32);
+
 pub struct CookCache {
+    checkpoints: Mutex<BTreeMap<CheckpointKey, Arc<GeoDetail>>>,
+    zone_ticks_run: AtomicU64,
     latest_revision: Mutex<RevisionId>,
     entries: Mutex<BTreeMap<CacheKey, CacheEntry>>,
     node_entries: Mutex<BTreeMap<NodeCacheKey, CacheEntry>>,
@@ -110,6 +127,8 @@ pub struct CookCache {
 impl Default for CookCache {
     fn default() -> Self {
         Self {
+            checkpoints: Mutex::new(BTreeMap::new()),
+            zone_ticks_run: AtomicU64::new(0),
             latest_revision: Mutex::new(RevisionId(0)),
             entries: Mutex::new(BTreeMap::new()),
             node_entries: Mutex::new(BTreeMap::new()),
@@ -185,6 +204,27 @@ impl CookCache {
         }
         found
     }
+    /// How many solver ticks have actually been computed, rather than restored or skipped.
+    #[must_use]
+    pub fn zone_ticks_run(&self) -> u64 {
+        self.zone_ticks_run.load(Ordering::Relaxed)
+    }
+
+    /// The latest stored state of a zone at or before `tick`.
+    fn latest_checkpoint(&self, zone: &[u8; 32], tick: u32) -> Option<(u32, Arc<GeoDetail>)> {
+        let checkpoints = self.checkpoints.lock().ok()?;
+        checkpoints
+            .range((*zone, 0)..=(*zone, tick))
+            .next_back()
+            .map(|((_, found), geo)| (*found, Arc::clone(geo)))
+    }
+
+    fn store_checkpoint(&self, zone: &[u8; 32], tick: u32, geo: &Arc<GeoDetail>) {
+        if let Ok(mut checkpoints) = self.checkpoints.lock() {
+            checkpoints.insert((*zone, tick), Arc::clone(geo));
+        }
+    }
+
     #[must_use]
     pub fn node_cache_hits(&self) -> u64 {
         self.node_hits.load(Ordering::Relaxed)
@@ -1561,6 +1601,274 @@ fn eval_single_node(
     }
 }
 
+/// How often a solver stores its state. Seeking replays at most this many ticks minus one.
+const CHECKPOINT_INTERVAL: u32 = 8;
+
+/// One evaluation of a scene at one point in time.
+struct Pass<'a> {
+    snapshot: &'a GraphSnapshot,
+    cache: Option<&'a CookCache>,
+    frame_numerator: i64,
+    frame_denominator: u32,
+    ctx: &'a EvalContext<'a>,
+}
+
+impl Pass<'_> {
+    /// Cooks one resolved node, through the content-addressed cache when there is one.
+    fn cook_node(
+        &self,
+        node: &Node,
+        outputs: &BTreeMap<NodeId, Arc<GeoDetail>>,
+    ) -> Result<Arc<GeoDetail>, EvalError> {
+        let (numerator, denominator) = (self.frame_numerator, self.frame_denominator);
+        let Some(cook_cache) = self.cache else {
+            return Ok(Arc::new(eval_single_node(
+                node,
+                outputs,
+                numerator,
+                denominator,
+                self.ctx,
+            )?));
+        };
+        let mut upstream_hashes = Vec::new();
+        for input_id in node.inputs() {
+            let upstream_geo = outputs.get(&input_id).ok_or(EvalError::InvalidGraph)?;
+            upstream_hashes.push(upstream_geo.hash());
+        }
+        let key = CookCache::node_key(node, &upstream_hashes, numerator, denominator);
+        if let Some(cached) = cook_cache.get_node(&key) {
+            return Ok(cached);
+        }
+        let evaluated = Arc::new(eval_single_node(
+            node,
+            outputs,
+            numerator,
+            denominator,
+            self.ctx,
+        )?);
+        let _ =
+            cook_cache.insert_node_if_fresh(key, self.snapshot.revision, Arc::clone(&evaluated));
+        Ok(evaluated)
+    }
+
+    /// The same pass, but with `$F` and operators that read time seeing `tick` instead.
+    const fn at_tick(&self, tick: i64) -> Pass<'_> {
+        Pass {
+            snapshot: self.snapshot,
+            cache: self.cache,
+            frame_numerator: tick,
+            frame_denominator: 1,
+            ctx: self.ctx,
+        }
+    }
+
+    /// Runs a zone's body once from `state`, in a scratch copy of the evaluated nodes, so that no
+    /// value from inside the body leaks into the rest of the scene.
+    fn run_body(
+        &self,
+        zone: &StateZone,
+        state: &Arc<GeoDetail>,
+        tick: i64,
+        outputs: &BTreeMap<NodeId, Arc<GeoDetail>>,
+        resolved: &BTreeMap<NodeId, Node>,
+    ) -> Result<Arc<GeoDetail>, EvalError> {
+        let pass = self.at_tick(tick);
+        let mut local = outputs.clone();
+        let mut local_resolved = resolved.clone();
+        for id in &zone.body {
+            let node = self
+                .snapshot
+                .nodes
+                .iter()
+                .find(|node| node.id == *id)
+                .ok_or(EvalError::InvalidGraph)?;
+            if zone.entries.contains(id) {
+                local.insert(*id, Arc::clone(state));
+                local_resolved.insert(*id, node.clone());
+                continue;
+            }
+            if self.ctx.cancelled.load(Ordering::Acquire) {
+                return Err(EvalError::Cancelled);
+            }
+            let scope = ParamScope {
+                frame: tick as f64,
+                node,
+                resolved: &local_resolved,
+                outputs: &local,
+            };
+            let ready = resolve_node(node, &scope)?;
+            let geo = pass.cook_node(&ready, &local)?;
+            local.insert(*id, geo);
+            local_resolved.insert(*id, ready);
+        }
+        local
+            .get(&zone.output)
+            .cloned()
+            .ok_or(EvalError::InvalidGraph)
+    }
+
+    /// Identifies a zone's computation: its body as written, and everything the body reads from
+    /// outside, by content. Equal keys mean equal state at every tick.
+    fn zone_key(
+        &self,
+        zone: &StateZone,
+        initial: &GeoDetail,
+        outputs: &BTreeMap<NodeId, Arc<GeoDetail>>,
+        resolved: &BTreeMap<NodeId, Node>,
+    ) -> Result<[u8; 32], EvalError> {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(b"pcc-eval-zone-v1");
+        hasher.update(initial.hash().as_bytes());
+        for id in &zone.body {
+            let node = self
+                .snapshot
+                .nodes
+                .iter()
+                .find(|node| node.id == *id)
+                .ok_or(EvalError::InvalidGraph)?;
+            hasher.update(node.canonical_line().as_bytes());
+            for dependency in node.dependencies() {
+                if zone.body.contains(&dependency) {
+                    continue;
+                }
+                if let Some(geo) = outputs.get(&dependency) {
+                    hasher.update(geo.hash().as_bytes());
+                }
+                if let Some(outside) = resolved.get(&dependency) {
+                    hasher.update(outside.canonical_line().as_bytes());
+                }
+            }
+        }
+        Ok(*hasher.finalize().as_bytes())
+    }
+
+    /// Merging has no element budget of its own, so foreach checks its running total.
+    fn check_merged(&self, state: &GeoDetail) -> Result<(), EvalError> {
+        let elements = u32::try_from(state.len()).unwrap_or(u32::MAX);
+        check_element_estimate(elements, self.ctx)?;
+        let bytes = state
+            .len()
+            .saturating_mul(std::mem::size_of::<Vec3>())
+            .saturating_add(
+                state
+                    .vertex_count()
+                    .saturating_mul(std::mem::size_of::<u32>()),
+            );
+        if bytes > self.ctx.budget.max_memory_bytes {
+            return Err(EvalError::Resource(GeoError::LimitExceeded));
+        }
+        Ok(())
+    }
+
+    /// Runs a solver: restores the latest checkpoint at or before the requested tick, then replays
+    /// fixed ticks to it. Each tick reads only the state committed by the one before.
+    fn run_solver(
+        &self,
+        zone: &StateZone,
+        node: &Node,
+        outputs: &BTreeMap<NodeId, Arc<GeoDetail>>,
+        resolved: &BTreeMap<NodeId, Node>,
+    ) -> Result<Arc<GeoDetail>, EvalError> {
+        let ticks = param_u32(node, "ticks")?;
+        let limit = self.ctx.budget.max_state_ticks;
+        if ticks > limit {
+            return Err(EvalError::StateTickLimit {
+                requested: ticks,
+                limit,
+            });
+        }
+        let initial = outputs.get(&zone.source).ok_or(EvalError::InvalidGraph)?;
+        let key = self.zone_key(zone, initial, outputs, resolved)?;
+        let restored = self
+            .cache
+            .and_then(|cache| cache.latest_checkpoint(&key, ticks));
+        let (done, mut state) = restored.unwrap_or_else(|| (0, Arc::clone(initial)));
+        for tick in done..ticks {
+            let tick = tick + 1;
+            // Each operator in the body enforces the budget on what it produces.
+            state = self.run_body(zone, &state, i64::from(tick), outputs, resolved)?;
+            if let Some(cache) = self.cache {
+                cache.zone_ticks_run.fetch_add(1, Ordering::Relaxed);
+                if tick.is_multiple_of(CHECKPOINT_INTERVAL) || tick == ticks {
+                    cache.store_checkpoint(&key, tick, &state);
+                }
+            }
+        }
+        Ok(state)
+    }
+
+    /// Runs a foreach: pieces are primitives with equal attribute values, in ascending order of
+    /// that value, so the result does not depend on how the input happens to be ordered.
+    fn run_foreach(
+        &self,
+        zone: &StateZone,
+        node: &Node,
+        outputs: &BTreeMap<NodeId, Arc<GeoDetail>>,
+        resolved: &BTreeMap<NodeId, Node>,
+    ) -> Result<Arc<GeoDetail>, EvalError> {
+        const PIECE_GROUP: &str = "pcc_foreach_piece";
+        let name = param_text(node, "attribute")?;
+        let input = outputs.get(&zone.source).ok_or(EvalError::InvalidGraph)?;
+        let fail = |message: &str| EvalError::Param {
+            node: node.id,
+            param: "attribute".to_owned(),
+            message: message.to_owned(),
+        };
+        let column = input
+            .domain_attribute(GeoAttrDomain::Prim, name)
+            .ok_or_else(|| fail("the input has no such primitive attribute"))?;
+        let values: Vec<i64> = match column {
+            AttributeColumn::I32(values) => (0..values.len())
+                .map(|i| values.get(i).map_or(0, i64::from))
+                .collect(),
+            AttributeColumn::U32(values) => (0..values.len())
+                .map(|i| values.get(i).map_or(0, i64::from))
+                .collect(),
+            _ => return Err(fail("the attribute must be an integer")),
+        };
+        let mut pieces: BTreeMap<i64, Vec<usize>> = BTreeMap::new();
+        for (prim, value) in values.into_iter().enumerate() {
+            pieces.entry(value).or_default().push(prim);
+        }
+        let limit = self.ctx.budget.max_state_ticks;
+        let count = u32::try_from(pieces.len()).unwrap_or(u32::MAX);
+        if count > limit {
+            return Err(EvalError::StateTickLimit {
+                requested: count,
+                limit,
+            });
+        }
+        let memory = self.ctx.budget.max_memory_bytes;
+        let resource = |error: GeoError| match error {
+            GeoError::Cancelled => EvalError::Cancelled,
+            other => EvalError::Resource(other),
+        };
+        let mut merged: Option<GeoDetail> = None;
+        for (ordinal, prims) in pieces.values().enumerate() {
+            let piece = input
+                .with_group(GroupDomain::Prim, PIECE_GROUP, prims)
+                .and_then(|grouped| {
+                    grouped.blast_group_cancellable(PIECE_GROUP, true, memory, self.ctx.cancelled)
+                })
+                .map_err(resource)?;
+            let result =
+                self.run_body(zone, &Arc::new(piece), ordinal as i64, outputs, resolved)?;
+            merged = Some(match merged {
+                None => (*result).clone(),
+                Some(sofar) => sofar
+                    .merged_cancellable(&result, memory, self.ctx.cancelled)
+                    .map_err(resource)?,
+            });
+            if let Some(sofar) = &merged {
+                self.check_merged(sofar)?;
+            }
+        }
+        Ok(Arc::new(
+            merged.unwrap_or_else(|| GeoDetail::points(Vec::new())),
+        ))
+    }
+}
+
 fn eval_dag<F>(
     snapshot: &GraphSnapshot,
     cache: Option<&CookCache>,
@@ -1579,6 +1887,14 @@ where
     {
         return Err(EvalError::NodeNotFound(target));
     }
+    let zones = snapshot.zones().map_err(|_| EvalError::InvalidGraph)?;
+    let pass = Pass {
+        snapshot,
+        cache,
+        frame_numerator,
+        frame_denominator,
+        ctx,
+    };
     let total_steps = snapshot.nodes.len() as u32;
     on_progress(0, total_steps);
     let mut outputs: BTreeMap<NodeId, Arc<GeoDetail>> = BTreeMap::new();
@@ -1590,7 +1906,29 @@ where
         if ctx.cancelled.load(Ordering::Acquire) {
             return Err(EvalError::Cancelled);
         }
-        let node = &resolve_node(
+        let done = (step_idx + 1) as u32;
+        let enclosing = zones.iter().find(|zone| zone.body.contains(&node.id));
+        if let Some(zone) = enclosing {
+            // A body only runs from its owner, unless a node inside it is what was asked for. Then
+            // it shows the first evaluation: the source geometry as its state.
+            let wanted = target_node.is_some_and(|target| zone.body.contains(&target));
+            if !wanted {
+                on_progress(done, total_steps);
+                continue;
+            }
+            if zone.entries.contains(&node.id) {
+                let source = outputs.get(&zone.source).ok_or(EvalError::InvalidGraph)?;
+                let source = Arc::clone(source);
+                resolved_nodes.insert(node.id, node.clone());
+                outputs.insert(node.id, Arc::clone(&source));
+                on_progress(done, total_steps);
+                if target_node == Some(node.id) {
+                    return Ok(source);
+                }
+                continue;
+            }
+        }
+        let ready = &resolve_node(
             node,
             &ParamScope {
                 frame,
@@ -1599,45 +1937,19 @@ where
                 outputs: &outputs,
             },
         )?;
-        let node_geo = if let Some(cook_cache) = cache {
-            let mut upstream_hashes = Vec::new();
-            for input_id in node.inputs() {
-                let upstream_geo = outputs.get(&input_id).ok_or(EvalError::InvalidGraph)?;
-                upstream_hashes.push(upstream_geo.hash());
+        let owned = zones.iter().find(|zone| zone.owner == node.id);
+        let node_geo = match owned {
+            Some(zone) if zone.kind == ZoneKind::Solver => {
+                pass.run_solver(zone, ready, &outputs, &resolved_nodes)?
             }
-            let nkey =
-                CookCache::node_key(node, &upstream_hashes, frame_numerator, frame_denominator);
-            if let Some(cached) = cook_cache.get_node(&nkey) {
-                cached
-            } else {
-                let evaluated = Arc::new(eval_single_node(
-                    node,
-                    &outputs,
-                    frame_numerator,
-                    frame_denominator,
-                    ctx,
-                )?);
-                let _ = cook_cache.insert_node_if_fresh(
-                    nkey,
-                    snapshot.revision,
-                    Arc::clone(&evaluated),
-                );
-                evaluated
-            }
-        } else {
-            Arc::new(eval_single_node(
-                node,
-                &outputs,
-                frame_numerator,
-                frame_denominator,
-                ctx,
-            )?)
+            Some(zone) => pass.run_foreach(zone, ready, &outputs, &resolved_nodes)?,
+            None => pass.cook_node(ready, &outputs)?,
         };
         let nid = node.id();
-        resolved_nodes.insert(nid, node.clone());
+        resolved_nodes.insert(nid, ready.clone());
         outputs.insert(nid, Arc::clone(&node_geo));
         last_output = Some(Arc::clone(&node_geo));
-        on_progress((step_idx + 1) as u32, total_steps);
+        on_progress(done, total_steps);
         if target_node == Some(nid) {
             return Ok(node_geo);
         }
@@ -1721,6 +2033,7 @@ mod tests {
             assets: &NoAssets,
             cancelled: &c,
             budget: CookBudget {
+                max_state_ticks: DEFAULT_MAX_STATE_TICKS,
                 max_memory_bytes: 1 << 20,
                 max_elements: 1_000,
             },
@@ -1737,6 +2050,7 @@ mod tests {
             assets: &NoAssets,
             cancelled: &c,
             budget: CookBudget {
+                max_state_ticks: DEFAULT_MAX_STATE_TICKS,
                 max_memory_bytes: 1 << 20,
                 max_elements: 1_000,
             },
@@ -1753,6 +2067,7 @@ mod tests {
             assets: &NoAssets,
             cancelled: &cancelled,
             budget: CookBudget {
+                max_state_ticks: DEFAULT_MAX_STATE_TICKS,
                 max_memory_bytes: 1 << 20,
                 max_elements: 1_000,
             },
@@ -1790,6 +2105,7 @@ mod tests {
             assets: &NoAssets,
             cancelled: &cancelled,
             budget: CookBudget {
+                max_state_ticks: DEFAULT_MAX_STATE_TICKS,
                 max_memory_bytes: 1 << 20,
                 max_elements: 1_000,
             },
@@ -1828,6 +2144,7 @@ mod tests {
             assets: &NoAssets,
             cancelled: &cancelled,
             budget: CookBudget {
+                max_state_ticks: DEFAULT_MAX_STATE_TICKS,
                 max_memory_bytes: 1 << 20,
                 max_elements: 1_000,
             },
@@ -1879,6 +2196,7 @@ mod tests {
             assets: &NoAssets,
             cancelled: &cancelled,
             budget: CookBudget {
+                max_state_ticks: DEFAULT_MAX_STATE_TICKS,
                 max_memory_bytes: 1 << 20,
                 max_elements: 10_000,
             },
@@ -1933,6 +2251,7 @@ mod tests {
             assets: &NoAssets,
             cancelled: &cancelled,
             budget: CookBudget {
+                max_state_ticks: DEFAULT_MAX_STATE_TICKS,
                 max_memory_bytes: 1 << 20,
                 max_elements: 10_000,
             },
@@ -1987,6 +2306,7 @@ mod tests {
             assets: &NoAssets,
             cancelled: &cancelled,
             budget: CookBudget {
+                max_state_ticks: DEFAULT_MAX_STATE_TICKS,
                 max_memory_bytes: 1 << 20,
                 max_elements: 10_000,
             },
@@ -2102,6 +2422,7 @@ mod tests {
             assets: &NoAssets,
             cancelled: &cancelled,
             budget: CookBudget {
+                max_state_ticks: DEFAULT_MAX_STATE_TICKS,
                 max_memory_bytes: 2 << 20,
                 max_elements: 10_000,
             },
@@ -2158,6 +2479,7 @@ mod tests {
             assets: &NoAssets,
             cancelled: &cancelled,
             budget: CookBudget {
+                max_state_ticks: DEFAULT_MAX_STATE_TICKS,
                 max_memory_bytes: 8 << 20,
                 max_elements: 50_000,
             },
@@ -2218,6 +2540,7 @@ mod tests {
             assets: &NoAssets,
             cancelled,
             budget: CookBudget {
+                max_state_ticks: DEFAULT_MAX_STATE_TICKS,
                 max_memory_bytes: 256 << 20,
                 max_elements: 2_000_000,
             },
@@ -2483,6 +2806,7 @@ mod tests {
             assets: &NoAssets,
             cancelled: &cancelled,
             budget: CookBudget {
+                max_state_ticks: DEFAULT_MAX_STATE_TICKS,
                 max_memory_bytes: 1 << 30,
                 max_elements: 1_000,
             },
@@ -2508,6 +2832,7 @@ mod tests {
             assets: &NoAssets,
             cancelled: &cancelled,
             budget: CookBudget {
+                max_state_ticks: DEFAULT_MAX_STATE_TICKS,
                 max_memory_bytes: 64,
                 max_elements: 1_000_000,
             },
@@ -2570,6 +2895,7 @@ mod tests {
             ],
         };
         let budget = CookBudget {
+            max_state_ticks: DEFAULT_MAX_STATE_TICKS,
             max_memory_bytes: 1 << 20,
             max_elements: 1000,
         };
@@ -2602,6 +2928,7 @@ mod tests {
             assets: &resolver,
             cancelled: &cancelled,
             budget: CookBudget {
+                max_state_ticks: DEFAULT_MAX_STATE_TICKS,
                 max_memory_bytes: 1,
                 max_elements: 1000,
             },

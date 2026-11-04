@@ -5,8 +5,8 @@ mod exchange;
 pub use exchange::{AssetStore, FileError, MeshFormat, Workspace};
 
 use pcc_eval::{
-    AssetError, CookBudget, CookCache, EvalContext, EvalError, cook_cached, cook_node_cached,
-    cook_with_progress,
+    AssetError, CookBudget, CookCache, DEFAULT_MAX_STATE_TICKS, EvalContext, EvalError,
+    cook_cached, cook_node_cached, cook_with_progress,
 };
 use pcc_geo::{GeoDetail, GeoError};
 use pcc_graph::{
@@ -200,6 +200,7 @@ pub enum ToolErrorCode {
     AssetNotFound,
     AssetCorrupt,
     ParamEvaluationFailed,
+    StateTickLimitExceeded,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -398,6 +399,10 @@ impl McpError {
                 job_id: None,
             },
             Self::Cook(eval_err) => match eval_err {
+                EvalError::StateTickLimit { requested, limit } => plain(
+                    ToolErrorCode::StateTickLimitExceeded,
+                    format!("a zone asked for {requested} ticks, and the limit is {limit}"),
+                ),
                 EvalError::Param {
                     node,
                     param,
@@ -685,6 +690,7 @@ impl RootService {
     #[must_use]
     pub const fn default_budget(&self) -> CookBudget {
         CookBudget {
+            max_state_ticks: DEFAULT_MAX_STATE_TICKS,
             max_memory_bytes: self.max_cook_memory_bytes,
             max_elements: self.max_cook_elements,
         }
@@ -1127,6 +1133,7 @@ impl RootService {
         let snapshot = self.store.snapshot().map_err(McpError::Store)?;
         let parent_budget = self.default_budget();
         let candidate_budget = CookBudget {
+            max_state_ticks: DEFAULT_MAX_STATE_TICKS,
             max_memory_bytes: requested_max_memory_bytes.unwrap_or(parent_budget.max_memory_bytes),
             max_elements: requested_max_elements.unwrap_or(parent_budget.max_elements),
         };

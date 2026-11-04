@@ -7,7 +7,7 @@ mod stl;
 use pcc_geo::{AttrDomain, AttributeColumn, GeoDetail, GeoError, GroupDomain, PrimKind, PrimRun};
 use pcc_math::Vec3;
 
-pub use stl::from_stl_bytes;
+pub use stl::{from_stl_bytes, to_stl_bytes};
 
 const OFXG_MAGIC: &[u8; 8] = b"OFXG\x01\x00\x00\x00";
 pub const DEFAULT_MAX_IO_ELEMENTS: usize = 10_000_000;
@@ -222,6 +222,15 @@ pub fn to_obj(geo: &GeoDetail) -> String {
             canonical(p.z)
         ));
     }
+    let texture = geo
+        .domain_attribute(AttrDomain::Vertex, "uv")
+        .and_then(AttributeColumn::as_vec3);
+    if let Some(column) = texture {
+        for idx in 0..column.len() {
+            let uv = column.get(idx).unwrap_or(Vec3::ZERO);
+            out.push_str(&format!("vt {:e} {:e}\n", canonical(uv.x), canonical(uv.y)));
+        }
+    }
     let mut vtx_cursor = 0usize;
     for run in geo.prim_runs() {
         let prefix = match run.kind {
@@ -233,7 +242,11 @@ pub fn to_obj(geo: &GeoDetail) -> String {
             out.push_str(prefix);
             for offset in 0..arity {
                 let pt_idx = geo.vertex_point(vtx_cursor + offset).unwrap_or(0);
-                out.push_str(&format!(" {}", pt_idx + 1));
+                if texture.is_some() {
+                    out.push_str(&format!(" {}/{}", pt_idx + 1, vtx_cursor + offset + 1));
+                } else {
+                    out.push_str(&format!(" {}", pt_idx + 1));
+                }
             }
             out.push('\n');
             vtx_cursor += arity;
@@ -242,14 +255,38 @@ pub fn to_obj(geo: &GeoDetail) -> String {
     out
 }
 
-/// Parses a `GeoDetail` from Wavefront `.obj` text (`v`, `f`, `l` records).
+/// Parses one `v` or `vt` index of a face corner. OBJ indices are 1-based, and negative values
+/// count back from the most recent element.
+fn parse_obj_index(token: &str, count: usize) -> Result<u32, IoFormatError> {
+    let value = token
+        .parse::<i64>()
+        .map_err(|_| IoFormatError::InvalidSyntax)?;
+    let resolved = if value > 0 {
+        value - 1
+    } else if value < 0 {
+        i64::try_from(count).map_err(|_| IoFormatError::ElementLimitExceeded)? + value
+    } else {
+        -1
+    };
+    u32::try_from(resolved).map_err(|_| IoFormatError::Geo(GeoError::IndexOutOfBounds))
+}
+
+/// Parses Wavefront `.obj` text as exported by common tools: `v`, `vt`, `f`, and `l` records with
+/// any line ending. Vertex colours, normals, groups, and materials are ignored because the engine
+/// derives or lacks them. Free-form surfaces fail loudly rather than vanish. Texture coordinates
+/// become vertex `v@uv` only when every corner has one.
 pub fn from_obj(text: &str) -> Result<GeoDetail, IoFormatError> {
-    if !text.is_ascii() || text.contains('\r') {
-        return Err(IoFormatError::InvalidSyntax);
-    }
+    from_obj_with_limit(text, DEFAULT_MAX_IO_ELEMENTS)
+}
+
+/// [`from_obj`] with an explicit limit on points plus primitive corners.
+pub fn from_obj_with_limit(text: &str, max_elements: usize) -> Result<GeoDetail, IoFormatError> {
     let mut points = Vec::new();
+    let mut texture = Vec::new();
     let mut runs: Vec<PrimRun> = Vec::new();
     let mut vertex_points: Vec<u32> = Vec::new();
+    let mut corner_texture: Vec<u32> = Vec::new();
+    let mut all_textured = true;
 
     for raw_line in text.lines() {
         let line = raw_line.trim();
@@ -260,17 +297,32 @@ pub fn from_obj(text: &str) -> Result<GeoDetail, IoFormatError> {
         let Some(keyword) = parts.next() else {
             continue;
         };
+        if points.len() + vertex_points.len() + texture.len() > max_elements {
+            return Err(IoFormatError::ElementLimitExceeded);
+        }
         match keyword {
             "v" => {
                 let x = parse_f32_obj(parts.next())?;
                 let y = parse_f32_obj(parts.next())?;
                 let z = parse_f32_obj(parts.next())?;
-                if parts.next().is_some() {
+                // Allowed remainders: nothing, a weight, a colour, or a weight and a colour.
+                let extra = parts.count();
+                if !matches!(extra, 0 | 1 | 3 | 4) {
                     return Err(IoFormatError::InvalidSyntax);
                 }
                 let pt =
                     Vec3::checked(x, y, z).map_err(|_| IoFormatError::Geo(GeoError::NonFinite))?;
                 points.push(pt);
+            }
+            "vt" => {
+                let u = parse_f32_obj(parts.next())?;
+                let v = match parts.next() {
+                    Some(token) => parse_f32_obj(Some(token))?,
+                    None => 0.0,
+                };
+                let uv = Vec3::checked(u, v, 0.0)
+                    .map_err(|_| IoFormatError::Geo(GeoError::NonFinite))?;
+                texture.push(uv);
             }
             "f" | "l" => {
                 let kind = if keyword == "f" {
@@ -280,14 +332,15 @@ pub fn from_obj(text: &str) -> Result<GeoDetail, IoFormatError> {
                 };
                 let mut indices = Vec::new();
                 for token in parts {
-                    let head = token.split('/').next().unwrap_or("");
-                    let one_based = head
-                        .parse::<u32>()
-                        .map_err(|_| IoFormatError::InvalidSyntax)?;
-                    if one_based == 0 {
-                        return Err(IoFormatError::Geo(GeoError::IndexOutOfBounds));
+                    let mut fields = token.split('/');
+                    let head = fields.next().unwrap_or("");
+                    indices.push(parse_obj_index(head, points.len())?);
+                    match fields.next() {
+                        Some(field) if !field.is_empty() => {
+                            corner_texture.push(parse_obj_index(field, texture.len())?);
+                        }
+                        _ => all_textured = false,
                     }
-                    indices.push(one_based - 1);
                 }
                 let min_arity = match kind {
                     PrimKind::Polygon => 3,
@@ -312,16 +365,28 @@ pub fn from_obj(text: &str) -> Result<GeoDetail, IoFormatError> {
                     });
                 }
             }
+            "vn" | "vp" | "g" | "o" | "s" | "mg" | "usemtl" | "mtllib" | "usemap" | "maplib" => {}
             _ => return Err(IoFormatError::InvalidSyntax),
         }
     }
 
     let geo = GeoDetail::points(points);
     if runs.is_empty() {
-        Ok(geo)
-    } else {
-        Ok(geo.with_primitives(runs, vertex_points)?)
+        return Ok(geo);
     }
+    let geo = geo.with_primitives(runs, vertex_points)?;
+    if !all_textured || corner_texture.is_empty() {
+        return Ok(geo);
+    }
+    let mut uv = Vec::with_capacity(corner_texture.len());
+    for &index in &corner_texture {
+        uv.push(
+            *texture
+                .get(index as usize)
+                .ok_or(IoFormatError::Geo(GeoError::IndexOutOfBounds))?,
+        );
+    }
+    Ok(geo.with_domain_attribute(AttrDomain::Vertex, "uv", AttributeColumn::vec3_values(uv))?)
 }
 
 fn parse_f32_obj(token: Option<&str>) -> Result<f32, IoFormatError> {
@@ -620,5 +685,94 @@ mod tests {
             corrupted[flip_idx] ^= 0xFF;
             assert!(from_ofxg_bytes(&corrupted).is_err());
         }
+    }
+
+    #[test]
+    fn real_world_obj_files_parse() -> Result<(), IoFormatError> {
+        let exported = "# Blender\r\nmtllib a.mtl\r\no Cube\r\n\
+            v 0 0 0 1 0 0\r\nv 1 0 0 1 0 0\r\nv 1 1 0 0 1 0\r\nv 0 1 0 1.0\r\n\
+            vn 0 0 1\r\nvt 0 0\r\nvt 1 0\r\nvt 1 1\r\nvt 0 1\r\n\
+            usemtl Material\r\ns off\r\ng group\r\nf 1/1/1 2/2/1 3/3/1 4/4/1\r\n";
+        let geo = from_obj(exported)?;
+        assert_eq!((geo.len(), geo.prim_count()), (4, 1));
+        let uv = geo
+            .domain_attribute(AttrDomain::Vertex, "uv")
+            .and_then(AttributeColumn::as_vec3)
+            .and_then(|column| column.get(2));
+        assert_eq!(uv.map(|p| (p.x, p.y, p.z)), Some((1.0, 1.0, 0.0)));
+        // Non-ASCII text in a comment or name is not an error.
+        assert_eq!(
+            from_obj("# café\nv 0 0 0\nv 1 0 0\nv 0 1 0\nf 1 2 3\n")?.prim_count(),
+            1
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn negative_obj_indices_count_back_from_the_latest_element() -> Result<(), IoFormatError> {
+        let relative = from_obj("v 0 0 0\nv 1 0 0\nv 0 1 0\nf -3 -2 -1\nv 5 5 5\nl -1 -2\n")?;
+        assert_eq!(relative.vertex_point(0), Some(0));
+        assert_eq!(relative.vertex_point(2), Some(2));
+        // The polyline's -1 is the fourth point, because it was defined before that line.
+        assert_eq!(relative.vertex_point(3), Some(3));
+        assert_eq!(relative.vertex_point(4), Some(2));
+        for bad in [
+            "v 0 0 0\nv 1 0 0\nv 0 1 0\nf 0 1 2\n",
+            "v 0 0 0\nv 1 0 0\nv 0 1 0\nf -4 -2 -1\n",
+            "v 0 0 0\nv 1 0 0\nv 0 1 0\nf 1 2 9\n",
+            "v 0 0 0\nv 1 0 0\nv 0 1 0\nvt 0 0\nf 1/9 2/9 3/9\n",
+        ] {
+            assert!(from_obj(bad).is_err(), "{bad:?}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn unsupported_obj_content_fails_instead_of_vanishing() {
+        for bad in [
+            "cstype bspline\n",
+            "surf 0 1 0 1 1 2\n",
+            "v 0 0\n",
+            "v 0 0 0 1 2\n",
+            "vt\n",
+            "v nan 0 0\n",
+            "f 1 2\n",
+        ] {
+            assert!(from_obj(bad).is_err(), "{bad:?}");
+        }
+        assert_eq!(
+            from_obj_with_limit("v 0 0 0\nv 1 0 0\nv 0 1 0\nv 0 0 1\n", 2).err(),
+            Some(IoFormatError::ElementLimitExceeded)
+        );
+    }
+
+    #[test]
+    fn uvs_survive_an_obj_round_trip_and_partial_uvs_are_dropped() -> Result<(), IoFormatError> {
+        let v = |x, y, z| Vec3::checked(x, y, z).map_err(|_| GeoError::NonFinite);
+        let geo = GeoDetail::points(vec![v(0., 0., 0.)?, v(1., 0., 0.)?, v(0., 1., 0.)?])
+            .with_primitives(
+                vec![PrimRun {
+                    kind: PrimKind::Polygon,
+                    arity: 3,
+                    prim_count: 1,
+                }],
+                vec![0, 1, 2],
+            )?
+            .with_domain_attribute(
+                AttrDomain::Vertex,
+                "uv",
+                AttributeColumn::vec3_values(vec![
+                    v(0.25, 0.5, 0.)?,
+                    v(0.75, 0.5, 0.)?,
+                    v(0.5, 1.0, 0.)?,
+                ]),
+            )?;
+        let text = to_obj(&geo);
+        assert!(text.contains("f 1/1 2/2 3/3"), "{text}");
+        let back = from_obj(&text)?;
+        assert_eq!(back.hash(), geo.hash());
+        let partial = from_obj("v 0 0 0\nv 1 0 0\nv 0 1 0\nvt 0 0\nf 1/1 2 3\n")?;
+        assert!(partial.domain_attribute(AttrDomain::Vertex, "uv").is_none());
+        Ok(())
     }
 }

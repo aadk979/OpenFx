@@ -3,7 +3,7 @@
 //! wild; orientation comes from vertex order alone.
 
 use crate::IoFormatError;
-use pcc_geo::{GeoDetail, PrimKind, PrimRun};
+use pcc_geo::{GeoDetail, GeoError, PrimKind, PrimRun};
 use pcc_math::Vec3;
 use std::collections::HashMap;
 
@@ -94,6 +94,65 @@ fn read_ascii(bytes: &[u8], max_triangles: usize) -> Result<GeoDetail, IoFormatE
     assemble(&corners)
 }
 
+/// Writes binary STL. Every polygon must be a triangle; polylines cannot be represented and are
+/// skipped. The header deliberately does not start with `solid`.
+pub fn to_stl_bytes(geo: &GeoDetail) -> Result<Vec<u8>, IoFormatError> {
+    let triangles: usize = geo
+        .prim_runs()
+        .iter()
+        .filter(|run| run.kind == PrimKind::Polygon)
+        .map(|run| {
+            if run.arity == 3 {
+                Ok(run.prim_count)
+            } else {
+                Err(IoFormatError::Geo(GeoError::InvalidTopology))
+            }
+        })
+        .sum::<Result<usize, _>>()?;
+    let count = u32::try_from(triangles).map_err(|_| IoFormatError::ElementLimitExceeded)?;
+    let mut bytes = Vec::with_capacity(BINARY_PREFIX + triangles * BINARY_FACET);
+    let mut header = [0u8; BINARY_HEADER];
+    let label = b"pcc binary stl";
+    header[..label.len()].copy_from_slice(label);
+    bytes.extend_from_slice(&header);
+    bytes.extend_from_slice(&count.to_le_bytes());
+    let mut cursor = 0usize;
+    for run in geo.prim_runs() {
+        let arity = run.arity as usize;
+        if run.kind != PrimKind::Polygon {
+            cursor += arity * run.prim_count;
+            continue;
+        }
+        for _ in 0..run.prim_count {
+            let mut corners = [Vec3::ZERO; 3];
+            for (k, corner) in corners.iter_mut().enumerate() {
+                let point = geo
+                    .vertex_point(cursor + k)
+                    .ok_or(GeoError::IndexOutOfBounds)?;
+                *corner = geo
+                    .point(point as usize)
+                    .ok_or(GeoError::IndexOutOfBounds)?;
+            }
+            cursor += arity;
+            let normal = corners[1]
+                .sub_checked(corners[0])
+                .and_then(|u| {
+                    corners[2]
+                        .sub_checked(corners[0])
+                        .and_then(|v| u.cross_checked(v))
+                })
+                .map_or(Vec3::UP, Vec3::normalized_or_up);
+            for value in [normal, corners[0], corners[1], corners[2]] {
+                for component in [value.x, value.y, value.z] {
+                    bytes.extend_from_slice(&component.to_le_bytes());
+                }
+            }
+            bytes.extend_from_slice(&[0u8; 2]);
+        }
+    }
+    Ok(bytes)
+}
+
 /// Whether the bytes begin like an ASCII STL. Many binary files also start with `solid`, so callers
 /// must try the exact binary size test first.
 fn looks_ascii(bytes: &[u8]) -> bool {
@@ -142,7 +201,6 @@ pub fn from_stl_bytes(bytes: &[u8], max_triangles: usize) -> Result<GeoDetail, I
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pcc_geo::GeoError;
     use pcc_math::Philox4x32;
 
     const LIMIT: usize = 1 << 20;
@@ -227,6 +285,31 @@ mod tests {
         assert_two_welded_triangles(&from_stl_bytes(&bytes, LIMIT)?);
         bytes.extend_from_slice(b"exporter trailer");
         assert_two_welded_triangles(&from_stl_bytes(&bytes, LIMIT)?);
+        Ok(())
+    }
+
+    #[test]
+    fn written_files_read_back_identically_and_quads_are_refused() -> Result<(), IoFormatError> {
+        let original = from_stl_bytes(&binary_stl(b"x", &TWO_TRIANGLES), LIMIT)?;
+        let written = to_stl_bytes(&original)?;
+        assert!(!written.starts_with(b"solid"));
+        assert_eq!(written.len(), BINARY_PREFIX + 2 * BINARY_FACET);
+        // The stored normal of the first triangle faces +Z, from its vertex order.
+        let normal_z = f32::from_le_bytes([written[92], written[93], written[94], written[95]]);
+        assert!((normal_z - 1.0).abs() < 1e-6, "{normal_z}");
+        assert_eq!(from_stl_bytes(&written, LIMIT)?.hash(), original.hash());
+        let quad = GeoDetail::points(vec![Vec3::ZERO; 4]).with_primitives(
+            vec![PrimRun {
+                kind: PrimKind::Polygon,
+                arity: 4,
+                prim_count: 1,
+            }],
+            vec![0, 1, 2, 3],
+        )?;
+        assert_eq!(
+            to_stl_bytes(&quad).err(),
+            Some(IoFormatError::Geo(GeoError::InvalidTopology))
+        );
         Ok(())
     }
 

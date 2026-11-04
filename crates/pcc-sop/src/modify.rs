@@ -53,6 +53,19 @@ pub fn transform_trs(
         positions.push(to_vec3(add(apply_matrix(&rotation, scaled), translate))?);
     }
     let mut out = geo.with_positions(positions)?;
+    // Instances compose the same map onto their own transforms, leaving prototypes untouched.
+    let rows_of = |row: D3| {
+        Vec3::checked(
+            (row[0] * scale[0]) as f32,
+            (row[1] * scale[1]) as f32,
+            (row[2] * scale[2]) as f32,
+        )
+    };
+    out = out.with_packed_linear(&[
+        rows_of(rotation[0])?,
+        rows_of(rotation[1])?,
+        rows_of(rotation[2])?,
+    ])?;
     for domain in [AttrDomain::Point, AttrDomain::Vertex, AttrDomain::Prim] {
         let Some(normals) = geo
             .domain_attribute(domain, "N")
@@ -135,7 +148,7 @@ pub fn triangulate(geo: &GeoDetail, ctx: &SopContext<'_>) -> Result<GeoDetail, G
                     prims.push((PrimKind::Polygon, t.to_vec()));
                 }
             }
-            PrimKind::Polyline => prims.push((PrimKind::Polyline, prim.points)),
+            kind => prims.push((kind, prim.points)),
         }
     }
     ctx.check_output(geo.len(), prims.iter().map(|p| p.1.len()).sum())?;
@@ -219,6 +232,7 @@ pub fn fuse_points(
                 3
             }
             PrimKind::Polyline => 2,
+            PrimKind::Packed => 1,
         };
         if mapped.len() >= minimum {
             prims.push((prim.kind, mapped));
@@ -256,7 +270,7 @@ pub fn measure(geo: &GeoDetail, ctx: &SopContext<'_>) -> Result<GeoDetail, GeoEr
         let segments = prim.points.len()
             - match prim.kind {
                 PrimKind::Polygon => 0,
-                PrimKind::Polyline => 1,
+                PrimKind::Polyline | PrimKind::Packed => 1,
             };
         let mut perimeter = 0.0;
         for k in 0..segments {
@@ -275,7 +289,7 @@ pub fn measure(geo: &GeoDetail, ctx: &SopContext<'_>) -> Result<GeoDetail, GeoEr
                 let order: Vec<u32> = (0..shifted.len() as u32).collect();
                 dot_len(polygon_area_vector(&shifted, &order)) * 0.5
             }
-            PrimKind::Polyline => 0.0,
+            PrimKind::Polyline | PrimKind::Packed => 0.0,
         };
         total_area += area;
         areas.push(FiniteF32::checked(area as f32)?);

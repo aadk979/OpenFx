@@ -1122,4 +1122,96 @@ mod tests {
             }
         }
     }
+
+    #[test]
+    fn range_functions_work_away_from_zero() {
+        // A range starting at zero hides mistakes in the subtraction, so these do not.
+        for (source, expected) in [
+            ("smoothstep(2, 4, 3)", 0.5),
+            ("smoothstep(2, 6, 3)", 0.15625),
+            ("smoothstep(2, 4, 1)", 0.0),
+            ("smoothstep(2, 4, 5)", 1.0),
+            ("fit(3, 2, 6, 10, 20)", 12.5),
+            ("fit(1, 2, 6, 10, 20)", 10.0),
+            ("fit(7, 2, 6, 10, 20)", 20.0),
+        ] {
+            assert_value(source, expected);
+        }
+    }
+
+    #[test]
+    fn every_value_kind_works_on_either_side_of_an_operator() {
+        // On the right, a value lands above another on the stack, where a wrong stack pointer shows.
+        for (source, expected) in [
+            ("2 + $F", 50.0),
+            ("2 + $T", 4.0),
+            ("2 + $FPS", 26.0),
+            ("2 + $PI - $PI", 2.0),
+            ("2 + ch(\"own\")", 5.0),
+            ("2 + npoints(0)", 102.0),
+            ("2 + bbox(0, \"xsize\")", 10.0),
+            ("$F + 2", 50.0),
+            ("$T + 2", 4.0),
+            ("$FPS + 2", 26.0),
+            ("$F + $T + $FPS", 74.0),
+            ("min($F, $T)", 2.0),
+        ] {
+            assert_value(source, expected);
+        }
+    }
+
+    #[test]
+    fn strict_comparisons_are_false_at_equality() {
+        assert_value("2 < 2", 0.0);
+        assert_value("2 > 2", 0.0);
+        assert_value("2 <= 2", 1.0);
+        assert_value("2 >= 2", 1.0);
+        assert_value("step(2, 2)", 1.0);
+    }
+
+    #[test]
+    fn limits_hold_at_their_exact_boundaries() {
+        // Source length: exactly at the limit is fine, one more is not.
+        let padded = |len: usize| format!("1{}", " ".repeat(len - 1));
+        assert!(Expr::compile(&padded(MAX_SOURCE_LEN)).is_ok());
+        assert_eq!(
+            Expr::compile(&padded(MAX_SOURCE_LEN + 1)).map_err(|e| e.message),
+            Err("the expression is too long".to_owned())
+        );
+        // Parser nesting: each parenthesis adds one level, up to the limit.
+        let nested = |levels: usize| format!("{}1{}", "(".repeat(levels), ")".repeat(levels));
+        assert!(Expr::compile(&nested(MAX_STACK)).is_ok());
+        assert_eq!(
+            Expr::compile(&nested(MAX_STACK + 1)).map_err(|e| e.message),
+            Err("the expression is too deeply nested".to_owned())
+        );
+        // Stack depth: each `fit` holds four values while its last argument evaluates, so 15 levels
+        // hold 60. An innermost formula needing four more reaches the limit of 64 exactly.
+        let levels =
+            |inner: &str| format!("{}{inner}{}", "fit(1, 2, 3, 4, ".repeat(15), ")".repeat(15));
+        let at_limit = Expr::compile(&levels("min(1, min(2, min(3, 4)))"));
+        // Filling the very last slot still evaluates in bounds.
+        assert!(at_limit.is_ok_and(|expr| expr.eval(&TestScope).is_ok()));
+        assert_eq!(
+            Expr::compile(&levels("min(1, min(2, min(3, min(4, 5))))")).map_err(|e| e.message),
+            Err("the expression is too deeply nested".to_owned())
+        );
+    }
+
+    #[test]
+    fn faults_describe_themselves_because_agents_read_the_messages() {
+        let compile = Expr::compile("1 + $X")
+            .map(|_| ())
+            .map_err(|e| e.to_string());
+        assert_eq!(
+            compile,
+            Err("at byte 6: unknown variable: use $F, $T, $FPS, $PI, or $E".to_owned())
+        );
+        assert_eq!(
+            EvalError::UnknownChannel("size.x".to_owned()).to_string(),
+            "no such channel: size.x"
+        );
+        assert_eq!(EvalError::NoSuchInput(2).to_string(), "no input 2");
+        assert_eq!(EvalError::NonFinite.to_string(), "the result is not finite");
+    }
 }

@@ -48,3 +48,6 @@ solver 46 3 45 3
 foreach_piece 47 49
 normal 48 47
 foreach 49 41 48 piece
+pack 50 3
+instance 51 3 25
+unpack 52 51

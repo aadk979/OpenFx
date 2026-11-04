@@ -1,6 +1,11 @@
 //! Paged copy-on-write geometry detail and validated typed attribute columns.
 //! Page starts are logical 16,384-element boundaries (`PAGE_LEN`).
 
+mod packed;
+
+use packed::PackedTable;
+pub use packed::{MAX_PACKED_DEPTH, PackedInstance, PackedPrototype};
+
 use pcc_math::{MathError, Vec3};
 use std::{
     collections::BTreeMap,
@@ -65,6 +70,8 @@ pub enum AttrType {
 pub enum PrimKind {
     Polygon,
     Polyline,
+    /// An instance of a shared prototype. Arity one: its vertex is the instance's point.
+    Packed,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -152,6 +159,7 @@ pub struct GeoDetail {
     detail_attributes: Arc<BTreeMap<String, AttributeColumn>>,
     point_groups: Arc<BTreeMap<String, ElementGroup>>,
     prim_groups: Arc<BTreeMap<String, ElementGroup>>,
+    packed: Option<Arc<PackedTable>>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -397,66 +405,41 @@ impl AttributeColumn {
         second: Option<&Self>,
         second_len: usize,
     ) -> Result<Self, GeoError> {
+        Self::concatenated_all(&[(first, first_len), (second, second_len)])
+    }
+
+    /// Joins any number of `(column, length)` parts end to end, filling a missing part with zeros.
+    pub(crate) fn concatenated_all(parts: &[(Option<&Self>, usize)]) -> Result<Self, GeoError> {
         fn join<T: HashableValue>(
-            first: Option<&PagedColumn<T>>,
-            first_len: usize,
-            second: Option<&PagedColumn<T>>,
-            second_len: usize,
+            parts: &[(Option<&AttributeColumn>, usize)],
+            view: fn(&AttributeColumn) -> Option<&PagedColumn<T>>,
             zero: T,
         ) -> PagedColumn<T> {
-            let read = |column: Option<&PagedColumn<T>>, index: usize| {
-                column.and_then(|c| c.get(index)).unwrap_or(zero)
-            };
-            let mut values = Vec::with_capacity(first_len + second_len);
-            values.extend((0..first_len).map(|i| read(first, i)));
-            values.extend((0..second_len).map(|i| read(second, i)));
+            let total = parts.iter().map(|part| part.1).sum();
+            let mut values = Vec::with_capacity(total);
+            for (column, len) in parts {
+                let column = column.and_then(view);
+                values.extend((0..*len).map(|i| column.and_then(|c| c.get(i)).unwrap_or(zero)));
+            }
             PagedColumn::from_vec(values)
         }
-        let kind = first
-            .or(second)
+        let kind = parts
+            .iter()
+            .find_map(|part| part.0)
             .ok_or(GeoError::AttributeNotFound)?
             .attr_type();
-        if first.is_some_and(|c| c.attr_type() != kind)
-            || second.is_some_and(|c| c.attr_type() != kind)
+        if parts
+            .iter()
+            .any(|part| part.0.is_some_and(|c| c.attr_type() != kind))
         {
             return Err(GeoError::AttributeTypeMismatch);
         }
         Ok(match kind {
-            AttrType::F32 => Self::F32(join(
-                first.and_then(Self::as_f32),
-                first_len,
-                second.and_then(Self::as_f32),
-                second_len,
-                FiniteF32::ZERO,
-            )),
-            AttrType::I32 => Self::I32(join(
-                first.and_then(Self::as_i32),
-                first_len,
-                second.and_then(Self::as_i32),
-                second_len,
-                0,
-            )),
-            AttrType::U32 => Self::U32(join(
-                first.and_then(Self::as_u32),
-                first_len,
-                second.and_then(Self::as_u32),
-                second_len,
-                0,
-            )),
-            AttrType::Bool => Self::Bool(join(
-                first.and_then(Self::as_bool),
-                first_len,
-                second.and_then(Self::as_bool),
-                second_len,
-                false,
-            )),
-            AttrType::Vec3 => Self::Vec3(join(
-                first.and_then(Self::as_vec3),
-                first_len,
-                second.and_then(Self::as_vec3),
-                second_len,
-                Vec3::ZERO,
-            )),
+            AttrType::F32 => Self::F32(join(parts, Self::as_f32, FiniteF32::ZERO)),
+            AttrType::I32 => Self::I32(join(parts, Self::as_i32, 0)),
+            AttrType::U32 => Self::U32(join(parts, Self::as_u32, 0)),
+            AttrType::Bool => Self::Bool(join(parts, Self::as_bool, false)),
+            AttrType::Vec3 => Self::Vec3(join(parts, Self::as_vec3, Vec3::ZERO)),
         })
     }
 
@@ -567,6 +550,7 @@ impl GeoDetail {
             detail_attributes: Arc::new(BTreeMap::new()),
             point_groups: Arc::new(BTreeMap::new()),
             prim_groups: Arc::new(BTreeMap::new()),
+            packed: None,
         }
     }
 
@@ -658,6 +642,15 @@ impl GeoDetail {
         runs: Vec<PrimRun>,
         vertex_points: Vec<u32>,
     ) -> Result<Self, GeoError> {
+        // A packed primitive needs table entries, which only the packed API supplies.
+        if runs.iter().any(|run| run.kind == PrimKind::Packed) {
+            return Err(GeoError::InvalidTopology);
+        }
+        self.with_runs(runs, vertex_points)
+    }
+
+    /// Attaches topology of any kind, without packed data. Callers supply that separately.
+    pub fn with_runs(&self, runs: Vec<PrimRun>, vertex_points: Vec<u32>) -> Result<Self, GeoError> {
         let mut expected_vertices = 0usize;
         let mut total_prims = 0usize;
         for run in &runs {
@@ -667,8 +660,9 @@ impl GeoDetail {
             let min_arity = match run.kind {
                 PrimKind::Polygon => 3,
                 PrimKind::Polyline => 2,
+                PrimKind::Packed => 1,
             };
-            if run.arity < min_arity {
+            if run.arity < min_arity || (run.kind == PrimKind::Packed && run.arity != 1) {
                 return Err(GeoError::InvalidTopology);
             }
             let run_verts = (run.arity as usize)
@@ -697,6 +691,7 @@ impl GeoDetail {
         next.vertex_attributes = Arc::new(BTreeMap::new());
         next.prim_attributes = Arc::new(BTreeMap::new());
         next.prim_groups = Arc::new(BTreeMap::new());
+        next.packed = None;
         Ok(next)
     }
 
@@ -926,7 +921,7 @@ impl GeoDetail {
                 vertex_points.push(shifted);
             }
         }
-        base.with_primitives(runs, vertex_points)?
+        base.with_runs(runs, vertex_points)?
             .with_merged_data(self, other)
     }
 
@@ -976,6 +971,8 @@ impl GeoDetail {
             detail.entry(name.clone()).or_insert_with(|| column.clone());
         }
         self.detail_attributes = Arc::new(detail);
+        self.packed =
+            PackedTable::merged(first.packed.as_deref(), second.packed.as_deref()).map(Arc::new);
         let groups = |left: &BTreeMap<String, ElementGroup>,
                       right: &BTreeMap<String, ElementGroup>,
                       left_len: usize,
@@ -2195,7 +2192,7 @@ impl GeoDetail {
             for _ in 0..run.prim_count {
                 match run.kind {
                     PrimKind::Polygon => order.extend((cursor..cursor + arity).rev()),
-                    PrimKind::Polyline => order.extend(cursor..cursor + arity),
+                    PrimKind::Polyline | PrimKind::Packed => order.extend(cursor..cursor + arity),
                 }
                 cursor += arity;
             }
@@ -2251,6 +2248,7 @@ impl GeoDetail {
                 let kind_tag: u8 = match run.kind {
                     PrimKind::Polygon => 1,
                     PrimKind::Polyline => 2,
+                    PrimKind::Packed => 3,
                 };
                 h.update(&[kind_tag]);
                 h.update(&run.arity.to_le_bytes());
@@ -2287,6 +2285,9 @@ impl GeoDetail {
                 }
             }
         }
+        if let Some(table) = &self.packed {
+            table.update_hash(&mut h);
+        }
         h.finalize()
     }
 
@@ -2304,6 +2305,19 @@ impl GeoDetail {
                 hi.y = hi.y.max(p.y);
                 hi.z = hi.z.max(p.z);
             }
+        }
+        // Instances reach past their points, by as much as their prototypes extend.
+        if let Some((low, high)) = self.packed_bounds() {
+            lo = Vec3 {
+                x: lo.x.min(low.x),
+                y: lo.y.min(low.y),
+                z: lo.z.min(low.z),
+            };
+            hi = Vec3 {
+                x: hi.x.max(high.x),
+                y: hi.y.max(high.y),
+                z: hi.z.max(high.z),
+            };
         }
         Some((lo, hi))
     }
@@ -2501,6 +2515,7 @@ impl TopologyIndex {
             let kind_tag: u8 = match run.kind {
                 PrimKind::Polygon => 1,
                 PrimKind::Polyline => 2,
+                PrimKind::Packed => 3,
             };
             h.update(&[kind_tag]);
             h.update(&run.arity.to_le_bytes());
@@ -2558,7 +2573,8 @@ impl TopologyIndex {
                                 }
                             }
                         }
-                        PrimKind::Polyline => {
+                        // A packed primitive has one vertex, and so no edges at all.
+                        PrimKind::Polyline | PrimKind::Packed => {
                             if k + 1 < arity
                                 && let Some(slot) = next_he.get_mut(he)
                             {

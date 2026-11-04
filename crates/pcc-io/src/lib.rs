@@ -4,8 +4,12 @@
 
 mod stl;
 
-use pcc_geo::{AttrDomain, AttributeColumn, GeoDetail, GeoError, GroupDomain, PrimKind, PrimRun};
+use pcc_geo::{
+    AttrDomain, AttributeColumn, GeoDetail, GeoError, GroupDomain, MAX_PACKED_DEPTH,
+    PackedInstance, PrimKind, PrimRun,
+};
 use pcc_math::Vec3;
+use std::sync::Arc;
 
 pub use stl::{from_stl_bytes, to_stl_bytes};
 
@@ -55,6 +59,7 @@ pub fn to_ofxg_bytes(geo: &GeoDetail) -> Vec<u8> {
         let kind_tag: u8 = match run.kind {
             PrimKind::Polygon => 1,
             PrimKind::Polyline => 2,
+            PrimKind::Packed => 3,
         };
         payload.push(kind_tag);
         write_u32(&mut payload, run.arity);
@@ -100,7 +105,29 @@ pub fn to_ofxg_bytes(geo: &GeoDetail) -> Vec<u8> {
         }
     }
 
-    // 5. Append 32-byte BLAKE3 payload integrity digest
+    // 5. Packed instances, only when present, so that other geometry's files never change.
+    if geo.packed_count() > 0 {
+        let prototypes = geo.packed_prototypes();
+        write_u64(&mut payload, prototypes.len() as u64);
+        for prototype in prototypes {
+            let bytes = to_ofxg_bytes(prototype.geo());
+            write_u64(&mut payload, bytes.len() as u64);
+            payload.extend_from_slice(&bytes);
+        }
+        write_u64(&mut payload, geo.packed_count() as u64);
+        for index in 0..geo.packed_count() {
+            if let Some(instance) = geo.packed_instance(index) {
+                write_u32(&mut payload, instance.prototype);
+                for row in instance.rows {
+                    write_f32(&mut payload, row.x);
+                    write_f32(&mut payload, row.y);
+                    write_f32(&mut payload, row.z);
+                }
+            }
+        }
+    }
+
+    // 6. Append 32-byte BLAKE3 payload integrity digest
     let checksum = blake3::hash(&payload);
     payload.extend_from_slice(checksum.as_bytes());
     payload
@@ -116,6 +143,15 @@ pub fn from_ofxg_bytes_with_limit(
     bytes: &[u8],
     max_elements: usize,
 ) -> Result<GeoDetail, IoFormatError> {
+    read_ofxg(bytes, max_elements, 0)
+}
+
+/// Reads a file, whose packed prototypes are themselves files. `depth` bounds that recursion, so a
+/// crafted file cannot exhaust the stack by nesting.
+fn read_ofxg(bytes: &[u8], max_elements: usize, depth: u32) -> Result<GeoDetail, IoFormatError> {
+    if depth > MAX_PACKED_DEPTH {
+        return Err(IoFormatError::ElementLimitExceeded);
+    }
     if bytes.len() < OFXG_MAGIC.len() + 32 + 32 {
         return Err(IoFormatError::UnexpectedEof);
     }
@@ -151,6 +187,7 @@ pub fn from_ofxg_bytes_with_limit(
         let kind = match kind_tag {
             1 => PrimKind::Polygon,
             2 => PrimKind::Polyline,
+            3 => PrimKind::Packed,
             _ => return Err(IoFormatError::InvalidTypeTag),
         };
         let arity = read_u32(body, &mut cursor)?;
@@ -167,7 +204,7 @@ pub fn from_ofxg_bytes_with_limit(
         vertex_points.push(read_u32(body, &mut cursor)?);
     }
     if !runs.is_empty() || !vertex_points.is_empty() {
-        geo = geo.with_primitives(runs, vertex_points)?;
+        geo = geo.with_runs(runs, vertex_points)?;
     }
 
     // 3. Attributes across all 4 domains
@@ -197,6 +234,38 @@ pub fn from_ofxg_bytes_with_limit(
             }
             geo = geo.with_group(domain, name, &indices)?;
         }
+    }
+
+    // 5. Packed instances, which only exist in files of geometry that has them.
+    let packed_expected: usize = geo
+        .prim_runs()
+        .iter()
+        .filter(|run| run.kind == PrimKind::Packed)
+        .map(|run| run.prim_count)
+        .sum();
+    if packed_expected > 0 {
+        let prototype_count = read_bounded_len(body, &mut cursor, max_elements)?;
+        let mut prototypes = Vec::with_capacity(prototype_count);
+        for _ in 0..prototype_count {
+            let length = read_bounded_len(body, &mut cursor, usize::MAX)?;
+            let nested = read_slice(body, &mut cursor, length)?;
+            prototypes.push(Arc::new(read_ofxg(nested, max_elements, depth + 1)?));
+        }
+        let instance_count = read_bounded_len(body, &mut cursor, max_elements)?;
+        let mut instances = Vec::with_capacity(instance_count);
+        for _ in 0..instance_count {
+            let prototype = read_u32(body, &mut cursor)?;
+            let mut rows = [Vec3::ZERO; 3];
+            for row in &mut rows {
+                let x = read_f32(body, &mut cursor)?;
+                let y = read_f32(body, &mut cursor)?;
+                let z = read_f32(body, &mut cursor)?;
+                *row =
+                    Vec3::checked(x, y, z).map_err(|_| IoFormatError::Geo(GeoError::NonFinite))?;
+            }
+            instances.push(PackedInstance { prototype, rows });
+        }
+        geo = geo.with_packed_parts(prototypes, &instances)?;
     }
 
     if cursor != body.len() {
@@ -233,11 +302,16 @@ pub fn to_obj(geo: &GeoDetail) -> String {
     }
     let mut vtx_cursor = 0usize;
     for run in geo.prim_runs() {
+        let arity = run.arity as usize;
         let prefix = match run.kind {
             PrimKind::Polygon => "f",
             PrimKind::Polyline => "l",
+            // OBJ has no instances. Callers that must not lose them refuse to get here.
+            PrimKind::Packed => {
+                vtx_cursor += arity * run.prim_count;
+                continue;
+            }
         };
-        let arity = run.arity as usize;
         for _ in 0..run.prim_count {
             out.push_str(prefix);
             for offset in 0..arity {
@@ -344,7 +418,7 @@ pub fn from_obj_with_limit(text: &str, max_elements: usize) -> Result<GeoDetail,
                 }
                 let min_arity = match kind {
                     PrimKind::Polygon => 3,
-                    PrimKind::Polyline => 2,
+                    _ => 2,
                 };
                 if indices.len() < min_arity {
                     return Err(IoFormatError::Geo(GeoError::InvalidTopology));
@@ -773,6 +847,33 @@ mod tests {
         assert_eq!(back.hash(), geo.hash());
         let partial = from_obj("v 0 0 0\nv 1 0 0\nv 0 1 0\nvt 0 0\nf 1/1 2 3\n")?;
         assert!(partial.domain_attribute(AttrDomain::Vertex, "uv").is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn packed_geometry_round_trips_and_nesting_in_files_is_bounded() -> Result<(), IoFormatError> {
+        let prototype = Arc::new(from_obj("v 0 0 0\nv 1 0 0\nv 0 1 0\nf 1 2 3\n")?);
+        let once = GeoDetail::packed_whole(prototype)?;
+        let bytes = to_ofxg_bytes(&once);
+        let back = from_ofxg_bytes(&bytes)?;
+        assert_eq!(back.hash(), once.hash());
+        assert_eq!(back.packed_count(), 1);
+        assert_eq!(back.packed_prototypes().len(), 1);
+        // Files of geometry with no instances never gained a section.
+        let plain = from_obj("v 0 0 0\nv 1 0 0\nv 0 1 0\nf 1 2 3\n")?;
+        let plain_bytes = to_ofxg_bytes(&plain);
+        assert_eq!(from_ofxg_bytes(&plain_bytes)?.hash(), plain.hash());
+
+        // A nested file at the depth limit must stop rather than recurse further.
+        assert!(read_ofxg(&bytes, DEFAULT_MAX_IO_ELEMENTS, MAX_PACKED_DEPTH).is_err());
+        assert!(read_ofxg(&plain_bytes, DEFAULT_MAX_IO_ELEMENTS, MAX_PACKED_DEPTH).is_ok());
+        assert!(read_ofxg(&plain_bytes, DEFAULT_MAX_IO_ELEMENTS, MAX_PACKED_DEPTH + 1).is_err());
+        // Corruption anywhere in a nested file is detected by some checksum.
+        for at in (40..bytes.len()).step_by(7) {
+            let mut bad = bytes.clone();
+            bad[at] ^= 0xFF;
+            assert!(from_ofxg_bytes(&bad).is_err(), "byte {at}");
+        }
         Ok(())
     }
 }

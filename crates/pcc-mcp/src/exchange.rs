@@ -39,6 +39,8 @@ pub enum FileError {
     NotFound,
     AlreadyExists,
     UnsupportedFormat,
+    /// `.obj` and `.stl` have no instances, and exporting must not expand them unasked.
+    PackedNeedsUnpack,
     TooLarge,
     Parse(IoFormatError),
     Io(io::ErrorKind),
@@ -57,6 +59,9 @@ impl FileError {
                 "the file already exists: pass overwrite to replace it".to_owned()
             }
             Self::UnsupportedFormat => "unsupported format: use .stl, .obj, or .ofxg".to_owned(),
+            Self::PackedNeedsUnpack => {
+                "this format has no instances: use `unpack` first, or export .ofxg".to_owned()
+            }
             Self::TooLarge => "the file exceeds the memory budget".to_owned(),
             Self::Parse(error) => format!("could not parse the file: {error:?}"),
             Self::Io(kind) => format!("file operation failed: {kind}"),
@@ -320,6 +325,9 @@ impl AssetStore {
         let workspace = self.workspace()?;
         let target = workspace.resolve_target(path)?;
         let format = MeshFormat::from_path(&target)?;
+        if format != MeshFormat::Ofxg && geo.packed_count() > 0 {
+            return Err(FileError::PackedNeedsUnpack);
+        }
         let cancelled = AtomicBool::new(false);
         let ctx = SopContext::new(self.memory_limit, &cancelled);
         let bytes = encode_mesh(geo, format, &ctx)?;
@@ -650,6 +658,26 @@ mod tests {
         let before = fs::read(outside.join("secret.stl"))?;
         store.export(&geo, "leak.stl", true)?;
         assert_eq!(fs::read(outside.join("secret.stl"))?, before);
+        Ok(())
+    }
+
+    #[test]
+    fn instances_export_losslessly_or_not_at_all() -> Result<(), FileError> {
+        let root = scratch("packed").map_err(FileError::from)?;
+        fs::write(root.join("mesh.stl"), triangle_stl())?;
+        let store = AssetStore::new(Some(Workspace::open(&root)?), 1 << 20);
+        let (_, geo) = store.import("mesh.stl")?;
+        let packed =
+            GeoDetail::packed_whole(geo).map_err(|e| FileError::Parse(IoFormatError::Geo(e)))?;
+        for path in ["a.obj", "a.stl"] {
+            assert_eq!(
+                store.export(&packed, path, false).err(),
+                Some(FileError::PackedNeedsUnpack)
+            );
+            assert!(!root.join(path).exists());
+        }
+        store.export(&packed, "a.ofxg", false)?;
+        assert_eq!(store.import("a.ofxg")?.1.hash(), packed.hash());
         Ok(())
     }
 }

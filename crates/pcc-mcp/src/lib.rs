@@ -50,6 +50,9 @@ pub struct GeoProbe {
     pub point_attributes: Vec<String>,
     pub hash: String,
     pub bounds: Option<(Vec3, Vec3)>,
+    /// Packed instances, which area and volume do not count until they are unpacked.
+    pub packed_count: usize,
+    pub packed_prototype_count: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
@@ -241,6 +244,8 @@ pub fn geo_probe(revision: RevisionId, geo: &GeoDetail) -> GeoProbe {
         point_attributes,
         hash: geo.hash().to_hex().to_string(),
         bounds: geo.bounds(),
+        packed_count: geo.packed_count(),
+        packed_prototype_count: geo.packed_prototypes().len(),
     }
 }
 
@@ -316,7 +321,7 @@ impl McpError {
                     FileError::PathRejected(_) => plain(ToolErrorCode::PathRejected, message),
                     FileError::NotFound => plain(ToolErrorCode::FileNotFound, message),
                     FileError::AlreadyExists => plain(ToolErrorCode::FileAlreadyExists, message),
-                    FileError::UnsupportedFormat => {
+                    FileError::UnsupportedFormat | FileError::PackedNeedsUnpack => {
                         plain(ToolErrorCode::UnsupportedFileFormat, message)
                     }
                     FileError::Parse(_) => plain(ToolErrorCode::MeshParseFailed, message),

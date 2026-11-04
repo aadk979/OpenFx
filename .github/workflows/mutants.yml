@@ -1,0 +1,60 @@
+name: Mutation testing
+
+# A green test suite says little by itself: hand-picked mutations left 17 of 36 alive on one crate,
+# and this tool then found 18 more on a crate that had passed every hand-picked check. So pull
+# requests are held to it, on the lines they change.
+
+on:
+  pull_request:
+  schedule:
+    # Weekly over everything, to catch what diffs alone never touch.
+    - cron: "0 3 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  changed-code:
+    name: Mutants in changed code
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      # v4.2.2
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          fetch-depth: 0
+      - run: rustup toolchain install
+      - run: cargo install cargo-mutants --version 27.1.0 --locked
+      - run: git diff "origin/${{ github.base_ref }}...HEAD" > changes.diff
+      - run: cargo mutants --in-diff changes.diff --timeout 120 --jobs 4 --no-shuffle
+      # v4.6.2
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: mutants-changed
+          path: mutants.out/*.txt
+
+  everything:
+    name: Mutants everywhere
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3, 4, 5, 6, 7]
+    steps:
+      # v4.2.2
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - run: rustup toolchain install
+      - run: cargo install cargo-mutants --version 27.1.0 --locked
+      # Reports survivors without failing: known ones exist, and this run is for finding them.
+      - run: cargo mutants --shard ${{ matrix.shard }}/8 --timeout 120 --jobs 4 --no-shuffle || true
+      # v4.6.2
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: mutants-shard-${{ matrix.shard }}
+          path: mutants.out/*.txt

@@ -182,6 +182,9 @@ pub struct NodeDef {
     pub seeded_by_node_id: bool,
     /// The operator reads the current time, so its results cannot be reused across frames.
     pub time_dependent: bool,
+    /// The operator handles packed instances properly. Any other refuses them, so that nothing
+    /// expands or drops instances without being asked to.
+    pub accepts_packed: bool,
     /// A constraint spanning several parameters.
     pub rule: Option<NodeRule>,
 }
@@ -203,6 +206,7 @@ impl NodeDef {
             params,
             seeded_by_node_id: false,
             time_dependent: false,
+            accepts_packed: false,
             rule: None,
         }
     }
@@ -210,6 +214,12 @@ impl NodeDef {
     #[must_use]
     pub const fn seeded_by_node_id(mut self) -> Self {
         self.seeded_by_node_id = true;
+        self
+    }
+
+    #[must_use]
+    pub const fn accepts_packed(mut self) -> Self {
+        self.accepts_packed = true;
         self
     }
 
@@ -874,6 +884,33 @@ pub fn node_catalog() -> Vec<crate::NodeTypeSpec> {
 
 static BUILTIN_NODES: &[NodeDef] = &[
     NodeDef::new(
+        "pack",
+        "instancing",
+        "Wraps its input into one packed instance at the origin, which later transforms move without touching the geometry.",
+        &[input("input", "Geometry to wrap.")],
+        &[],
+    )
+    .accepts_packed(),
+    NodeDef::new(
+        "instance",
+        "instancing",
+        "Places a packed instance of the source on every target point, uniformly scaled by `f@pscale`. A million instances of one prototype cost a fixed amount per instance. Target point attributes are kept.",
+        &[
+            input("source", "The prototype, shared by every instance."),
+            input("target", "Points to place instances on."),
+        ],
+        &[],
+    )
+    .accepts_packed(),
+    NodeDef::new(
+        "unpack",
+        "instancing",
+        "Expands one level of packed instances into real geometry, keeping attributes and reversing winding for mirrored instances. Fails before allocating if the result would not fit the budget.",
+        &[input("input", "Geometry holding instances.")],
+        &[],
+    )
+    .accepts_packed(),
+    NodeDef::new(
         "solver",
         "state",
         "Runs its body once per tick, each tick starting from the previous tick's result. Seeking restores the latest checkpoint at or before the requested tick and replays from there. Inside the body, `$F` is the tick.",
@@ -997,7 +1034,8 @@ static BUILTIN_NODES: &[NodeDef] = &[
             Check::Any,
             "Finite (x, y, z) translation offset in metres.",
         )],
-    ),
+    )
+    .accepts_packed(),
     NodeDef::new(
         "normal",
         "modifier",
@@ -1326,7 +1364,8 @@ static BUILTIN_NODES: &[NodeDef] = &[
             input("right", "Second upstream geometry stream."),
         ],
         &[],
-    ),
+    )
+    .accepts_packed(),
     NodeDef::new(
         "asset",
         "generator",
@@ -1471,7 +1510,8 @@ static BUILTIN_NODES: &[NodeDef] = &[
                 "Per-axis scale (all non-zero).",
             ),
         ],
-    ),
+    )
+    .accepts_packed(),
     NodeDef::new(
         "reverse",
         "modeling",

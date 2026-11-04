@@ -209,6 +209,8 @@ async fn stdio_transport_initialize_discover_probe_replace_and_conflict() {
                     .to_hex()
                     .to_string(),
                 bounds: None,
+                packed_count: 0,
+                packed_prototype_count: 0,
             })
         );
     }

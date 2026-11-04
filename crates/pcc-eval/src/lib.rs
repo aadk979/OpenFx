@@ -3,7 +3,8 @@
 use pcc_expr::{Expr, InputStat, Scope};
 use pcc_geo::{
     AttrDomain as GeoAttrDomain, AttributeColumn, GeoDetail, GeoError, GroupDomain, PAGE_LEN,
-    PrimKind, PrimRun, PromoteMode as GeoPromoteMode, UvProjectMode as GeoUvProjectMode,
+    PackedPrototype, PrimKind, PrimRun, PromoteMode as GeoPromoteMode,
+    UvProjectMode as GeoUvProjectMode,
 };
 use pcc_graph::{
     AttrDomain, BooleanMode, GraphSnapshot, Node, NodeDef, NodeRegistrationError, ParamKind,
@@ -787,6 +788,45 @@ fn eval_single_node(
                 points.push(pt);
             }
             Ok(GeoDetail::points(points))
+        }
+        "pack" => {
+            let input_geo = outputs
+                .get(&input_slot(node, 0)?)
+                .ok_or(EvalError::InvalidGraph)?;
+            finish_sop(GeoDetail::packed_whole(Arc::clone(input_geo)), ctx)
+        }
+        "instance" => {
+            let source = outputs
+                .get(&input_slot(node, 0)?)
+                .ok_or(EvalError::InvalidGraph)?;
+            let target = outputs
+                .get(&input_slot(node, 1)?)
+                .ok_or(EvalError::InvalidGraph)?;
+            // A prototype index and three matrix rows per instance, alongside its point and vertex.
+            let per_instance = std::mem::size_of::<u32>() * 2 + std::mem::size_of::<Vec3>() * 4;
+            if target.len().saturating_mul(per_instance) > ctx.budget.max_memory_bytes {
+                return Err(EvalError::Resource(GeoError::LimitExceeded));
+            }
+            let scales = target.attribute("pscale").and_then(AttributeColumn::as_f32);
+            let scale_of = |point: usize| {
+                scales
+                    .and_then(|column| column.get(point))
+                    .map_or(1.0, |value| value.get())
+            };
+            finish_sop(
+                PackedPrototype::new(Arc::clone(source))
+                    .and_then(|prototype| target.with_instances_on_points(prototype, &scale_of)),
+                ctx,
+            )
+        }
+        "unpack" => {
+            let input_geo = outputs
+                .get(&input_slot(node, 0)?)
+                .ok_or(EvalError::InvalidGraph)?;
+            finish_sop(
+                input_geo.unpacked_cancellable(ctx.budget.max_memory_bytes, ctx.cancelled),
+                ctx,
+            )
         }
         "copytopoints" => {
             let id = &node.id;
@@ -1620,6 +1660,21 @@ impl Pass<'_> {
         node: &Node,
         outputs: &BTreeMap<NodeId, Arc<GeoDetail>>,
     ) -> Result<Arc<GeoDetail>, EvalError> {
+        // An operator that does not understand instances must not expand or lose them unasked.
+        if !node_def(&node.op).is_some_and(|def| def.accepts_packed) {
+            for id in &node.inputs {
+                if outputs.get(id).is_some_and(|geo| geo.packed_count() > 0) {
+                    return Err(EvalError::Param {
+                        node: node.id,
+                        param: "input".to_owned(),
+                        message: format!(
+                            "`{}` does not accept packed instances: use `unpack` first",
+                            node.op
+                        ),
+                    });
+                }
+            }
+        }
         let (numerator, denominator) = (self.frame_numerator, self.frame_denominator);
         let Some(cook_cache) = self.cache else {
             return Ok(Arc::new(eval_single_node(

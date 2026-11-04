@@ -1194,7 +1194,7 @@ mod tests {
             assert_eq!(cycle, Err(SceneError::NodeOrder));
         }
 
-        assert_eq!(search_node_catalog("").len(), 47);
+        assert_eq!(search_node_catalog("").len(), 50);
         let matches: Vec<String> = search_node_catalog("merge")
             .into_iter()
             .map(|spec| spec.type_name)

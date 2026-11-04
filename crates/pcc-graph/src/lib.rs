@@ -253,6 +253,10 @@ pub enum Node {
         left: NodeId,
         right: NodeId,
     },
+    GeoAsset {
+        id: NodeId,
+        content_hash: String,
+    },
     CreateSphere {
         id: NodeId,
         radius: f32,
@@ -405,6 +409,7 @@ impl Node {
             | Self::Scatter { id, .. }
             | Self::CopyToPoints { id, .. }
             | Self::Merge { id, .. }
+            | Self::GeoAsset { id, .. }
             | Self::CreateSphere { id, .. }
             | Self::CreateTube { id, .. }
             | Self::CreateTorus { id, .. }
@@ -437,6 +442,7 @@ impl Node {
                 | Self::CreateGrid { .. }
                 | Self::CreateBox { .. }
                 | Self::HeightField { .. }
+                | Self::GeoAsset { .. }
                 | Self::CreateSphere { .. }
                 | Self::CreateTube { .. }
                 | Self::CreateTorus { .. }
@@ -451,6 +457,7 @@ impl Node {
             | Self::CreateGrid { .. }
             | Self::CreateBox { .. }
             | Self::HeightField { .. }
+            | Self::GeoAsset { .. }
             | Self::CreateSphere { .. }
             | Self::CreateTube { .. }
             | Self::CreateTorus { .. }
@@ -1046,6 +1053,17 @@ pub fn node_catalog() -> Vec<NodeTypeSpec> {
                 },
             ],
         },
+        sop_spec(
+            "asset",
+            "generator",
+            "Outputs imported geometry by its content hash, as returned by `geo_import`. The scene does not depend on the source file afterwards.",
+            &[],
+            &[(
+                "content_hash",
+                "string",
+                "BLAKE3 content hash: 64 lowercase hexadecimal digits.",
+            )],
+        ),
         sop_spec("sphere", "generator", "Generates a closed, outward-facing latitude-longitude sphere centred on the origin.", &[], &[("radius", "f32", "Sphere radius in metres (> 0)."), ("rows", "u32", "Latitude bands (>= 2)."), ("cols", "u32", "Longitude segments (>= 3).")]),
         sop_spec("tube", "generator", "Generates a closed, capped cylinder centred on the origin along +Y.", &[], &[("radius", "f32", "Tube radius in metres (> 0)."), ("height", "f32", "Tube height in metres (> 0)."), ("rows", "u32", "Height bands (>= 1)."), ("cols", "u32", "Sides (>= 3).")]),
         sop_spec("torus", "generator", "Generates a closed quad torus around +Y.", &[], &[("major_radius", "f32", "Distance from the axis to the tube centre (> minor_radius)."), ("minor_radius", "f32", "Tube radius (> 0)."), ("rows", "u32", "Segments around the axis (>= 3)."), ("cols", "u32", "Segments around the tube (>= 3).")]),
@@ -1389,6 +1407,9 @@ impl GraphSnapshot {
                     if !defined.contains(left) || !defined.contains(right) {
                         return Err(SceneError::NodeOrder);
                     }
+                }
+                Node::GeoAsset { content_hash, .. } => {
+                    validate_content_hash(content_hash)?;
                 }
                 Node::CreateSphere {
                     radius, rows, cols, ..
@@ -2116,6 +2137,9 @@ impl GraphSnapshot {
                 Node::Merge { id, left, right } => {
                     text.push_str(&format!("merge {} {} {}\n", id.0, left.0, right.0));
                 }
+                Node::GeoAsset { id, content_hash } => {
+                    text.push_str(&format!("asset {} {}\n", id.0, content_hash));
+                }
                 Node::CreateSphere {
                     id,
                     radius,
@@ -2806,6 +2830,17 @@ impl GraphSnapshot {
                         right: NodeId(right),
                     });
                 }
+                "asset" => {
+                    let id = parse_u64_strict(parse_next(&mut parts)?)?;
+                    let content_hash = parse_next(&mut parts)?.to_owned();
+                    if parts.next().is_some() {
+                        return Err(SceneError::Field);
+                    }
+                    nodes.push(Node::GeoAsset {
+                        id: NodeId(id),
+                        content_hash,
+                    });
+                }
                 "sphere" => {
                     let id = parse_u64_strict(parse_next(&mut parts)?)?;
                     let radius = parse_f32_checked(parse_next(&mut parts)?)?;
@@ -3270,6 +3305,19 @@ fn parse_f32_checked(token: &str) -> Result<f32, SceneError> {
         Ok(val)
     } else {
         Err(SceneError::NonFinite)
+    }
+}
+
+/// A BLAKE3 hash in canonical form. Being pure hexadecimal also makes it safe in a file name.
+fn validate_content_hash(hash: &str) -> Result<(), SceneError> {
+    let canonical = hash.len() == 64
+        && hash
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b));
+    if canonical {
+        Ok(())
+    } else {
+        Err(SceneError::Field)
     }
 }
 
@@ -4160,6 +4208,41 @@ mod tests {
     }
 
     #[test]
+    fn asset_nodes_round_trip_and_reject_anything_but_a_canonical_hash() {
+        let hash = "0123456789abcdef".repeat(4);
+        let scene = |content_hash: String| GraphSnapshot {
+            revision: RevisionId(1),
+            nodes: vec![
+                Node::GeoAsset {
+                    id: NodeId(1),
+                    content_hash,
+                },
+                Node::Reverse {
+                    id: NodeId(2),
+                    input: NodeId(1),
+                },
+            ],
+        };
+        let good = scene(hash.clone());
+        assert_eq!(GraphSnapshot::from_ofxs(&good.to_ofxs()), Ok(good.clone()));
+        assert_eq!(good.nodes[0].inputs(), Vec::new());
+        for bad in [
+            String::new(),
+            "abc".to_owned(),
+            hash.to_uppercase(),
+            format!("{hash}0"),
+            format!("../{}", &hash[3..]),
+            "g".repeat(64),
+        ] {
+            assert_eq!(
+                scene(bad.clone()).validate(),
+                Err(SceneError::Field),
+                "{bad}"
+            );
+        }
+    }
+
+    #[test]
     fn malformed_sop_lines_are_rejected_by_the_parser() {
         for body in [
             "sphere 1 1e0 8\n",
@@ -4217,7 +4300,7 @@ mod tests {
             assert_eq!(cycle, Err(SceneError::NodeOrder));
         }
 
-        assert_eq!(search_node_catalog("").len(), 42);
+        assert_eq!(search_node_catalog("").len(), 43);
         assert_eq!(search_node_catalog("merge").len(), 1);
         assert!(inspect_node_type("transform").is_some());
         assert!(inspect_node_type("grid").is_some());

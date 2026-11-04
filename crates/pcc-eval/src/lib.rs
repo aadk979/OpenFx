@@ -31,6 +31,7 @@ pub enum EvalError {
     Resource(GeoError),
     Vex(VexError),
     ElementLimit { requested: u32, limit: u32 },
+    Asset(AssetError),
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CookBudget {
@@ -50,6 +51,30 @@ impl CookBudget {
 pub struct EvalContext<'a> {
     pub cancelled: &'a AtomicBool,
     pub budget: CookBudget,
+    pub assets: &'a dyn AssetResolver,
+}
+
+/// Why an `asset` node's content could not be supplied.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AssetError {
+    NotFound,
+    /// Stored data did not match its content hash.
+    Corrupt,
+}
+
+/// Supplies imported geometry by content hash, keeping the evaluator free of file access.
+pub trait AssetResolver: Sync {
+    fn resolve(&self, content_hash: &str) -> Result<Arc<GeoDetail>, AssetError>;
+}
+
+/// For cooks in which no scene may refer to imported geometry.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct NoAssets;
+
+impl AssetResolver for NoAssets {
+    fn resolve(&self, _content_hash: &str) -> Result<Arc<GeoDetail>, AssetError> {
+        Err(AssetError::NotFound)
+    }
 }
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct CacheKey([u8; 32]);
@@ -264,6 +289,10 @@ impl CookCache {
                 hasher.update(mode.as_str().as_bytes());
                 let canonical = if *voxel_size == 0.0 { 0.0 } else { *voxel_size };
                 hasher.update(&canonical.to_bits().to_le_bytes());
+            }
+            Node::GeoAsset { content_hash, .. } => {
+                hasher.update(b"asset");
+                hasher.update(content_hash.as_bytes());
             }
             Node::CreateSphere {
                 radius, rows, cols, ..
@@ -1316,6 +1345,20 @@ fn eval_single_node(
             }
             Ok(out)
         }
+        Node::GeoAsset { content_hash, .. } => {
+            let geo = ctx.assets.resolve(content_hash).map_err(EvalError::Asset)?;
+            let bytes = geo
+                .len()
+                .saturating_mul(std::mem::size_of::<Vec3>())
+                .saturating_add(
+                    geo.vertex_count()
+                        .saturating_mul(std::mem::size_of::<u32>()),
+                );
+            if bytes > ctx.budget.max_memory_bytes {
+                return Err(EvalError::Resource(GeoError::LimitExceeded));
+            }
+            finish_sop(Ok((*geo).clone()), ctx)
+        }
         Node::CreateSphere {
             radius, rows, cols, ..
         } => {
@@ -1744,6 +1787,7 @@ mod tests {
         let c = AtomicBool::new(false);
         let g = GraphSnapshot::demo(100, Vec3::checked(1., 2., 3.).unwrap_or(Vec3::ZERO));
         let x = EvalContext {
+            assets: &NoAssets,
             cancelled: &c,
             budget: CookBudget {
                 max_memory_bytes: 1 << 20,
@@ -1759,6 +1803,7 @@ mod tests {
     fn cancellation_is_observed() {
         let c = AtomicBool::new(true);
         let x = EvalContext {
+            assets: &NoAssets,
             cancelled: &c,
             budget: CookBudget {
                 max_memory_bytes: 1 << 20,
@@ -1774,6 +1819,7 @@ mod tests {
     fn cache_key_includes_frame_and_reuses_value() {
         let cancelled = AtomicBool::new(false);
         let context = EvalContext {
+            assets: &NoAssets,
             cancelled: &cancelled,
             budget: CookBudget {
                 max_memory_bytes: 1 << 20,
@@ -1810,6 +1856,7 @@ mod tests {
     fn cook_validates_graph_topology_and_supports_distinct_node_ids() {
         let cancelled = AtomicBool::new(false);
         let ctx = EvalContext {
+            assets: &NoAssets,
             cancelled: &cancelled,
             budget: CookBudget {
                 max_memory_bytes: 1 << 20,
@@ -1857,6 +1904,7 @@ mod tests {
         use pcc_graph::GraphEdit;
         let cancelled = AtomicBool::new(false);
         let ctx = EvalContext {
+            assets: &NoAssets,
             cancelled: &cancelled,
             budget: CookBudget {
                 max_memory_bytes: 1 << 20,
@@ -1913,6 +1961,7 @@ mod tests {
     fn grid_and_scatter_cook_and_intermediate_node_cook() {
         let cancelled = AtomicBool::new(false);
         let ctx = EvalContext {
+            assets: &NoAssets,
             cancelled: &cancelled,
             budget: CookBudget {
                 max_memory_bytes: 1 << 20,
@@ -1970,6 +2019,7 @@ mod tests {
     fn box_normal_wrangle_and_copy_to_points_cook() {
         let cancelled = AtomicBool::new(false);
         let ctx = EvalContext {
+            assets: &NoAssets,
             cancelled: &cancelled,
             budget: CookBudget {
                 max_memory_bytes: 1 << 20,
@@ -2032,6 +2082,7 @@ mod tests {
     fn subdivide_extrude_promote_and_blast_dag_cook() {
         let cancelled = AtomicBool::new(false);
         let ctx = EvalContext {
+            assets: &NoAssets,
             cancelled: &cancelled,
             budget: CookBudget {
                 max_memory_bytes: 1 << 20,
@@ -2162,6 +2213,7 @@ mod tests {
     fn heightfield_noise_erode_and_uv_project_dag_cook() {
         let cancelled = AtomicBool::new(false);
         let ctx = EvalContext {
+            assets: &NoAssets,
             cancelled: &cancelled,
             budget: CookBudget {
                 max_memory_bytes: 2 << 20,
@@ -2228,6 +2280,7 @@ mod tests {
     fn vdb_pipeline_and_boolean_dag_cook_produce_closed_manifolds() {
         let cancelled = AtomicBool::new(false);
         let ctx = EvalContext {
+            assets: &NoAssets,
             cancelled: &cancelled,
             budget: CookBudget {
                 max_memory_bytes: 8 << 20,
@@ -2300,6 +2353,7 @@ mod tests {
     }
     fn sop_ctx(cancelled: &AtomicBool) -> EvalContext<'_> {
         EvalContext {
+            assets: &NoAssets,
             cancelled,
             budget: CookBudget {
                 max_memory_bytes: 256 << 20,
@@ -2616,6 +2670,7 @@ mod tests {
         assert_ne!(other.hash(), first.hash());
 
         let tight = EvalContext {
+            assets: &NoAssets,
             cancelled: &cancelled,
             budget: CookBudget {
                 max_memory_bytes: 1 << 30,
@@ -2645,6 +2700,7 @@ mod tests {
             })
         );
         let starved = EvalContext {
+            assets: &NoAssets,
             cancelled: &cancelled,
             budget: CookBudget {
                 max_memory_bytes: 64,
@@ -2681,6 +2737,84 @@ mod tests {
         assert_eq!(
             cook(&open_input, &ctx).err(),
             Some(EvalError::Resource(GeoError::InvalidTopology))
+        );
+        Ok(())
+    }
+
+    /// Serves one fixed geometry under one hash.
+    struct OneAsset(String, Arc<GeoDetail>);
+
+    impl AssetResolver for OneAsset {
+        fn resolve(&self, content_hash: &str) -> Result<Arc<GeoDetail>, AssetError> {
+            if content_hash == self.0 {
+                Ok(Arc::clone(&self.1))
+            } else {
+                Err(AssetError::NotFound)
+            }
+        }
+    }
+
+    #[test]
+    fn asset_nodes_cook_through_the_resolver_and_key_the_cache_by_content() -> Result<(), String> {
+        let cancelled = AtomicBool::new(false);
+        let point = Vec3::checked(7.0, 0.0, 0.0).map_err(|e| format!("{e:?}"))?;
+        let geo = Arc::new(GeoDetail::points(vec![point]));
+        let hash = geo.hash().to_hex().to_string();
+        let resolver = OneAsset(hash.clone(), Arc::clone(&geo));
+        let graph = |content_hash: String| GraphSnapshot {
+            revision: RevisionId(1),
+            nodes: vec![
+                Node::GeoAsset {
+                    id: NodeId(1),
+                    content_hash,
+                },
+                Node::Normal {
+                    id: NodeId(2),
+                    input: NodeId(1),
+                },
+            ],
+        };
+        let budget = CookBudget {
+            max_memory_bytes: 1 << 20,
+            max_elements: 1000,
+        };
+        let ctx = EvalContext {
+            assets: &resolver,
+            cancelled: &cancelled,
+            budget,
+        };
+        let cache = CookCache::default();
+        let cooked = cook_node_cached(&cache, &graph(hash.clone()), NodeId(1), 0, 1, &ctx);
+        assert_eq!(cooked.map(|g| g.hash()).ok(), Some(geo.hash()));
+        // A different hash is a different cache entry and must not reuse the first result.
+        let other = "f".repeat(64);
+        assert_eq!(
+            cook_node_cached(&cache, &graph(other), NodeId(1), 0, 1, &ctx).err(),
+            Some(EvalError::Asset(AssetError::NotFound))
+        );
+        // Without a resolver, a scene with assets fails with a clear error.
+        let no_assets = EvalContext {
+            assets: &NoAssets,
+            cancelled: &cancelled,
+            budget,
+        };
+        assert_eq!(
+            cook(&graph(hash.clone()), &no_assets).err(),
+            Some(EvalError::Asset(AssetError::NotFound))
+        );
+        // Budgets apply to imported geometry as they do to generated geometry.
+        let tight = EvalContext {
+            assets: &resolver,
+            cancelled: &cancelled,
+            budget: CookBudget {
+                max_memory_bytes: 1,
+                max_elements: 1000,
+            },
+        };
+        // Cooks the asset node alone, so that no later node can be what enforces the limit.
+        assert_eq!(
+            cook_node_cached(&CookCache::default(), &graph(hash), NodeId(1), 0, 1, &tight).err(),
+            Some(EvalError::Resource(GeoError::LimitExceeded))
         );
         Ok(())
     }

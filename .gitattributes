@@ -1,0 +1,9 @@
+# Normalize every text file to LF so hashes and diffs match across platforms.
+* text=auto eol=lf
+
+# Binary formats must never be converted.
+*.stl binary
+*.ofxg binary
+*.png binary
+*.exr binary
+*.vdb binary

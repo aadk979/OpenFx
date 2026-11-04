@@ -1,0 +1,15 @@
+# Build output
+/target/
+
+# Downloaded test corpora. Individual meshes carry their own licenses and are never committed.
+/corpus/
+
+# Local reports
+/reports/
+
+# Editors and operating systems
+.idea/
+.vscode/
+*.swp
+.DS_Store
+Thumbs.db

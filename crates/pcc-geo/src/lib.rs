@@ -2535,6 +2535,47 @@ impl TopologyIndex {
     pub fn prim_kind(&self, prim: u32) -> Option<PrimKind> {
         self.prim_kinds.get(prim as usize).copied()
     }
+
+    /// Counts points whose incident polygon corners form more than one edge-connected fan. Such a
+    /// point pinches the surface even though every edge may be manifold, which
+    /// [`Self::is_closed_manifold`] does not detect.
+    #[must_use]
+    pub fn non_manifold_vertex_count(&self, geo: &GeoDetail) -> usize {
+        let corners = self.next_he.len();
+        let mut visited = vec![false; corners];
+        let mut fans = vec![0u32; geo.len()];
+        for start in 0..corners as u32 {
+            if visited[start as usize]
+                || self.prim_of_vertex(start).and_then(|p| self.prim_kind(p))
+                    != Some(PrimKind::Polygon)
+            {
+                continue;
+            }
+            let Some(point) = geo.vertex_point(start as usize) else {
+                continue;
+            };
+            fans[point as usize] += 1;
+            visited[start as usize] = true;
+            // Sweep around the point in both directions until the fan closes or hits a boundary.
+            let mut corner = start;
+            while let Some(step) = self.prev(corner).and_then(|prev| self.twin(prev)) {
+                if visited[step as usize] {
+                    break;
+                }
+                visited[step as usize] = true;
+                corner = step;
+            }
+            corner = start;
+            while let Some(step) = self.twin(corner).and_then(|twin| self.next(twin)) {
+                if visited[step as usize] {
+                    break;
+                }
+                visited[step as usize] = true;
+                corner = step;
+            }
+        }
+        fans.iter().filter(|&&count| count > 1).count()
+    }
 }
 
 #[cfg(test)]
@@ -3111,5 +3152,53 @@ mod tests {
                 }
             }
         }
+    }
+    #[test]
+    fn pinched_vertices_are_counted_even_when_every_edge_is_manifold() -> Result<(), GeoError> {
+        let v = |x, y, z| Vec3::checked(x, y, z);
+        // Two tetrahedra sharing only point 0.
+        let pinched = GeoDetail::points(vec![
+            v(0.0, 0.0, 0.0)?,
+            v(1.0, 0.0, 0.0)?,
+            v(0.0, 1.0, 0.0)?,
+            v(0.0, 0.0, 1.0)?,
+            v(-1.0, 0.0, 0.0)?,
+            v(0.0, -1.0, 0.0)?,
+            v(0.0, 0.0, -1.0)?,
+        ])
+        .with_primitives(
+            vec![PrimRun {
+                kind: PrimKind::Polygon,
+                arity: 3,
+                prim_count: 8,
+            }],
+            vec![
+                0, 2, 1, 0, 1, 3, 1, 2, 3, 0, 3, 2, 0, 5, 4, 0, 4, 6, 4, 5, 6, 0, 6, 5,
+            ],
+        )?;
+        let topology = TopologyIndex::build(&pinched);
+        assert!(topology.is_closed_manifold(), "edges alone look fine");
+        assert_eq!(topology.non_manifold_vertex_count(&pinched), 1);
+
+        // Three separate fans around one point count once, and a clean tetrahedron not at all.
+        let clean = GeoDetail::points(vec![
+            v(0.0, 0.0, 0.0)?,
+            v(1.0, 0.0, 0.0)?,
+            v(0.0, 1.0, 0.0)?,
+            v(0.0, 0.0, 1.0)?,
+        ])
+        .with_primitives(
+            vec![PrimRun {
+                kind: PrimKind::Polygon,
+                arity: 3,
+                prim_count: 4,
+            }],
+            vec![0, 2, 1, 0, 1, 3, 1, 2, 3, 0, 3, 2],
+        )?;
+        assert_eq!(
+            TopologyIndex::build(&clean).non_manifold_vertex_count(&clean),
+            0
+        );
+        Ok(())
     }
 }

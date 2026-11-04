@@ -393,6 +393,7 @@ name = "pcc-eval"
 version = "0.1.0"
 dependencies = [
  "blake3",
+ "pcc-expr",
  "pcc-geo",
  "pcc-graph",
  "pcc-id",
@@ -401,6 +402,13 @@ dependencies = [
  "pcc-terrain",
  "pcc-vdb",
  "pcc-vex",
+]
+
+[[package]]
+name = "pcc-expr"
+version = "0.1.0"
+dependencies = [
+ "pcc-math",
 ]
 
 [[package]]
@@ -415,6 +423,7 @@ dependencies = [
 name = "pcc-graph"
 version = "0.1.0"
 dependencies = [
+ "pcc-expr",
  "pcc-id",
  "pcc-math",
  "schemars",

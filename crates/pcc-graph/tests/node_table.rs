@@ -465,3 +465,192 @@ fn every_built_in_definition_is_internally_consistent() {
         );
     }
 }
+
+#[test]
+fn expressions_round_trip_through_the_format_and_json() -> Result<(), serde_json::Error> {
+    let scene = GraphSnapshot {
+        revision: RevisionId(1),
+        nodes: vec![
+            Node::new("sphere", NodeId(1))
+                .with_expr("radius", "1 + $F * 0.5")
+                .with_expr("rows", "8")
+                .with_u32("cols", 12),
+            Node::new("xform", NodeId(2))
+                .with_input(NodeId(1))
+                .with_vec3_expr("translate", ["0", "ch(1, \"radius\")", "sin($T)"])
+                .with_vec3("rotate_degrees", Vec3::ZERO)
+                .with_vec3("scale", v3(1.0, 1.0, 1.0)),
+        ],
+    };
+    assert_eq!(scene.validate(), Ok(()));
+    let text = scene.to_ofxs();
+    // Hex keeps spaces and quotes from breaking the line's positional tokens.
+    assert!(
+        text.lines()
+            .all(|line| !line.contains('$') && !line.contains('"')),
+        "{text}"
+    );
+    assert!(
+        text.contains("xform 2 1 0e0 ="),
+        "literal components stay readable: {text}"
+    );
+    let parsed = GraphSnapshot::from_ofxs(&text);
+    assert_eq!(parsed.as_ref(), Ok(&scene));
+    assert_eq!(parsed.map(|p| p.to_ofxs()), Ok(text.clone()));
+
+    // Agents write formulas in plain JSON, and equal scenes compare equal however they arrived.
+    let node: Node = serde_json::from_value(serde_json::json!({
+        "id": 2,
+        "op": "xform",
+        "inputs": [1],
+        "params": {
+            "translate": { "x": "0.0", "y": "ch(1, \"radius\")", "z": "sin($T)" },
+            "rotate_degrees": { "x": 0, "y": 0, "z": 0 },
+            "scale": { "x": 1, "y": 1, "z": 1 }
+        }
+    }))?;
+    let edited = GraphSnapshot {
+        revision: RevisionId(1),
+        nodes: vec![scene.nodes[0].clone()],
+    }
+    .apply_edits(RevisionId(2), &[GraphEdit::AddNode { node }]);
+    assert_eq!(
+        edited.map(|g| g.to_ofxs().lines().last().map(str::to_owned)),
+        Ok(text.lines().last().map(str::to_owned))
+    );
+
+    // A vector whose components are all plain numbers settles to an ordinary vector.
+    let mut plain = Node::new("box", NodeId(2)).with_vec3_expr("size", ["1", "2.0", "3e0"]);
+    plain.canonicalize_numbers();
+    assert_eq!(plain.vec3("size"), Some(v3(1.0, 2.0, 3.0)));
+    Ok(())
+}
+
+#[test]
+fn expressions_are_checked_where_they_can_be() {
+    let id = NodeId(2);
+    let field = Err(SceneError::Field);
+    let sphere = |radius: &str| {
+        Node::new("sphere", id)
+            .with_expr("radius", radius)
+            .with_u32("rows", 8)
+            .with_u32("cols", 8)
+    };
+    assert_eq!(validate(sphere("$F + 1")), Ok(()));
+    // Syntax fails at once, in time for an agent to see it when the edit is made.
+    assert_eq!(validate(sphere("$F +")), field);
+    assert_eq!(validate(sphere("nosuch(1)")), field);
+    // A range can only fail once there is a value, so a formula may look out of range here.
+    assert_eq!(validate(sphere("-1")), Ok(()));
+    // Text and choices take no formulas, and vectors need all three components.
+    let blast = Node::new("blast", id)
+        .with_input(NodeId(1))
+        .with_expr("group_name", "1")
+        .with_bool("negate", false);
+    assert_eq!(validate(blast), field);
+    let mode = Node::new("uvproject", id)
+        .with_input(NodeId(1))
+        .with_expr("mode", "1");
+    assert_eq!(validate(mode), field);
+    let box_scalar = Node::new("box", id).with_expr("size", "1");
+    assert_eq!(validate(box_scalar), field);
+    let scalar_vec = Node::new("sphere", id)
+        .with_vec3_expr("radius", ["1", "1", "$F"])
+        .with_u32("rows", 8)
+        .with_u32("cols", 8);
+    assert_eq!(validate(scalar_vec), field);
+    assert_eq!(
+        validate(Node::new("box", id).with_vec3_expr("size", ["1", "$F +", "1"])),
+        field
+    );
+    // Rules wait for values, but apply to literal-only nodes as ever.
+    let torus = Node::new("torus", id)
+        .with_expr("major_radius", "$F")
+        .with_f32("minor_radius", 1.0)
+        .with_u32("rows", 8)
+        .with_u32("cols", 8);
+    assert_eq!(validate(torus), Ok(()));
+    // Bools take formulas too.
+    let swept = Node::new("sweep", id)
+        .with_input(NodeId(1))
+        .with_f32("radius", 1.0)
+        .with_u32("sides", 8)
+        .with_expr("capped", "$F > 3");
+    assert_eq!(validate(swept), Ok(()));
+    // Malformed hex in a scene file.
+    for body in [
+        "sphere 2 =zz 8 8\n",
+        "sphere 2 =6 8 8\n",
+        "sphere 2 = 8 8\n",
+        "box 2 =31 1e0\n",
+    ] {
+        let text = format!("ofxs 1\nrevision 1\ncreate 1 3\n{body}reverse 3 2\n");
+        assert_eq!(
+            GraphSnapshot::from_ofxs(&text).err(),
+            Some(SceneError::Field),
+            "{body}"
+        );
+    }
+}
+
+#[test]
+fn channel_references_are_dependencies_and_cannot_form_cycles() {
+    let reader = |id: u64, source: u64| {
+        Node::new("sphere", NodeId(id))
+            .with_expr("radius", format!("ch({source}, \"radius\")"))
+            .with_u32("rows", 8)
+            .with_u32("cols", 8)
+    };
+    let base = Node::new("sphere", NodeId(1))
+        .with_f32("radius", 1.0)
+        .with_u32("rows", 8)
+        .with_u32("cols", 8);
+    let end = Node::new("reverse", NodeId(9)).with_input(NodeId(1));
+    assert_eq!(reader(5, 3).dependencies(), vec![NodeId(3)]);
+    // Reading an earlier node is fine, including alongside real inputs.
+    let ok = GraphSnapshot {
+        revision: RevisionId(1),
+        nodes: vec![base.clone(), reader(2, 1), end.clone()],
+    };
+    assert_eq!(ok.validate(), Ok(()));
+    // Reading a later node, itself, or nothing that exists is an ordering error.
+    for bad in [
+        vec![base.clone(), reader(2, 3), reader(3, 1), end.clone()],
+        vec![base.clone(), reader(2, 2), end.clone()],
+        vec![base.clone(), reader(2, 77), end.clone()],
+    ] {
+        let scene = GraphSnapshot {
+            revision: RevisionId(1),
+            nodes: bad,
+        };
+        assert_eq!(scene.validate(), Err(SceneError::NodeOrder));
+    }
+    // Edits sort by dependencies, so a read-before-definition order is repaired...
+    let start = GraphSnapshot {
+        revision: RevisionId(1),
+        nodes: vec![base.clone(), end.clone()],
+    };
+    let added = start.apply_edits(
+        RevisionId(2),
+        &[
+            GraphEdit::AddNode { node: reader(4, 3) },
+            GraphEdit::AddNode { node: reader(3, 1) },
+            GraphEdit::AddNode {
+                node: Node::new("reverse", NodeId(8)).with_input(NodeId(4)),
+            },
+        ],
+    );
+    let order = added.map(|g| g.nodes.iter().map(|n| n.id.0).collect::<Vec<_>>());
+    let order = order.unwrap_or_default();
+    let at = |id: u64| order.iter().position(|&n| n == id);
+    assert!(at(3) < at(4), "{order:?}");
+    // ...and a cycle through expressions alone is rejected.
+    let cycle = start.apply_edits(
+        RevisionId(2),
+        &[
+            GraphEdit::AddNode { node: reader(4, 3) },
+            GraphEdit::AddNode { node: reader(3, 4) },
+        ],
+    );
+    assert_eq!(cycle, Err(SceneError::NodeOrder));
+}

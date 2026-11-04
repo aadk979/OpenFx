@@ -258,8 +258,8 @@ impl GraphSnapshot {
             if defined.contains(&id) {
                 return Err(SceneError::NodeOrder);
             }
-            for input in &node.inputs {
-                if !defined.contains(input) {
+            for dependency in node.dependencies() {
+                if !defined.contains(&dependency) {
                     return Err(SceneError::NodeOrder);
                 }
             }
@@ -390,7 +390,7 @@ fn topological_sort(nodes: &[Node]) -> Result<Vec<Node>, SceneError> {
     let mut in_degree = vec![0usize; nodes.len()];
     let mut dependents: Vec<Vec<usize>> = vec![Vec::new(); nodes.len()];
     for (idx, node) in nodes.iter().enumerate() {
-        for input_id in node.inputs() {
+        for input_id in node.dependencies() {
             let Some(&upstream_idx) = index_by_id.get(&input_id) else {
                 return Err(SceneError::NodeOrder);
             };

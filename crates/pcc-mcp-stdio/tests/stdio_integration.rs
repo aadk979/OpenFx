@@ -1404,3 +1404,62 @@ async fn file_tools_are_refused_unless_the_host_names_a_workspace() {
     assert_eq!(error_code(&export), "file_access_disabled", "{export}");
     client.shutdown().await;
 }
+
+#[tokio::test]
+async fn agent_animates_a_parameter_with_an_expression_and_probes_two_frames() {
+    let client_res = StdioClient::spawn();
+    assert!(client_res.is_ok(), "{client_res:?}");
+    let Ok(mut client) = client_res else {
+        return;
+    };
+    initialize(&mut client).await;
+    // Edits in plain JSON, as an agent writes them, on top of the server's initial scene.
+    let edits = json!({
+        "base_revision": 1,
+        "edits": [
+            { "edit": "remove_node", "id": 2 },
+            { "edit": "remove_node", "id": 1 },
+            { "edit": "add_node", "node": { "id": 10, "op": "box", "params": {
+                "size": { "x": 1, "y": 1, "z": 1 } } } },
+            { "edit": "add_node", "node": { "id": 11, "op": "xform", "inputs": [10], "params": {
+                "translate": { "x": "0", "y": "$F * 2", "z": "0" },
+                "rotate_degrees": { "x": 0, "y": 0, "z": 0 },
+                "scale": { "x": 1, "y": 1, "z": 1 } } } },
+            { "edit": "add_node", "node": { "id": 12, "op": "sphere", "params": {
+                "radius": { "expr": "5 - $F" }, "rows": 8, "cols": 8 } } },
+            { "edit": "add_node", "node": { "id": 13, "op": "merge", "inputs": [11, 12] } }
+        ]
+    });
+    let edited = call_tool(&mut client, 2, "graph_batch_edit", edits).await;
+    assert_eq!(edited["isError"], false, "{edited}");
+    let high_y = |probe: &Value| probe["structuredContent"]["bounds"][1]["y"].as_f64();
+    let frame = |numerator: i64| json!({ "node_id": 11, "frame_numerator": numerator, "frame_denominator": 1 });
+    let at_zero = call_tool(&mut client, 3, "node_cook", frame(0)).await;
+    let at_ten = call_tool(&mut client, 4, "node_cook", frame(10)).await;
+    assert_eq!(at_ten["isError"], false, "{at_ten}");
+    let (start, later) = (
+        high_y(&at_zero).unwrap_or(0.0),
+        high_y(&at_ten).unwrap_or(0.0),
+    );
+    assert!((later - start - 20.0).abs() < 1e-4, "{start} then {later}");
+    // A formula that strays out of range fails at that frame, and names the node and parameter.
+    let bad_frame = json!({ "frame_numerator": 5, "frame_denominator": 1 });
+    let failed = call_tool(&mut client, 5, "geo_probe", bad_frame).await;
+    assert_eq!(failed["isError"], true, "{failed}");
+    assert_eq!(error_code(&failed), "param_evaluation_failed", "{failed}");
+    let message = failed["structuredContent"]["message"]
+        .as_str()
+        .unwrap_or("");
+    assert!(message.contains("node 12"), "{message}");
+    // A syntax error is refused when the edit is made, leaving the scene as it was.
+    let revision = edited["structuredContent"]["committed_revision"]
+        .as_u64()
+        .unwrap_or(0);
+    let typo = json!({ "base_revision": revision, "edits": [
+        { "edit": "set_param", "id": 12, "name": "radius", "value": { "expr": "5 - $" } }
+    ]});
+    let refused = call_tool(&mut client, 6, "graph_batch_edit", typo).await;
+    assert_eq!(refused["isError"], true, "{refused}");
+    assert_eq!(error_code(&refused), "scene_field_invalid", "{refused}");
+    client.shutdown().await;
+}

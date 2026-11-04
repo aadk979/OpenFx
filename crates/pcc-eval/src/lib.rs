@@ -1,12 +1,13 @@
 //! Deterministic DAG evaluator with whole-graph and per-node content-addressed caching
 //! and early cutoff.
+use pcc_expr::{Expr, InputStat, Scope};
 use pcc_geo::{
     AttrDomain as GeoAttrDomain, AttributeColumn, GeoDetail, GeoError, GroupDomain, PAGE_LEN,
     PrimKind, PrimRun, PromoteMode as GeoPromoteMode, UvProjectMode as GeoUvProjectMode,
 };
 use pcc_graph::{
-    AttrDomain, BooleanMode, GraphSnapshot, Node, NodeDef, NodeRegistrationError, PromoteMode,
-    UvProjectMode, node_def, register_node_def,
+    AttrDomain, BooleanMode, GraphSnapshot, Node, NodeDef, NodeRegistrationError, ParamKind,
+    ParamValue, PromoteMode, SceneError, UvProjectMode, node_def, register_node_def,
 };
 use pcc_id::{NodeId, RevisionId};
 use pcc_math::{Philox4x32, Vec3};
@@ -33,8 +34,17 @@ pub enum EvalError {
     NodeNotFound(NodeId),
     Resource(GeoError),
     Vex(VexError),
-    ElementLimit { requested: u32, limit: u32 },
+    ElementLimit {
+        requested: u32,
+        limit: u32,
+    },
     Asset(AssetError),
+    /// A parameter expression failed, or produced a value its parameter does not allow.
+    Param {
+        node: NodeId,
+        param: String,
+        message: String,
+    },
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CookBudget {
@@ -142,8 +152,13 @@ impl CookCache {
         for upstream in upstream_hashes {
             hasher.update(upstream.as_bytes());
         }
-        hasher.update(&frame_numerator.to_le_bytes());
-        hasher.update(&frame_denominator.to_le_bytes());
+        // Expressions have already resolved to values, so only an operator that itself reads the
+        // time is keyed by it. Anything else reuses its result across frames while its values and
+        // inputs stay the same.
+        if node_def(&node.op).is_some_and(|def| def.time_dependent) {
+            hasher.update(&frame_numerator.to_le_bytes());
+            hasher.update(&frame_denominator.to_le_bytes());
+        }
         NodeCacheKey(*hasher.finalize().as_bytes())
     }
     pub fn note_published_revision(&self, revision: RevisionId) {
@@ -293,6 +308,139 @@ fn input_slot(node: &Node, slot: usize) -> Result<NodeId, EvalError> {
         .get(slot)
         .copied()
         .ok_or(EvalError::InvalidGraph)
+}
+
+/// Frames per second until scenes can state their own.
+const DEFAULT_FPS: f64 = 24.0;
+
+/// What a parameter expression can read while its node resolves.
+struct ParamScope<'a> {
+    frame: f64,
+    node: &'a Node,
+    resolved: &'a BTreeMap<NodeId, Node>,
+    outputs: &'a BTreeMap<NodeId, Arc<GeoDetail>>,
+}
+
+/// A numeric parameter, or one component of a vector parameter when named like `size.x`.
+fn read_channel(node: &Node, name: &str) -> Option<f64> {
+    let (base, component) = match name.split_once('.') {
+        Some((base, component)) => (base, Some(component)),
+        None => (name, None),
+    };
+    match (node.params.get(base)?, component) {
+        (ParamValue::Float(value), None) => Some(f64::from(*value)),
+        (ParamValue::Uint(value), None) => Some(*value as f64),
+        (ParamValue::Bool(value), None) => Some(f64::from(u8::from(*value))),
+        (ParamValue::Vec3(value), Some("x")) => Some(f64::from(value.x)),
+        (ParamValue::Vec3(value), Some("y")) => Some(f64::from(value.y)),
+        (ParamValue::Vec3(value), Some("z")) => Some(f64::from(value.z)),
+        _ => None,
+    }
+}
+
+impl Scope for ParamScope<'_> {
+    fn frame(&self) -> f64 {
+        self.frame
+    }
+
+    fn fps(&self) -> f64 {
+        DEFAULT_FPS
+    }
+
+    fn channel(&self, node: Option<u64>, name: &str) -> Option<f64> {
+        match node {
+            // This node's own expression parameters are not resolved yet, so they read as absent.
+            None => read_channel(self.node, name),
+            Some(id) => read_channel(self.resolved.get(&NodeId(id))?, name),
+        }
+    }
+
+    fn input_stat(&self, input: u32, stat: InputStat) -> Option<f64> {
+        let id = self.node.inputs.get(input as usize)?;
+        let geo = self.outputs.get(id)?;
+        let axis_of = |v: Vec3, axis: usize| f64::from([v.x, v.y, v.z][axis]);
+        Some(match stat {
+            InputStat::Points => geo.len() as f64,
+            InputStat::Prims => geo.prim_count() as f64,
+            // Empty geometry has no bounds, and measures as zero rather than failing.
+            InputStat::BoundsMin(axis) => geo.bounds().map_or(0.0, |(low, _)| axis_of(low, axis)),
+            InputStat::BoundsMax(axis) => geo.bounds().map_or(0.0, |(_, high)| axis_of(high, axis)),
+            InputStat::BoundsSize(axis) => geo
+                .bounds()
+                .map_or(0.0, |(low, high)| axis_of(high, axis) - axis_of(low, axis)),
+            InputStat::BoundsCenter(axis) => geo.bounds().map_or(0.0, |(low, high)| {
+                (axis_of(high, axis) + axis_of(low, axis)) * 0.5
+            }),
+        })
+    }
+}
+
+fn evaluate_source(source: &str, scope: &ParamScope<'_>, name: &str) -> Result<f64, EvalError> {
+    let fail = |message: String| EvalError::Param {
+        node: scope.node.id,
+        param: name.to_owned(),
+        message,
+    };
+    Expr::compile(source)
+        .map_err(|error| fail(error.to_string()))?
+        .eval(scope)
+        .map_err(|error| fail(error.to_string()))
+}
+
+/// Replaces every expression with its value at this frame, then applies the operator's constraints
+/// to the result: a formula that strays out of range fails here, naming the node.
+fn resolve_node(node: &Node, scope: &ParamScope<'_>) -> Result<Node, EvalError> {
+    let def = node_def(&node.op).ok_or(EvalError::InvalidGraph)?;
+    let mut resolved = node.clone();
+    let fail = |param: &str, message: &str| EvalError::Param {
+        node: node.id,
+        param: param.to_owned(),
+        message: message.to_owned(),
+    };
+    for param in def.params {
+        let Some(value) = node.params.get(param.name) else {
+            continue;
+        };
+        let replacement = match value {
+            ParamValue::Expr { expr } => {
+                let number = evaluate_source(expr, scope, param.name)?;
+                match param.kind {
+                    ParamKind::F32 => ParamValue::Float(number as f32),
+                    ParamKind::Bool => ParamValue::Bool(number != 0.0),
+                    _ => {
+                        // Integers round, as a frame-driven count would need them to.
+                        let rounded = number.round();
+                        if !(0.0..18_446_744_073_709_551_615.0).contains(&rounded) {
+                            return Err(fail(
+                                param.name,
+                                "the value does not fit an unsigned integer",
+                            ));
+                        }
+                        ParamValue::Uint(rounded as u64)
+                    }
+                }
+            }
+            ParamValue::VecExpr { x, y, z } => ParamValue::Vec3(Vec3 {
+                x: evaluate_source(x, scope, param.name)? as f32,
+                y: evaluate_source(y, scope, param.name)? as f32,
+                z: evaluate_source(z, scope, param.name)? as f32,
+            }),
+            _ => continue,
+        };
+        resolved.params.insert(param.name.to_owned(), replacement);
+    }
+    if node.has_expressions() {
+        def.validate(&resolved).map_err(|error| {
+            fail(
+                "",
+                match error {
+                    SceneError::NonFinite => "a resolved value is not finite",
+                    _ => "a resolved value is outside the range its parameter allows",
+                },
+            )
+        })?;
+    }
+    Ok(resolved)
 }
 
 /// Cooks one node of a runtime-registered operator from its evaluated inputs.
@@ -1434,12 +1582,23 @@ where
     let total_steps = snapshot.nodes.len() as u32;
     on_progress(0, total_steps);
     let mut outputs: BTreeMap<NodeId, Arc<GeoDetail>> = BTreeMap::new();
+    let mut resolved_nodes: BTreeMap<NodeId, Node> = BTreeMap::new();
     let mut last_output: Option<Arc<GeoDetail>> = None;
+    let frame = frame_numerator as f64 / f64::from(frame_denominator.max(1));
 
     for (step_idx, node) in snapshot.nodes.iter().enumerate() {
         if ctx.cancelled.load(Ordering::Acquire) {
             return Err(EvalError::Cancelled);
         }
+        let node = &resolve_node(
+            node,
+            &ParamScope {
+                frame,
+                node,
+                resolved: &resolved_nodes,
+                outputs: &outputs,
+            },
+        )?;
         let node_geo = if let Some(cook_cache) = cache {
             let mut upstream_hashes = Vec::new();
             for input_id in node.inputs() {
@@ -1475,6 +1634,7 @@ where
             )?)
         };
         let nid = node.id();
+        resolved_nodes.insert(nid, node.clone());
         outputs.insert(nid, Arc::clone(&node_geo));
         last_output = Some(Arc::clone(&node_geo));
         on_progress((step_idx + 1) as u32, total_steps);
@@ -2578,5 +2738,290 @@ mod tests {
             ],
         };
         assert_eq!(cook(&scene, &ctx).err(), Some(EvalError::InvalidGraph));
+    }
+
+    fn scene(nodes: Vec<Node>) -> GraphSnapshot {
+        GraphSnapshot {
+            revision: RevisionId(1),
+            nodes,
+        }
+    }
+
+    fn cook_frame(
+        cache: &CookCache,
+        scene: &GraphSnapshot,
+        id: u64,
+        frame: i64,
+        ctx: &EvalContext<'_>,
+    ) -> Result<Arc<GeoDetail>, EvalError> {
+        cook_node_cached(cache, scene, NodeId(id), frame, 1, ctx)
+    }
+
+    #[test]
+    fn expressions_animate_parameters_with_the_frame() -> Result<(), EvalError> {
+        let cancelled = AtomicBool::new(false);
+        let ctx = sop_ctx(&cancelled);
+        let cache = CookCache::default();
+        let graph = scene(vec![
+            Node::new("box", NodeId(1)).with_vec3("size", v3(1.0, 1.0, 1.0)),
+            Node::new("xform", NodeId(2))
+                .with_input(NodeId(1))
+                .with_vec3_expr("translate", ["0", "$F * 2", "$T"])
+                .with_vec3("rotate_degrees", Vec3::ZERO)
+                .with_vec3("scale", v3(1.0, 1.0, 1.0)),
+        ]);
+        let at = |frame| -> Result<Option<(Vec3, Vec3)>, EvalError> {
+            Ok(cook_frame(&cache, &graph, 2, frame, &ctx)?.bounds())
+        };
+        let (low, _) = at(0)?.unwrap_or((Vec3::ZERO, Vec3::ZERO));
+        let (low_later, _) = at(24)?.unwrap_or((Vec3::ZERO, Vec3::ZERO));
+        // Frame 24 is one second: 48 up, and one along Z.
+        assert!((low_later.y - low.y - 48.0).abs() < 1e-4, "{low_later:?}");
+        assert!((low_later.z - low.z - 1.0).abs() < 1e-5, "{low_later:?}");
+        Ok(())
+    }
+
+    #[test]
+    fn unchanged_values_reuse_results_across_frames() -> Result<(), EvalError> {
+        let cancelled = AtomicBool::new(false);
+        let ctx = sop_ctx(&cancelled);
+        let cache = CookCache::default();
+        // The offset only steps at frame 10, and the box and its reversal never depend on time.
+        let graph = scene(vec![
+            Node::new("box", NodeId(1)).with_vec3("size", v3(1.0, 1.0, 1.0)),
+            Node::new("xform", NodeId(2))
+                .with_input(NodeId(1))
+                .with_vec3_expr("translate", ["if($F < 10, 0, 5)", "0", "0"])
+                .with_vec3("rotate_degrees", Vec3::ZERO)
+                .with_vec3("scale", v3(1.0, 1.0, 1.0)),
+            Node::new("reverse", NodeId(3)).with_input(NodeId(2)),
+        ]);
+        let first = cook_frame(&cache, &graph, 3, 1, &ctx)?;
+        let hits = cache.node_cache_hits();
+        // Same resolved values at another frame: all three nodes come from the cache.
+        let same = cook_frame(&cache, &graph, 3, 2, &ctx)?;
+        assert_eq!(cache.node_cache_hits(), hits + 3);
+        assert_eq!(same.hash(), first.hash());
+        // Past the step the box still hits, but the other two recook.
+        let hits = cache.node_cache_hits();
+        let moved = cook_frame(&cache, &graph, 3, 10, &ctx)?;
+        assert_eq!(cache.node_cache_hits(), hits + 1);
+        assert_ne!(moved.hash(), first.hash());
+        Ok(())
+    }
+
+    #[test]
+    fn operators_that_read_time_recook_every_frame() -> Result<(), EvalError> {
+        let cancelled = AtomicBool::new(false);
+        let ctx = sop_ctx(&cancelled);
+        let cache = CookCache::default();
+        let graph = scene(vec![
+            Node::new("create", NodeId(1)).with_u32("count", 2),
+            Node::new("wrangle", NodeId(2))
+                .with_input(NodeId(1))
+                .with_text("snippet", "@age = @Frame;"),
+        ]);
+        let first = cook_frame(&cache, &graph, 2, 1, &ctx)?;
+        let second = cook_frame(&cache, &graph, 2, 2, &ctx)?;
+        assert_ne!(
+            first.hash(),
+            second.hash(),
+            "the wrangle must see the new frame"
+        );
+        let hits = cache.node_cache_hits();
+        cook_frame(&cache, &graph, 2, 3, &ctx)?;
+        assert_eq!(
+            cache.node_cache_hits(),
+            hits + 1,
+            "only the generator is reusable"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn channel_references_read_resolved_values_from_earlier_nodes() -> Result<(), EvalError> {
+        let cancelled = AtomicBool::new(false);
+        let ctx = sop_ctx(&cancelled);
+        let cache = CookCache::default();
+        let graph = scene(vec![
+            // An expression feeding an expression: the sphere's radius follows the frame.
+            Node::new("sphere", NodeId(1))
+                .with_expr("radius", "1 + $F")
+                .with_u32("rows", 8)
+                .with_u32("cols", 8),
+            Node::new("box", NodeId(2))
+                .with_vec3_expr("size", ["ch(1, \"radius\") * 2", "ch(1, \"rows\")", "1"]),
+            // A vector component of another node, used by a node with no input from it.
+            Node::new("tube", NodeId(3))
+                .with_expr("radius", "ch(2, \"size.y\") + 1")
+                .with_expr("height", "ch(\"cols\") / 2")
+                .with_u32("rows", 1)
+                .with_u32("cols", 8),
+            Node::new("merge", NodeId(4))
+                .with_input(NodeId(1))
+                .with_input(NodeId(2)),
+        ]);
+        let cooked = cook_frame(&cache, &graph, 2, 2, &ctx)?;
+        let (low, high) = cooked.bounds().unwrap_or((Vec3::ZERO, Vec3::ZERO));
+        // Frame 2 gives radius 3, so the box is 6 by 8 by 1.
+        assert_eq!(
+            (high.x - low.x, high.y - low.y, high.z - low.z),
+            (6.0, 8.0, 1.0)
+        );
+        let tube = cook_frame(&cache, &graph, 3, 2, &ctx)?;
+        let (low, high) = tube.bounds().unwrap_or((Vec3::ZERO, Vec3::ZERO));
+        // Radius 8 + 1, and height 8 / 2 read from its own literal parameter.
+        assert!((high.y - low.y - 4.0).abs() < 1e-5, "{low:?} {high:?}");
+        assert!((high.x - 9.0).abs() < 1e-4, "{high:?}");
+        Ok(())
+    }
+
+    #[test]
+    fn expressions_can_measure_input_geometry() -> Result<(), EvalError> {
+        let cancelled = AtomicBool::new(false);
+        let ctx = sop_ctx(&cancelled);
+        let cache = CookCache::default();
+        let graph = scene(vec![
+            Node::new("box", NodeId(1)).with_vec3("size", v3(4.0, 2.0, 6.0)),
+            // Rests the box on the ground whatever its size.
+            Node::new("xform", NodeId(2))
+                .with_input(NodeId(1))
+                .with_vec3_expr("translate", ["0", "-bbox(0, \"ymin\")", "npoints(0)"])
+                .with_vec3("rotate_degrees", Vec3::ZERO)
+                .with_vec3_expr("scale", ["1", "1", "if(nprims(0) == 6, 1, 2)"]),
+        ]);
+        let rested = cook_frame(&cache, &graph, 2, 0, &ctx)?;
+        let (low, high) = rested.bounds().unwrap_or((Vec3::ZERO, Vec3::ZERO));
+        assert_eq!(low.y, 0.0);
+        assert_eq!(high.y, 2.0);
+        assert_eq!(high.z - low.z, 6.0, "six prims keeps the scale at one");
+        assert_eq!(low.z, 8.0, "moved along Z by the eight points of its input");
+        Ok(())
+    }
+
+    #[test]
+    fn resolved_values_obey_their_parameter_constraints() {
+        let cancelled = AtomicBool::new(false);
+        let ctx = sop_ctx(&cancelled);
+        let cache = CookCache::default();
+        let sphere_at = |radius: &str| {
+            scene(vec![
+                Node::new("sphere", NodeId(1))
+                    .with_expr("radius", radius)
+                    .with_u32("rows", 8)
+                    .with_u32("cols", 8),
+                Node::new("reverse", NodeId(2)).with_input(NodeId(1)),
+            ])
+        };
+        let graph = sphere_at("5 - $F");
+        assert!(cook_frame(&cache, &graph, 2, 4, &ctx).is_ok());
+        // At frame 5 the radius reaches zero, which a sphere does not allow.
+        let fails_on = |result: Result<Arc<GeoDetail>, EvalError>| match result {
+            Err(EvalError::Param { node, .. }) => node,
+            // Zero is never a real node id, so success can never pass for the expected failure.
+            _ => NodeId(0),
+        };
+        assert_eq!(fails_on(cook_frame(&cache, &graph, 2, 5, &ctx)), NodeId(1));
+        // Division by zero and an unknown channel name the node and the parameter.
+        let by_zero = cook_frame(&cache, &sphere_at("1 / ($F - 3)"), 2, 3, &ctx);
+        assert!(
+            matches!(&by_zero, Err(EvalError::Param { param, message, .. })
+                if param == "radius" && message.contains("not finite")),
+            "{by_zero:?}"
+        );
+        assert_eq!(
+            fails_on(cook_frame(&cache, &sphere_at("ch(\"nope\")"), 2, 0, &ctx)),
+            NodeId(1)
+        );
+        // An own parameter that is itself an expression has no value yet.
+        let own = scene(vec![
+            Node::new("tube", NodeId(1))
+                .with_expr("radius", "ch(\"height\")")
+                .with_expr("height", "1")
+                .with_u32("rows", 1)
+                .with_u32("cols", 8),
+            Node::new("reverse", NodeId(2)).with_input(NodeId(1)),
+        ]);
+        assert_eq!(fails_on(cook_frame(&cache, &own, 2, 0, &ctx)), NodeId(1));
+        // Integer parameters round, and refuse negative values.
+        let rows = |expr: &str| {
+            scene(vec![
+                Node::new("sphere", NodeId(1))
+                    .with_f32("radius", 1.0)
+                    .with_expr("rows", expr)
+                    .with_u32("cols", 8),
+                Node::new("reverse", NodeId(2)).with_input(NodeId(1)),
+            ])
+        };
+        let rounded = cook_frame(&cache, &rows("7.6"), 2, 0, &ctx);
+        // Eight bands around eight segments: two poles and seven rings.
+        assert_eq!(rounded.map(|g| g.len()).ok(), Some(2 + 7 * 8));
+        assert_eq!(
+            fails_on(cook_frame(&cache, &rows("-1"), 2, 0, &ctx)),
+            NodeId(1)
+        );
+        assert_eq!(
+            fails_on(cook_frame(&cache, &rows("1e30"), 2, 0, &ctx)),
+            NodeId(1)
+        );
+        // With no range for a later check to catch them, integers must still fit themselves.
+        let count = |expr: &str| {
+            scene(vec![
+                Node::new("create", NodeId(1)).with_expr("count", expr),
+                Node::new("reverse", NodeId(2)).with_input(NodeId(1)),
+            ])
+        };
+        assert_eq!(
+            cook_frame(&cache, &count("3"), 2, 0, &ctx)
+                .map(|g| g.len())
+                .ok(),
+            Some(3)
+        );
+        assert_eq!(
+            fails_on(cook_frame(&cache, &count("-1"), 2, 0, &ctx)),
+            NodeId(1)
+        );
+        let seed = scene(vec![
+            Node::new("box", NodeId(1)).with_vec3("size", v3(1.0, 1.0, 1.0)),
+            Node::new("scatter", NodeId(2))
+                .with_input(NodeId(1))
+                .with_u32("count", 2)
+                .with_expr("seed", "1e30"),
+        ]);
+        assert_eq!(fails_on(cook_frame(&cache, &seed, 2, 0, &ctx)), NodeId(2));
+        // Cross-parameter rules apply once the values exist.
+        let torus = scene(vec![
+            Node::new("torus", NodeId(1))
+                .with_expr("major_radius", "$F")
+                .with_f32("minor_radius", 1.0)
+                .with_u32("rows", 8)
+                .with_u32("cols", 8),
+            Node::new("reverse", NodeId(2)).with_input(NodeId(1)),
+        ]);
+        assert!(cook_frame(&cache, &torus, 2, 2, &ctx).is_ok());
+        assert_eq!(fails_on(cook_frame(&cache, &torus, 2, 1, &ctx)), NodeId(1));
+    }
+
+    #[test]
+    fn boolean_parameters_follow_the_truth_of_their_expression() -> Result<(), EvalError> {
+        let cancelled = AtomicBool::new(false);
+        let ctx = sop_ctx(&cancelled);
+        let cache = CookCache::default();
+        let graph = scene(vec![
+            Node::new("line", NodeId(1))
+                .with_vec3("start", Vec3::ZERO)
+                .with_vec3("end", v3(0.0, 1.0, 0.0))
+                .with_u32("points", 2),
+            Node::new("sweep", NodeId(2))
+                .with_input(NodeId(1))
+                .with_f32("radius", 0.5)
+                .with_u32("sides", 6)
+                .with_expr("capped", "$F > 3"),
+        ]);
+        let open = cook_frame(&cache, &graph, 2, 3, &ctx)?;
+        let capped = cook_frame(&cache, &graph, 2, 4, &ctx)?;
+        assert_eq!(open.prim_count(), 6, "false: the six side quads alone");
+        assert_eq!(capped.prim_count(), 8, "true: the sides and both caps");
+        Ok(())
     }
 }

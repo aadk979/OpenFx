@@ -6,6 +6,7 @@
 //! cook function, and [`register_node_def`] lets that happen at runtime, as plugins will need.
 
 use crate::SceneError;
+use pcc_expr::Expr;
 use pcc_id::NodeId;
 use pcc_math::Vec3;
 use schemars::JsonSchema;
@@ -23,6 +24,16 @@ pub enum ParamValue {
     Uint(u64),
     Float(f32),
     Vec3(Vec3),
+    /// A vector with at least one expression component. Literal components are held as text too.
+    VecExpr {
+        x: String,
+        y: String,
+        z: String,
+    },
+    /// A formula evaluated per cook, such as `$F * 0.1`.
+    Expr {
+        expr: String,
+    },
     Text(String),
 }
 
@@ -56,6 +67,18 @@ impl ParamValue {
                 update(&[5]);
                 update(&(value.len() as u64).to_le_bytes());
                 update(value.as_bytes());
+            }
+            Self::Expr { expr } => {
+                update(&[6]);
+                update(&(expr.len() as u64).to_le_bytes());
+                update(expr.as_bytes());
+            }
+            Self::VecExpr { x, y, z } => {
+                update(&[7]);
+                for component in [x, y, z] {
+                    update(&(component.len() as u64).to_le_bytes());
+                    update(component.as_bytes());
+                }
             }
         }
     }
@@ -157,6 +180,8 @@ pub struct NodeDef {
     pub params: &'static [NodeParam],
     /// The operator mixes its node id into its result, so the id must key its cache entries.
     pub seeded_by_node_id: bool,
+    /// The operator reads the current time, so its results cannot be reused across frames.
+    pub time_dependent: bool,
     /// A constraint spanning several parameters.
     pub rule: Option<NodeRule>,
 }
@@ -177,6 +202,7 @@ impl NodeDef {
             inputs,
             params,
             seeded_by_node_id: false,
+            time_dependent: false,
             rule: None,
         }
     }
@@ -184,6 +210,12 @@ impl NodeDef {
     #[must_use]
     pub const fn seeded_by_node_id(mut self) -> Self {
         self.seeded_by_node_id = true;
+        self
+    }
+
+    #[must_use]
+    pub const fn time_dependent(mut self) -> Self {
+        self.time_dependent = true;
         self
     }
 
@@ -202,9 +234,11 @@ impl NodeDef {
             let value = node.params.get(param.name).ok_or(SceneError::Field)?;
             validate_param(param, value)?;
         }
+        // A rule compares values, which an unresolved expression does not have yet. The evaluator
+        // applies this whole check again to the resolved node.
         match self.rule {
-            Some(rule) => rule(node),
-            None => Ok(()),
+            Some(rule) if !node.has_expressions() => rule(node),
+            _ => Ok(()),
         }
     }
 
@@ -254,7 +288,30 @@ fn require(condition: bool) -> Result<(), SceneError> {
     }
 }
 
+fn validate_expression(source: &str) -> Result<(), SceneError> {
+    Expr::compile(source)
+        .map(|_| ())
+        .map_err(|_| SceneError::Field)
+}
+
 fn validate_param(param: &NodeParam, value: &ParamValue) -> Result<(), SceneError> {
+    match value {
+        // Only the syntax can be judged now. Ranges wait until the value exists.
+        ParamValue::Expr { expr } => {
+            require(matches!(
+                param.kind,
+                ParamKind::F32 | ParamKind::U32 | ParamKind::U64 | ParamKind::Bool
+            ))?;
+            return validate_expression(expr);
+        }
+        ParamValue::VecExpr { x, y, z } => {
+            require(param.kind == ParamKind::Vec3)?;
+            validate_expression(x)?;
+            validate_expression(y)?;
+            return validate_expression(z);
+        }
+        _ => {}
+    }
     match param.kind {
         ParamKind::F32 => {
             let number = check_finite(as_f32(value).ok_or(SceneError::Field)?)?;
@@ -400,6 +457,25 @@ impl Node {
         self.with_value(name, ParamValue::Vec3(value))
     }
 
+    /// Sets a scalar parameter to a formula such as `$F * 0.1`.
+    #[must_use]
+    pub fn with_expr(self, name: &str, expr: impl Into<String>) -> Self {
+        self.with_value(name, ParamValue::Expr { expr: expr.into() })
+    }
+
+    /// Sets a vector parameter per component; each is a formula or a plain number.
+    #[must_use]
+    pub fn with_vec3_expr(self, name: &str, [x, y, z]: [&str; 3]) -> Self {
+        self.with_value(
+            name,
+            ParamValue::VecExpr {
+                x: canonical_component(x),
+                y: canonical_component(y),
+                z: canonical_component(z),
+            },
+        )
+    }
+
     #[must_use]
     pub fn with_text(self, name: &str, value: impl Into<String>) -> Self {
         self.with_value(name, ParamValue::Text(value.into()))
@@ -419,6 +495,37 @@ impl Node {
     #[must_use]
     pub fn inputs(&self) -> Vec<NodeId> {
         self.inputs.clone()
+    }
+
+    /// Whether any parameter needs evaluating before this node can cook.
+    #[must_use]
+    pub fn has_expressions(&self) -> bool {
+        self.params
+            .values()
+            .any(|value| matches!(value, ParamValue::Expr { .. } | ParamValue::VecExpr { .. }))
+    }
+
+    /// Everything that must evaluate first: input geometry, and nodes that `ch` reads.
+    #[must_use]
+    pub fn dependencies(&self) -> Vec<NodeId> {
+        let mut found = self.inputs.clone();
+        let mut add = |source: &str| {
+            if let Ok(expr) = Expr::compile(source) {
+                found.extend(expr.referenced_nodes().map(NodeId));
+            }
+        };
+        for value in self.params.values() {
+            match value {
+                ParamValue::Expr { expr } => add(expr),
+                ParamValue::VecExpr { x, y, z } => {
+                    add(x);
+                    add(y);
+                    add(z);
+                }
+                _ => {}
+            }
+        }
+        found
     }
 
     #[must_use]
@@ -467,11 +574,22 @@ impl Node {
             return;
         };
         for param in def.params {
+            let Some(value) = self.params.get_mut(param.name) else {
+                continue;
+            };
             if param.kind == ParamKind::F32
-                && let Some(value) = self.params.get_mut(param.name)
                 && let Some(number) = as_f32(value)
             {
                 *value = ParamValue::Float(number);
+            }
+            if let ParamValue::VecExpr { x, y, z } = value {
+                *x = canonical_component(x);
+                *y = canonical_component(y);
+                *z = canonical_component(z);
+                // A vector of plain numbers is just a vector, however it arrived.
+                if let (Ok(x), Ok(y), Ok(z)) = (x.parse(), y.parse(), z.parse()) {
+                    *value = ParamValue::Vec3(Vec3 { x, y, z });
+                }
             }
         }
     }
@@ -509,6 +627,18 @@ impl Node {
                     out.push_str(&encode_hex(v.as_bytes()));
                 }
                 ParamValue::Text(v) => out.push_str(&format!(" {v}")),
+                ParamValue::Expr { expr } => {
+                    out.push_str(&format!(" ={}", encode_hex(expr.as_bytes())))
+                }
+                ParamValue::VecExpr { x, y, z } => {
+                    for component in [x, y, z] {
+                        if component.parse::<f32>().is_ok() {
+                            out.push_str(&format!(" {component}"));
+                        } else {
+                            out.push_str(&format!(" ={}", encode_hex(component.as_bytes())));
+                        }
+                    }
+                }
             }
         }
         out.push('\n');
@@ -526,17 +656,35 @@ impl Node {
         }
         for param in def.params {
             let value = match param.kind {
-                ParamKind::F32 => ParamValue::Float(parse_f32(parse_next(&mut parts)?)?),
-                ParamKind::U32 => {
-                    ParamValue::Uint(u64::from(parse_u32_strict(parse_next(&mut parts)?)?))
+                ParamKind::F32 | ParamKind::U32 | ParamKind::U64 | ParamKind::Bool => {
+                    let token = parse_next(&mut parts)?;
+                    match token.strip_prefix('=') {
+                        Some(hex) => ParamValue::Expr {
+                            expr: decode_hex_ascii(hex)?,
+                        },
+                        None => parse_scalar(param.kind, token)?,
+                    }
                 }
-                ParamKind::U64 => ParamValue::Uint(parse_u64_strict(parse_next(&mut parts)?)?),
-                ParamKind::Bool => ParamValue::Bool(parse_bool(parse_next(&mut parts)?)?),
                 ParamKind::Vec3 => {
-                    let x = parse_f32(parse_next(&mut parts)?)?;
-                    let y = parse_f32(parse_next(&mut parts)?)?;
-                    let z = parse_f32(parse_next(&mut parts)?)?;
-                    ParamValue::Vec3(Vec3 { x, y, z })
+                    let tokens = [
+                        parse_next(&mut parts)?,
+                        parse_next(&mut parts)?,
+                        parse_next(&mut parts)?,
+                    ];
+                    if tokens.iter().any(|token| token.starts_with('=')) {
+                        let [x, y, z] = tokens.map(parse_component);
+                        ParamValue::VecExpr {
+                            x: x?,
+                            y: y?,
+                            z: z?,
+                        }
+                    } else {
+                        ParamValue::Vec3(Vec3 {
+                            x: parse_f32(tokens[0])?,
+                            y: parse_f32(tokens[1])?,
+                            z: parse_f32(tokens[2])?,
+                        })
+                    }
                 }
                 ParamKind::Text if param.check == Check::Snippet => {
                     ParamValue::Text(decode_hex_ascii(parse_next(&mut parts)?)?)
@@ -551,6 +699,33 @@ impl Node {
             return Err(SceneError::Field);
         }
         Ok(node)
+    }
+}
+
+fn parse_scalar(kind: ParamKind, token: &str) -> Result<ParamValue, SceneError> {
+    Ok(match kind {
+        ParamKind::F32 => ParamValue::Float(parse_f32(token)?),
+        ParamKind::U32 => ParamValue::Uint(u64::from(parse_u32_strict(token)?)),
+        ParamKind::U64 => ParamValue::Uint(parse_u64_strict(token)?),
+        _ => ParamValue::Bool(parse_bool(token)?),
+    })
+}
+
+/// A vector component in a scene file: `=hex` for a formula, or a plain number.
+fn parse_component(token: &str) -> Result<String, SceneError> {
+    match token.strip_prefix('=') {
+        Some(hex) => decode_hex_ascii(hex),
+        None => Ok(canonical_component(&format!("{:e}", parse_f32(token)?))),
+    }
+}
+
+/// Writes a plain-number component in canonical form, leaving formulas alone.
+fn canonical_component(text: &str) -> String {
+    match text.trim().parse::<f32>() {
+        Ok(value) if value.is_finite() => {
+            format!("{:e}", if value == 0.0 { 0.0 } else { value })
+        }
+        _ => text.to_owned(),
     }
 }
 
@@ -776,7 +951,8 @@ static BUILTIN_NODES: &[NodeDef] = &[
             Check::Snippet,
             "VEX-lite point wrangle source code.",
         )],
-    ),
+    )
+    .time_dependent(),
     NodeDef::new(
         "subdivide",
         "modifier",

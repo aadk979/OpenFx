@@ -199,6 +199,7 @@ pub enum ToolErrorCode {
     MeshParseFailed,
     AssetNotFound,
     AssetCorrupt,
+    ParamEvaluationFailed,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -397,6 +398,14 @@ impl McpError {
                 job_id: None,
             },
             Self::Cook(eval_err) => match eval_err {
+                EvalError::Param {
+                    node,
+                    param,
+                    message,
+                } => plain(
+                    ToolErrorCode::ParamEvaluationFailed,
+                    format!("node {} parameter `{param}`: {message}", node.0),
+                ),
                 EvalError::Asset(AssetError::NotFound) => plain(
                     ToolErrorCode::AssetNotFound,
                     "the scene refers to an asset that was never imported into this workspace"

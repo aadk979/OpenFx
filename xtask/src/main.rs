@@ -130,7 +130,7 @@ fn crate_tier(name: &str) -> Option<u8> {
         "pcc-geo" | "pcc-graph" | "pcc-sop" | "pcc-terrain" | "pcc-vdb" => Some(1),
         "pcc-store" | "pcc-cmd" | "pcc-eval" | "pcc-io" | "pcc-vex" => Some(2),
         "pcc-mcp" => Some(3),
-        "pcc-mcp-stdio" => Some(4),
+        "pcc-mcp-stdio" | "pcc-torture" => Some(4),
         _ => None,
     }
 }

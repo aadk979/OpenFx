@@ -505,12 +505,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "pcc-torture"
+version = "0.1.0"
+dependencies = [
+ "pcc-geo",
+ "pcc-io",
+ "pcc-math",
+ "pcc-sop",
+ "pcc-vdb",
+ "serde_json",
+]
+
+[[package]]
 name = "pcc-vdb"
 version = "0.1.0"
 dependencies = [
  "blake3",
  "pcc-geo",
  "pcc-math",
+ "pcc-sop",
 ]
 
 [[package]]

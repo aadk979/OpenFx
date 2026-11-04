@@ -1,0 +1,12 @@
+[package]
+name = "pcc-graph"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+[dependencies]
+pcc-id = { path = "../pcc-id" }
+pcc-math = { path = "../pcc-math" }
+schemars.workspace = true
+serde.workspace = true
+[lints]
+workspace = true

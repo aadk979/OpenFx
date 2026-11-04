@@ -1,0 +1,16 @@
+[package]
+name = "pcc-vex"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+version.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+pcc-geo = { path = "../pcc-geo" }
+pcc-math = { path = "../pcc-math" }
+schemars.workspace = true
+serde.workspace = true

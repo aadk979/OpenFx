@@ -1,0 +1,13 @@
+[package]
+name = "pcc-store"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+pcc-graph = { path = "../pcc-graph" }
+pcc-id = { path = "../pcc-id" }
+pcc-math = { path = "../pcc-math" }
+
+[lints]
+workspace = true

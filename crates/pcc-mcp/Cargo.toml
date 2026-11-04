@@ -1,0 +1,18 @@
+[package]
+name = "pcc-mcp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+[dependencies]
+pcc-geo = { path = "../pcc-geo" }
+pcc-id = { path = "../pcc-id" }
+pcc-math = { path = "../pcc-math" }
+pcc-cmd = { path = "../pcc-cmd" }
+pcc-eval = { path = "../pcc-eval" }
+pcc-graph = { path = "../pcc-graph" }
+pcc-store = { path = "../pcc-store" }
+pcc-vex = { path = "../pcc-vex" }
+schemars.workspace = true
+serde.workspace = true
+[lints]
+workspace = true

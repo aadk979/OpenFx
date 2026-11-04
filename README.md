@@ -1,0 +1,6 @@
+# PCC foundation workspace
+
+This is the Phase-0 vertical slice for the procedural content-creation engine documented in `docs/`.
+Run `cargo xtask ci` to format-check, lint, and test the workspace. The full AST-based anti-slop audit remains a tracked M0.1 sub-task.
+
+The currently delivered executable slice is deliberately narrow; its boundary, contracts, and non-goals are recorded in [`docs/adr/001-foundation-vertical-slice.md`](docs/adr/001-foundation-vertical-slice.md), [`docs/adr/002-phase0-mcp-jobs-and-attributes.md`](docs/adr/002-phase0-mcp-jobs-and-attributes.md), [`docs/adr/003-phase0-dag-domains-and-introspection.md`](docs/adr/003-phase0-dag-domains-and-introspection.md), [`docs/adr/004-io-sandboxes-and-mesh-sops.md`](docs/adr/004-io-sandboxes-and-mesh-sops.md), [`docs/adr/005-topology-vex-and-modeling-sops.md`](docs/adr/005-topology-vex-and-modeling-sops.md), [`docs/adr/006-topological-modeling-and-subdivision.md`](docs/adr/006-topological-modeling-and-subdivision.md), [`docs/adr/007-terrain-heightfields-and-uv-projection.md`](docs/adr/007-terrain-heightfields-and-uv-projection.md), and [`docs/adr/008-sparse-vdb-volumes-and-manifold-booleans.md`](docs/adr/008-sparse-vdb-volumes-and-manifold-booleans.md).

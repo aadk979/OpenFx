@@ -1,6 +1,6 @@
 //! Editable manifold triangle mesh with the local operations used by decimation and remeshing.
 
-use crate::common::{D3, SopContext, build_geo, cross, dot, length, sub};
+use crate::common::{D3, SopContext, build_geo, cross, dot, has_repeated_faces, length, sub};
 use crate::modify::triangles_of;
 use pcc_geo::{GeoDetail, GeoError, PrimKind};
 use std::collections::BTreeSet;
@@ -17,8 +17,12 @@ pub(crate) struct TriMesh {
 
 impl TriMesh {
     /// Triangulates polygon input and verifies it is an oriented manifold (every directed edge
-    /// is unique). Degenerate triangles and unreferenced points are dropped.
+    /// is unique) with no repeated faces, on which the local operations would create non-manifold
+    /// edges. Degenerate triangles and unreferenced points are dropped.
     pub(crate) fn from_geo(geo: &GeoDetail, ctx: &SopContext<'_>) -> Result<Self, GeoError> {
+        if has_repeated_faces(geo) {
+            return Err(GeoError::InvalidTopology);
+        }
         let (points, triangles) = triangles_of(geo)?;
         let mut mesh = Self {
             verts: points,

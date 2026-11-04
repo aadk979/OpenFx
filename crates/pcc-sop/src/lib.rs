@@ -22,7 +22,7 @@ mod uv;
 
 pub use bevel::poly_bevel;
 pub use clip::{clip_halfspace, voronoi_fracture};
-pub use common::{SopContext, signed_volume};
+pub use common::{SopContext, has_repeated_faces, signed_volume};
 pub use curves::{resample_curves, sweep_curves};
 pub use modify::{Trs, fuse_points, measure, reverse_winding, transform_trs, triangulate};
 pub use primitives::{create_line, create_sphere, create_torus, create_tube};

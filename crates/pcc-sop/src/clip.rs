@@ -1,8 +1,8 @@
 //! Half-space clipping with watertight capping, and Voronoi fracture built on top of it.
 
 use crate::common::{
-    D3, OrdF64, SopContext, any_perpendicular, build_geo, cross, distance, dot, lerp, load_points,
-    normalized, scale, sub,
+    D3, OrdF64, SopContext, any_perpendicular, build_geo, cross, distance, dot, has_repeated_faces,
+    lerp, load_points, normalized, scale, sub,
 };
 use crate::earclip::{P2, bridge_holes, contains_point, ear_clip, signed_area};
 use crate::modify::triangles_of;
@@ -198,12 +198,15 @@ fn cap_openings(points: &[D3], on_plane: &[bool], normal: D3, triangles: &mut Ve
         }
         let corners = as_corners(&found);
         let area = signed_area(&flat, &corners);
-        if area > 0.0 {
+        if area >= 0.0 {
             outers.push((corners, area, Vec::new()));
-        } else if area < 0.0 {
+        } else {
             holes.push(corners);
         }
     }
+    // Every opening must be consumed or the solid stays open. A clockwise loop inside no outline is
+    // not a hole: inside-out solids produce only such loops. It is capped as its own polygon.
+    let mut orphans = Vec::new();
     for hole in holes {
         let probe = flat[hole[0]];
         let home = outers
@@ -212,8 +215,16 @@ fn cap_openings(points: &[D3], on_plane: &[bool], normal: D3, triangles: &mut Ve
             .filter(|(_, outer)| contains_point(&flat, &outer.0, probe))
             .min_by_key(|(_, outer)| OrdF64(outer.1))
             .map(|(index, _)| index);
-        if let Some(index) = home {
-            outers[index].2.push(hole);
+        match home {
+            Some(index) => outers[index].2.push(hole),
+            None => orphans.push(hole),
+        }
+    }
+    for orphan in orphans {
+        let reversed: Vec<usize> = orphan.iter().rev().copied().collect();
+        for t in ear_clip(&flat, &reversed) {
+            // Triangulated counter-clockwise; restored to the loop's own direction.
+            triangles.push([t[2] as u32, t[1] as u32, t[0] as u32]);
         }
     }
     for (outer, _, inner) in outers {
@@ -263,7 +274,7 @@ pub fn voronoi_fracture(
     seeds: &GeoDetail,
     ctx: &SopContext<'_>,
 ) -> Result<GeoDetail, GeoError> {
-    if !TopologyIndex::build(geo).is_closed_manifold() {
+    if !TopologyIndex::build(geo).is_closed_manifold() || has_repeated_faces(geo) {
         return Err(GeoError::InvalidTopology);
     }
     let (points, triangles) = triangles_of(geo)?;
@@ -510,6 +521,33 @@ mod tests {
         assert!((total - whole).abs() < 1e-4 * whole, "{total} vs {whole}");
         let repeat = voronoi_fracture(&torus, &seeds, &ctx)?;
         assert_eq!(repeat.hash(), pieces.hash());
+        Ok(())
+    }
+
+    #[test]
+    fn inside_out_solids_clip_and_fracture_closed_with_negative_volume() -> Result<(), GeoError> {
+        let flag = AtomicBool::new(false);
+        let ctx = SopContext::new(1 << 24, &flag);
+        let inverted = cube()?.with_reversed_winding()?;
+        let slab = clip_halfspace(&inverted, [0.0, 0.25, 0.0], [0.0, 1.0, 0.0], true, &ctx)?;
+        assert!(TopologyIndex::build(&slab).is_closed_manifold());
+        assert!(
+            (signed_volume(&slab) + 0.25).abs() < 1e-6,
+            "{}",
+            signed_volume(&slab)
+        );
+        // A cut through an inverted torus leaves two loops at once, and an annulus the other way.
+        let torus = create_torus(3.0, 1.0, 48, 24, &ctx)?.with_reversed_winding()?;
+        let whole = signed_volume(&torus);
+        for normal in [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]] {
+            let half = clip_halfspace(&torus, [0.0; 3], normal, true, &ctx)?;
+            assert!(TopologyIndex::build(&half).is_closed_manifold());
+            assert!((signed_volume(&half) - whole / 2.0).abs() < 1e-3 * whole.abs());
+        }
+        let seeds = random_seeds(8, 4.0, 3)?;
+        let shards = voronoi_fracture(&torus, &seeds, &ctx)?;
+        assert!(TopologyIndex::build(&shards).is_closed_manifold());
+        assert!((signed_volume(&shards) - whole).abs() < 1e-3 * whole.abs());
         Ok(())
     }
 

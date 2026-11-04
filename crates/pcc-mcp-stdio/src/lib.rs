@@ -2,9 +2,9 @@
 use pcc_graph::{GraphEdit, NodeTypeSpec};
 use pcc_id::{JobId, NodeId, RevisionId, TransactionId};
 use pcc_mcp::{
-    CancelJobResponse, CookJobSnapshot, GeoInvariantReport, GeoInvariantSpec, GeoProbe,
-    NodeCatalogSearchResponse, ReplaceSceneResponse, RootService, ToolErrorPayload,
-    TxRollbackResponse, TxSessionResponse, VexCheckReport,
+    CancelJobResponse, CookJobSnapshot, GeoExportResponse, GeoImportResponse, GeoInvariantReport,
+    GeoInvariantSpec, GeoProbe, NodeCatalogSearchResponse, ReplaceSceneResponse, RootService,
+    ToolErrorPayload, TxRollbackResponse, TxSessionResponse, VexCheckReport,
 };
 use rmcp::{Json, handler::server::wrapper::Parameters, schemars, tool, tool_router};
 use serde::Deserialize;
@@ -92,6 +92,26 @@ pub struct StartCookJobParams {
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct JobIdParams {
     pub job_id: u64,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct GeoImportParams {
+    /// Path relative to the server's workspace, ending in `.stl`, `.obj`, or `.ofxg`.
+    pub path: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct GeoExportParams {
+    /// Path relative to the server's workspace, ending in `.stl`, `.obj`, or `.ofxg`. Its parent
+    /// directory must already exist.
+    pub path: String,
+    /// The node to cook. Defaults to the scene's final node.
+    pub node_id: Option<u64>,
+    /// Replace an existing file instead of failing.
+    #[serde(default)]
+    pub overwrite: bool,
+    pub frame_numerator: i64,
+    pub frame_denominator: u32,
 }
 
 #[derive(Clone)]
@@ -253,6 +273,38 @@ impl PccMcp {
     ) -> Result<Json<CancelJobResponse>, Json<ToolErrorPayload>> {
         self.engine
             .cancel_cook_job(JobId(params.job_id))
+            .map(Json)
+            .map_err(|error| Json(error.to_tool_error(self.engine.max_cook_memory_bytes())))
+    }
+
+    #[tool(
+        description = "Read a mesh file from the server's workspace into the content-addressed asset store and return its content hash. This does not change the scene: add an `asset` node with that hash using `graph_batch_edit` or `replace_scene`. The scene then no longer depends on the file. Requires the server to be started with --workspace."
+    )]
+    pub fn geo_import(
+        &self,
+        Parameters(params): Parameters<GeoImportParams>,
+    ) -> Result<Json<GeoImportResponse>, Json<ToolErrorPayload>> {
+        self.engine
+            .geo_import(&params.path)
+            .map(Json)
+            .map_err(|error| Json(error.to_tool_error(self.engine.max_cook_memory_bytes())))
+    }
+
+    #[tool(
+        description = "Cook a node, or the scene's final node, and write it to a file in the server's workspace. The extension picks the format: `.obj` (keeps vertex `uv`), `.stl` (triangulated), or `.ofxg` (lossless, all attributes). Fails rather than replacing a file unless `overwrite` is set. Requires the server to be started with --workspace."
+    )]
+    pub fn geo_export(
+        &self,
+        Parameters(params): Parameters<GeoExportParams>,
+    ) -> Result<Json<GeoExportResponse>, Json<ToolErrorPayload>> {
+        self.engine
+            .geo_export(
+                &params.path,
+                params.node_id.map(NodeId),
+                params.overwrite,
+                params.frame_numerator,
+                params.frame_denominator,
+            )
             .map(Json)
             .map_err(|error| Json(error.to_tool_error(self.engine.max_cook_memory_bytes())))
     }

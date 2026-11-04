@@ -22,8 +22,13 @@ struct StdioClient {
 
 impl StdioClient {
     fn spawn() -> Result<Self, String> {
+        Self::spawn_with(&[])
+    }
+
+    fn spawn_with(args: &[&std::ffi::OsStr]) -> Result<Self, String> {
         let bin = env!("CARGO_BIN_EXE_pcc-mcp-stdio");
         let mut child = Command::new(bin)
+            .args(args)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
@@ -1070,6 +1075,58 @@ async fn stdio_transport_initialize_discover_probe_replace_and_conflict() {
     client.shutdown().await;
 }
 
+/// Completes the MCP handshake.
+async fn initialize(client: &mut StdioClient) {
+    assert!(
+        client
+            .send(&json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "initialize",
+                "params": {
+                    "protocolVersion": "2025-11-25",
+                    "capabilities": {},
+                    "clientInfo": { "name": "integration-test", "version": "0.1.0" }
+                }
+            }))
+            .await
+            .is_ok()
+    );
+    assert!(client.recv().await.is_ok());
+    assert!(
+        client
+            .send(&json!({ "jsonrpc": "2.0", "method": "notifications/initialized" }))
+            .await
+            .is_ok()
+    );
+}
+
+/// A closed tetrahedron with edge lengths of about 2 m, as binary STL.
+fn tetrahedron_stl() -> Vec<u8> {
+    let (a, b, c, d) = (
+        [0f32, 0., 0.],
+        [2f32, 0., 0.],
+        [0f32, 2., 0.],
+        [0f32, 0., 2.],
+    );
+    let mut bytes = vec![0u8; 80];
+    bytes.extend_from_slice(&4u32.to_le_bytes());
+    for face in [[a, c, b], [a, b, d], [b, c, d], [a, d, c]] {
+        bytes.extend_from_slice(&[0u8; 12]);
+        for vertex in face {
+            for component in vertex {
+                bytes.extend_from_slice(&component.to_le_bytes());
+            }
+        }
+        bytes.extend_from_slice(&[0u8; 2]);
+    }
+    bytes
+}
+
+fn error_code(result: &Value) -> &str {
+    result["structuredContent"]["code"].as_str().unwrap_or("?")
+}
+
 /// Sends one `tools/call` and returns its `result` object after checking the response id.
 async fn call_tool(client: &mut StdioClient, id: u64, name: &str, arguments: Value) -> Value {
     let sent = client
@@ -1235,5 +1292,176 @@ async fn agent_builds_fractures_and_verifies_a_solid_through_the_sop_operators()
         );
     }
 
+    client.shutdown().await;
+}
+
+#[tokio::test]
+async fn agent_imports_a_mesh_processes_it_and_exports_the_result() {
+    let workspace = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("mcp-exchange");
+    if workspace.exists() {
+        assert!(std::fs::remove_dir_all(&workspace).is_ok());
+    }
+    assert!(std::fs::create_dir_all(workspace.join("out")).is_ok());
+    assert!(std::fs::write(workspace.join("input.stl"), tetrahedron_stl()).is_ok());
+    let client_res = StdioClient::spawn_with(&["--workspace".as_ref(), workspace.as_os_str()]);
+    assert!(client_res.is_ok(), "{client_res:?}");
+    let Ok(mut client) = client_res else {
+        return;
+    };
+    initialize(&mut client).await;
+
+    let import = call_tool(&mut client, 2, "geo_import", json!({ "path": "input.stl" })).await;
+    assert_eq!(import["isError"], false, "{import}");
+    assert_eq!(import["structuredContent"]["prim_count"], 4);
+    assert_eq!(import["structuredContent"]["point_count"], 4);
+    let hash = import["structuredContent"]["content_hash"]
+        .as_str()
+        .unwrap_or("")
+        .to_owned();
+    assert_eq!(hash.len(), 64);
+
+    // Deleting the source proves that the scene depends only on the stored content.
+    assert!(std::fs::remove_file(workspace.join("input.stl")).is_ok());
+
+    let node_id = pcc_id::NodeId;
+    let scene = GraphSnapshot {
+        revision: RevisionId(1),
+        nodes: vec![
+            pcc_graph::Node::GeoAsset {
+                id: node_id(1),
+                content_hash: hash.clone(),
+            },
+            pcc_graph::Node::Remesh {
+                id: node_id(2),
+                input: node_id(1),
+                target_length: 0.25,
+                iterations: 2,
+                feature_angle_degrees: 30.0,
+            },
+            pcc_graph::Node::UvFlatten {
+                id: node_id(3),
+                input: node_id(2),
+                seam_angle_degrees: 60.0,
+            },
+        ],
+    };
+    let replaced = call_tool(
+        &mut client,
+        3,
+        "replace_scene",
+        json!({ "base_revision": 1, "ofxs": scene.to_ofxs() }),
+    )
+    .await;
+    assert_eq!(replaced["isError"], false, "{replaced}");
+
+    // The final node as OBJ with UVs, and the untouched asset node as lossless OFXG.
+    let exported = call_tool(
+        &mut client,
+        4,
+        "geo_export",
+        json!({ "path": "out/result.obj", "frame_numerator": 0, "frame_denominator": 24 }),
+    )
+    .await;
+    assert_eq!(exported["isError"], false, "{exported}");
+    assert_eq!(exported["structuredContent"]["format"], "obj");
+    assert_eq!(exported["structuredContent"]["revision"], 2);
+    let text = std::fs::read_to_string(workspace.join("out/result.obj")).unwrap_or_default();
+    let parsed = pcc_io::from_obj(&text);
+    assert!(parsed.is_ok(), "{parsed:?}");
+    if let Ok(parsed) = parsed {
+        assert!(parsed.prim_count() > 100, "{}", parsed.prim_count());
+        assert!(parsed.topology_index().is_closed_manifold());
+        // A tetrahedron with 2 m legs has a volume of 8/6.
+        assert!((parsed.enclosed_volume() - 8.0 / 6.0).abs() < 0.01);
+        assert!(text.contains("\nvt "), "UVs must reach the file");
+    }
+    let source = call_tool(
+        &mut client,
+        5,
+        "geo_export",
+        json!({
+            "path": "out/source.ofxg",
+            "node_id": 1,
+            "frame_numerator": 0,
+            "frame_denominator": 24
+        }),
+    )
+    .await;
+    assert_eq!(source["structuredContent"]["content_hash"], hash.as_str());
+
+    // Files are not replaced by accident, and agents cannot leave the workspace.
+    let repeat = json!({ "path": "out/result.obj", "frame_numerator": 0, "frame_denominator": 24 });
+    let again = call_tool(&mut client, 6, "geo_export", repeat).await;
+    assert_eq!(again["isError"], true);
+    assert_eq!(error_code(&again), "file_already_exists", "{again}");
+    let escape = call_tool(
+        &mut client,
+        7,
+        "geo_import",
+        json!({ "path": "../input.stl" }),
+    )
+    .await;
+    assert_eq!(error_code(&escape), "path_rejected", "{escape}");
+    let escape = call_tool(
+        &mut client,
+        8,
+        "geo_export",
+        json!({ "path": "../planted.obj", "frame_numerator": 0, "frame_denominator": 24 }),
+    )
+    .await;
+    assert_eq!(error_code(&escape), "path_rejected", "{escape}");
+    assert!(!workspace.join("../planted.obj").exists());
+
+    // A scene naming content that was never imported fails with its own error.
+    let unknown = GraphSnapshot {
+        revision: RevisionId(2),
+        nodes: vec![
+            pcc_graph::Node::GeoAsset {
+                id: node_id(1),
+                content_hash: "a".repeat(64),
+            },
+            pcc_graph::Node::Reverse {
+                id: node_id(2),
+                input: node_id(1),
+            },
+        ],
+    };
+    let _ = call_tool(
+        &mut client,
+        9,
+        "replace_scene",
+        json!({ "base_revision": 2, "ofxs": unknown.to_ofxs() }),
+    )
+    .await;
+    let missing = call_tool(
+        &mut client,
+        10,
+        "geo_probe",
+        json!({ "frame_numerator": 0, "frame_denominator": 24 }),
+    )
+    .await;
+    assert_eq!(error_code(&missing), "asset_not_found", "{missing}");
+    client.shutdown().await;
+}
+
+#[tokio::test]
+async fn file_tools_are_refused_unless_the_host_names_a_workspace() {
+    let client_res = StdioClient::spawn();
+    assert!(client_res.is_ok(), "{client_res:?}");
+    let Ok(mut client) = client_res else {
+        return;
+    };
+    initialize(&mut client).await;
+    let import = call_tool(&mut client, 2, "geo_import", json!({ "path": "a.stl" })).await;
+    assert_eq!(import["isError"], true);
+    assert_eq!(error_code(&import), "file_access_disabled", "{import}");
+    let export = call_tool(
+        &mut client,
+        3,
+        "geo_export",
+        json!({ "path": "a.obj", "frame_numerator": 0, "frame_denominator": 24 }),
+    )
+    .await;
+    assert_eq!(error_code(&export), "file_access_disabled", "{export}");
     client.shutdown().await;
 }

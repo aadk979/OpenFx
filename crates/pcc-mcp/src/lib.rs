@@ -1,7 +1,11 @@
 //! Protocol-neutral MCP-shaped request/response values; transport follows after the core is proven.
 use pcc_cmd::{CommandError, EngineCommand, execute};
+mod exchange;
+
+pub use exchange::{AssetStore, FileError, MeshFormat, Workspace};
+
 use pcc_eval::{
-    CookBudget, CookCache, EvalContext, EvalError, cook_cached, cook_node_cached,
+    AssetError, CookBudget, CookCache, EvalContext, EvalError, cook_cached, cook_node_cached,
     cook_with_progress,
 };
 use pcc_geo::{GeoDetail, GeoError};
@@ -46,6 +50,25 @@ pub struct GeoProbe {
     pub point_attributes: Vec<String>,
     pub hash: String,
     pub bounds: Option<(Vec3, Vec3)>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct GeoImportResponse {
+    /// Pass this to an `asset` node to use the geometry in a scene.
+    pub content_hash: String,
+    pub point_count: usize,
+    pub prim_count: usize,
+    pub vertex_count: usize,
+    pub bounds: Option<(Vec3, Vec3)>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct GeoExportResponse {
+    /// The scene revision that was cooked.
+    pub revision: RevisionId,
+    pub format: String,
+    pub bytes: usize,
+    pub content_hash: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -168,6 +191,14 @@ pub enum ToolErrorCode {
     NodeNotFound,
     TransactionNotFound,
     VexCompileOrRuntimeError,
+    FileAccessDisabled,
+    PathRejected,
+    FileNotFound,
+    FileAlreadyExists,
+    UnsupportedFileFormat,
+    MeshParseFailed,
+    AssetNotFound,
+    AssetCorrupt,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -246,9 +277,11 @@ pub struct RootService {
     jobs: Mutex<BTreeMap<JobId, Arc<JobRecord>>>,
     next_tx_id: AtomicU64,
     sandboxes: Mutex<BTreeMap<TransactionId, SandboxRecord>>,
+    assets: AssetStore,
 }
 #[derive(Debug)]
 pub enum McpError {
+    File(FileError),
     Command(CommandError),
     Store(StoreError),
     Cook(EvalError),
@@ -263,7 +296,35 @@ pub enum McpError {
 impl McpError {
     #[must_use]
     pub fn to_tool_error(&self, max_memory_bytes: usize) -> ToolErrorPayload {
+        let plain = |code: ToolErrorCode, message: String| ToolErrorPayload {
+            code,
+            message,
+            expected_revision: None,
+            actual_revision: None,
+            requested_elements: None,
+            max_elements: None,
+            max_memory_bytes: None,
+            job_id: None,
+        };
         match self {
+            Self::File(error) => {
+                let message = error.message();
+                match error {
+                    FileError::Disabled => plain(ToolErrorCode::FileAccessDisabled, message),
+                    FileError::PathRejected(_) => plain(ToolErrorCode::PathRejected, message),
+                    FileError::NotFound => plain(ToolErrorCode::FileNotFound, message),
+                    FileError::AlreadyExists => plain(ToolErrorCode::FileAlreadyExists, message),
+                    FileError::UnsupportedFormat => {
+                        plain(ToolErrorCode::UnsupportedFileFormat, message)
+                    }
+                    FileError::Parse(_) => plain(ToolErrorCode::MeshParseFailed, message),
+                    FileError::TooLarge => ToolErrorPayload {
+                        max_memory_bytes: Some(max_memory_bytes),
+                        ..plain(ToolErrorCode::MemoryLimitExceeded, message)
+                    },
+                    FileError::Io(_) => plain(ToolErrorCode::IoFailure, message),
+                }
+            }
             Self::Command(CommandError::Conflict { expected, actual })
             | Self::Store(StoreError::Conflict { expected, actual }) => ToolErrorPayload {
                 code: ToolErrorCode::RevisionConflict,
@@ -336,6 +397,15 @@ impl McpError {
                 job_id: None,
             },
             Self::Cook(eval_err) => match eval_err {
+                EvalError::Asset(AssetError::NotFound) => plain(
+                    ToolErrorCode::AssetNotFound,
+                    "the scene refers to an asset that was never imported into this workspace"
+                        .to_owned(),
+                ),
+                EvalError::Asset(AssetError::Corrupt) => plain(
+                    ToolErrorCode::AssetCorrupt,
+                    "a stored asset does not match its content hash".to_owned(),
+                ),
                 EvalError::Cancelled | EvalError::Resource(GeoError::Cancelled) => {
                     ToolErrorPayload {
                         code: ToolErrorCode::CookCancelled,
@@ -521,7 +591,79 @@ impl RootService {
             jobs: Mutex::new(BTreeMap::new()),
             next_tx_id: AtomicU64::new(1),
             sandboxes: Mutex::new(BTreeMap::new()),
+            assets: AssetStore::new(None, max_cook_memory_bytes),
         }
+    }
+
+    /// Enables `geo_import` and `geo_export`, confined to this existing directory. File access is
+    /// otherwise off, because paths come from agents.
+    pub fn with_workspace(mut self, root: &Path) -> Result<Self, McpError> {
+        let workspace = Workspace::open(root).map_err(McpError::File)?;
+        self.assets = AssetStore::new(Some(workspace), self.max_cook_memory_bytes);
+        Ok(self)
+    }
+
+    /// Reads a mesh from the workspace into the content-addressed asset store. This does not change
+    /// the scene: add an `asset` node with the returned hash through the usual edit commands.
+    pub fn geo_import(&self, path: &str) -> Result<GeoImportResponse, McpError> {
+        let (content_hash, geo) = self.assets.import(path).map_err(McpError::File)?;
+        Ok(GeoImportResponse {
+            content_hash,
+            point_count: geo.len(),
+            prim_count: geo.prim_count(),
+            vertex_count: geo.vertex_count(),
+            bounds: geo.bounds(),
+        })
+    }
+
+    /// Cooks a node, or the scene's final node when none is named, and writes it to the workspace.
+    /// The format follows the path's extension: `.obj`, `.stl`, or `.ofxg`.
+    pub fn geo_export(
+        &self,
+        path: &str,
+        node_id: Option<NodeId>,
+        overwrite: bool,
+        frame_numerator: i64,
+        frame_denominator: u32,
+    ) -> Result<GeoExportResponse, McpError> {
+        if frame_denominator == 0 {
+            return Err(McpError::InvalidFrameDenominator);
+        }
+        let snapshot = self.store.snapshot().map_err(McpError::Store)?;
+        let cancelled = AtomicBool::new(false);
+        let context = EvalContext {
+            assets: &self.assets,
+            cancelled: &cancelled,
+            budget: self.default_budget(),
+        };
+        let geo = match node_id {
+            Some(id) => cook_node_cached(
+                &self.cache,
+                &snapshot,
+                id,
+                frame_numerator,
+                frame_denominator,
+                &context,
+            ),
+            None => cook_cached(
+                &self.cache,
+                &snapshot,
+                frame_numerator,
+                frame_denominator,
+                &context,
+            ),
+        }
+        .map_err(McpError::Cook)?;
+        let (format, bytes) = self
+            .assets
+            .export(&geo, path, overwrite)
+            .map_err(McpError::File)?;
+        Ok(GeoExportResponse {
+            revision: snapshot.revision,
+            format: format.as_str().to_owned(),
+            bytes,
+            content_hash: geo.hash().to_hex().to_string(),
+        })
     }
     #[must_use]
     pub const fn max_cook_memory_bytes(&self) -> usize {
@@ -634,6 +776,7 @@ impl RootService {
         let snapshot = self.store.snapshot().map_err(McpError::Store)?;
         let cancelled = AtomicBool::new(false);
         let context = EvalContext {
+            assets: &self.assets,
             cancelled: &cancelled,
             budget: self.default_budget(),
         };
@@ -660,6 +803,7 @@ impl RootService {
         let snapshot = self.store.snapshot().map_err(McpError::Store)?;
         let cancelled = AtomicBool::new(false);
         let context = EvalContext {
+            assets: &self.assets,
             cancelled: &cancelled,
             budget: self.default_budget(),
         };
@@ -746,6 +890,7 @@ impl RootService {
         };
         let cancelled = AtomicBool::new(false);
         let context = EvalContext {
+            assets: &self.assets,
             cancelled: &cancelled,
             budget: self.default_budget(),
         };
@@ -819,6 +964,7 @@ impl RootService {
         let snapshot = self.store.snapshot().map_err(McpError::Store)?;
         let cancelled = AtomicBool::new(false);
         let context = EvalContext {
+            assets: &self.assets,
             cancelled: &cancelled,
             budget: self.default_budget(),
         };
@@ -1056,6 +1202,7 @@ impl RootService {
             record.frame_denominator,
         );
         let ctx = EvalContext {
+            assets: &self.assets,
             cancelled: &record.cancelled,
             budget: record.effective_budget,
         };

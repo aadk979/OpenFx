@@ -10,6 +10,8 @@ pcc-math = { path = "../pcc-math" }
 pcc-cmd = { path = "../pcc-cmd" }
 pcc-eval = { path = "../pcc-eval" }
 pcc-graph = { path = "../pcc-graph" }
+pcc-io = { path = "../pcc-io" }
+pcc-sop = { path = "../pcc-sop" }
 pcc-store = { path = "../pcc-store" }
 pcc-vex = { path = "../pcc-vex" }
 schemars.workspace = true

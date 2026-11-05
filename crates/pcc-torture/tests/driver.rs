@@ -127,10 +127,15 @@ fn unknown_operators_and_bad_arguments_do_not_pass_silently() -> Result<(), std:
 }
 
 /// One deliberately failing operator, with how the supervisor must classify it.
-fn assert_fault(operator: &str, expected: &str, run_fails: bool) -> Result<(), std::io::Error> {
+fn assert_fault(
+    operator: &str,
+    (timeout, grace): (&str, &str),
+    expected: &str,
+    run_fails: bool,
+) -> Result<(), std::io::Error> {
     let name = operator.replace(':', "_");
     let fixture = Fixture::new(&name, &["1,x,0,4,CC,clean"])?;
-    let (success, records) = fixture.run_timed(operator, "1", "1")?;
+    let (success, records) = fixture.run_timed(operator, timeout, grace)?;
     assert_eq!(records.len(), 1, "{operator}");
     assert_eq!(records[0]["status"], expected, "{operator}: {}", records[0]);
     assert_eq!(success, !run_fails, "{operator}: wrong exit status");
@@ -139,10 +144,14 @@ fn assert_fault(operator: &str, expected: &str, run_fails: bool) -> Result<(), s
 
 #[test]
 fn the_supervisor_detects_panics_crashes_and_hangs() -> Result<(), std::io::Error> {
-    assert_fault("fault:panic", "panic", true)?;
-    assert_fault("fault:abort", "crash", true)?;
-    // Ignores cancellation, so it can only end by being killed after the grace period.
-    assert_fault("fault:hang", "hang", true)?;
-    // Honours cancellation at the soft limit: a limit reached, not a defect.
-    assert_fault("fault:slow", "timed_out", false)
+    // These two end by themselves, so the limits must not be able to fire first. An aborting
+    // process can take seconds to die on Windows, and a tight limit would call that a hang.
+    assert_fault("fault:panic", ("30", "10"), "panic", true)?;
+    assert_fault("fault:abort", ("30", "10"), "crash", true)?;
+    // Ignores cancellation, so it can only end by being killed after the grace period. This is
+    // the one case that waits out the limits, so it is the one case that keeps them short.
+    assert_fault("fault:hang", ("1", "1"), "hang", true)?;
+    // Honours cancellation at the soft limit: a limit reached, not a defect. The long grace
+    // leaves a slow machine room to respond before it would count as a hang.
+    assert_fault("fault:slow", ("1", "30"), "timed_out", false)
 }

@@ -1064,6 +1064,13 @@ l "
         refused(&grid_bytes(0.5, 2.0, &[(origin, -1.0), (origin, -1.0)]));
         // Coordinates at the edge are accepted, and just beyond it would overflow a voxel index.
         let edge = MAX_BRICK_COORDINATE;
+        // The arithmetic behind that limit: its voxels still fit in a voxel index.
+        assert_eq!(edge, 268_435_454);
+        assert!(i64::from(edge + 1) * (BRICK_DIM as i64) - 1 <= i64::from(i32::MAX));
+        assert_eq!(
+            read_grid(&grid_bytes(0.5, 2.0, &[((edge, 0, 0), -1.0)]))?.get(edge * 8, 0, 0),
+            -1.0
+        );
         assert!(read_grid(&grid_bytes(0.5, 2.0, &[((edge, 0, 0), -1.0)])).is_ok());
         refused(&grid_bytes(0.5, 2.0, &[((edge + 1, 0, 0), -1.0)]));
         refused(&grid_bytes(0.5, 2.0, &[((0, -edge - 1, 0), -1.0)]));

@@ -1130,4 +1130,13 @@ mod tests {
         assert!(phi_at(0.0, -1.0, -1.0) > 0.0, "below the base is outside");
         Ok(())
     }
+
+    #[test]
+    fn a_voxel_exactly_on_the_surface_is_not_inside_it() -> Result<(), GeoError> {
+        let flag = AtomicBool::new(false);
+        let grid = VdbGrid::new(1.0, 3.0)?.with_voxel(0, 0, 0, 0.0)?;
+        let surface = grid.to_polygons_cancellable(1 << 20, &flag)?;
+        assert_eq!(surface.prim_count(), 0);
+        Ok(())
+    }
 }

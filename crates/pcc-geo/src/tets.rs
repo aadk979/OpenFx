@@ -305,6 +305,19 @@ mod tests {
             vec![0, 1, 2, 0, 1, 2, 3],
         )?;
         assert!((mixed.tet_volume()? - 3.0).abs() < 1e-12);
+        // More than one primitive in the skipped run, so that its length needs a real product.
+        let two_before = single()?.with_primitives(
+            vec![
+                PrimRun {
+                    kind: PrimKind::Polygon,
+                    arity: 3,
+                    prim_count: 2,
+                },
+                tets(1)[0],
+            ],
+            vec![0, 1, 2, 0, 1, 3, 0, 1, 2, 3],
+        )?;
+        assert!((two_before.tet_volume()? - 3.0).abs() < 1e-12);
         Ok(())
     }
 
@@ -455,6 +468,12 @@ mod tests {
         // A swap of two corners, not a reversal of all four, which would be an even permutation.
         let order: Vec<_> = (0..4).map(|at| fixed.vertex_point(at)).collect();
         assert_eq!(order, [0, 2, 1, 3].map(Some).to_vec());
+        // Every element swaps its own corners, not only the first.
+        let two = mirrored.with_primitives(tets(2), vec![0, 1, 2, 3, 3, 2, 1, 0])?;
+        let order: Vec<_> = (0..8)
+            .map(|at| two.with_reversed_winding().map(|geo| geo.vertex_point(at)))
+            .collect::<Result<_, _>>()?;
+        assert_eq!(order, [0, 2, 1, 3, 3, 1, 2, 0].map(Some).to_vec());
         Ok(())
     }
 

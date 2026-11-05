@@ -581,8 +581,90 @@ mod tests {
             .unpacked_cancellable(1 << 20, &std::sync::atomic::AtomicBool::new(false))?;
         assert_eq!(flat.packed_count(), 0);
         assert_eq!(flat.volume_count(), 1);
-        // Winding means nothing to a volume, so reversal leaves it alone.
-        assert_eq!(geo.with_reversed_winding()?.volume_count(), 1);
+        // Winding means nothing to a volume or a polyline, so reversal leaves them exactly alone.
+        assert_eq!(geo.with_reversed_winding()?.hash(), geo.hash());
+        let line = GeoDetail::points(vec![Vec3::ZERO, v(1.0, 0.0, 0.0), v(0.0, 1.0, 0.0)])
+            .with_primitives(
+                vec![PrimRun {
+                    kind: PrimKind::Polyline,
+                    arity: 3,
+                    prim_count: 1,
+                }],
+                vec![0, 1, 2],
+            )?;
+        assert_eq!(line.with_reversed_winding()?.hash(), line.hash());
+        Ok(())
+    }
+
+    #[test]
+    fn a_grid_reports_what_it_was_given_and_shares_what_it_did_not_change() -> Result<(), GeoError>
+    {
+        let g0 = VdbGrid::new(0.5, 2.0)?
+            .with_voxel(1, 1, 1, -0.5)?
+            .with_voxel(10, 1, 1, -0.25)?;
+        assert_eq!((g0.voxel_size(), g0.background()), (0.5, 2.0));
+        assert_eq!(g0.active_brick_count(), 2);
+        assert_eq!(g0.bricks().len(), 2);
+        // Voxels come back exactly, an untouched voxel reads as background, and so does an
+        // unallocated brick.
+        assert_eq!(g0.get(1, 1, 1), -0.5);
+        assert_eq!(g0.get(10, 1, 1), -0.25);
+        assert_eq!(g0.get(2, 1, 1), 2.0);
+        assert_eq!(g0.get(100, 100, 100), 2.0);
+        let brick = g0
+            .bricks()
+            .get(&(0, 0, 0))
+            .ok_or(GeoError::IndexOutOfBounds)?;
+        assert_eq!(brick.values().len(), BRICK_LEN);
+        assert_eq!(brick.values()[local_index(1, 1, 1)].get(), -0.5);
+        // Changing one voxel copies only its own brick.
+        let g1 = g0.with_voxel(2, 2, 2, -0.75)?;
+        assert!(!g1.brick_shared_with(&g0, (0, 0, 0)));
+        assert!(g1.brick_shared_with(&g0, (1, 0, 0)));
+        assert!(!g1.brick_shared_with(&g0, (5, 5, 5)));
+        assert_ne!(g1.hash(), g0.hash());
+        Ok(())
+    }
+
+    #[test]
+    fn a_voxel_center_is_half_a_voxel_past_its_index() -> Result<(), GeoError> {
+        let grid = VdbGrid::new(2.0, 4.0)?;
+        // Different on every axis, so that no axis can borrow from another.
+        assert_eq!(grid.voxel_center(1, 2, 3), v(3.0, 5.0, 7.0));
+        assert_eq!(grid.voxel_center(-1, 0, 4), v(-1.0, 1.0, 9.0));
+        Ok(())
+    }
+
+    #[test]
+    fn assembling_a_grid_applies_the_same_rules_as_creating_one() -> Result<(), GeoError> {
+        let finite = |value: f32| FiniteF32::checked(value);
+        let make = |size: f32, background: f32| -> Result<VdbGrid, GeoError> {
+            VdbGrid::from_parts(finite(size)?, finite(background)?, BTreeMap::new())
+        };
+        assert!(make(0.5, 2.0).is_ok());
+        for (size, background) in [(0.0, 2.0), (-1.0, 2.0), (0.5, 0.0), (0.5, -1.0), (0.0, 0.0)] {
+            assert_eq!(
+                make(size, background).err(),
+                Some(GeoError::InvalidTopology),
+                "{size} {background}"
+            );
+        }
+        // With bricks: the same grid however it was built, and with_bricks keeps the settings.
+        let built = VdbGrid::new(0.5, 2.0)?.with_voxel(1, 1, 1, -0.5)?;
+        let parts = make(0.5, 2.0)?.with_bricks(built.bricks().clone());
+        assert_eq!(parts.hash(), built.hash());
+        assert_eq!((parts.voxel_size(), parts.background()), (0.5, 2.0));
+        Ok(())
+    }
+
+    #[test]
+    fn no_volumes_means_no_table_and_so_the_same_hash_as_nothing() -> Result<(), GeoError> {
+        let nothing = GeoDetail::points(Vec::new());
+        assert_eq!(GeoDetail::from_volumes(Vec::new())?.hash(), nothing.hash());
+        assert_eq!(
+            nothing.with_volume_grids(Vec::new())?.hash(),
+            nothing.hash()
+        );
         Ok(())
     }
 }

@@ -750,4 +750,17 @@ mod tests {
         assert_eq!(store.import("a.ofxg")?.1.hash(), volume.hash());
         Ok(())
     }
+
+    #[test]
+    fn refusals_tell_the_agent_what_to_do_instead() {
+        for (error, remedy) in [
+            (FileError::PackedNeedsUnpack, "unpack"),
+            (FileError::TetsNeedSurface, "tet_surface"),
+            (FileError::VolumesNeedConversion, "convert_vdb"),
+        ] {
+            let message = error.message();
+            assert!(message.contains(remedy), "{message}");
+            assert!(message.contains(".ofxg"), "{message}");
+        }
+    }
 }

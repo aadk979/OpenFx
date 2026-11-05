@@ -1,5 +1,5 @@
 //! Integration tests launching `pcc-mcp-stdio` over actual child-process stdio pipes.
-use pcc_graph::GraphSnapshot;
+use pcc_graph::{GraphSnapshot, Node};
 use pcc_id::{JobId, RevisionId};
 use pcc_math::Vec3;
 use pcc_mcp::{
@@ -22,8 +22,13 @@ struct StdioClient {
 
 impl StdioClient {
     fn spawn() -> Result<Self, String> {
+        Self::spawn_with(&[])
+    }
+
+    fn spawn_with(args: &[&std::ffi::OsStr]) -> Result<Self, String> {
         let bin = env!("CARGO_BIN_EXE_pcc-mcp-stdio");
         let mut child = Command::new(bin)
+            .args(args)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
@@ -204,6 +209,8 @@ async fn stdio_transport_initialize_discover_probe_replace_and_conflict() {
                     .to_hex()
                     .to_string(),
                 bounds: None,
+                packed_count: 0,
+                packed_prototype_count: 0,
             })
         );
     }
@@ -449,7 +456,10 @@ async fn stdio_transport_initialize_discover_probe_replace_and_conflict() {
         let search_out = serde_json::from_value::<NodeCatalogSearchResponse>(
             resp["result"]["structuredContent"].clone(),
         );
-        assert_eq!(search_out.map(|s| s.node_types.len()).ok(), Some(1));
+        let names: Option<Vec<String>> = search_out
+            .ok()
+            .map(|found| found.node_types.into_iter().map(|t| t.type_name).collect());
+        assert_eq!(names, Some(vec!["foreach".to_owned(), "merge".to_owned()]));
     }
 
     assert!(
@@ -491,7 +501,7 @@ async fn stdio_transport_initialize_discover_probe_replace_and_conflict() {
                     "arguments": {
                         "base_revision": 2,
                         "edits": [
-                            { "edit": "set_create_count", "id": 1, "count": 8 }
+                            { "edit": "set_param", "id": 1, "name": "count", "value": 8 }
                         ]
                     }
                 }
@@ -635,7 +645,7 @@ async fn stdio_transport_initialize_discover_probe_replace_and_conflict() {
                     "arguments": {
                         "tx_id": 1,
                         "edits": [
-                            { "edit": "set_create_count", "id": 1, "count": 12 }
+                            { "edit": "set_param", "id": 1, "name": "count", "value": 12 }
                         ]
                     }
                 }
@@ -765,25 +775,16 @@ async fn stdio_transport_initialize_discover_probe_replace_and_conflict() {
     let modeling_scene = GraphSnapshot {
         revision: RevisionId(6),
         nodes: vec![
-            pcc_graph::Node::CreateBox {
-                id: pcc_id::NodeId(1),
-                size: Vec3::checked(2.0, 2.0, 2.0).unwrap_or(Vec3::ZERO),
-            },
-            pcc_graph::Node::Subdivide {
-                id: pcc_id::NodeId(2),
-                input: pcc_id::NodeId(1),
-                iterations: 1,
-            },
-            pcc_graph::Node::PolyExtrude {
-                id: pcc_id::NodeId(3),
-                input: pcc_id::NodeId(2),
-                distance: 0.25,
-                inset: 0.05,
-            },
-            pcc_graph::Node::Normal {
-                id: pcc_id::NodeId(4),
-                input: pcc_id::NodeId(3),
-            },
+            Node::new("box", pcc_id::NodeId(1))
+                .with_vec3("size", Vec3::checked(2.0, 2.0, 2.0).unwrap_or(Vec3::ZERO)),
+            Node::new("subdivide", pcc_id::NodeId(2))
+                .with_input(pcc_id::NodeId(1))
+                .with_u32("iterations", 1),
+            Node::new("extrude", pcc_id::NodeId(3))
+                .with_input(pcc_id::NodeId(2))
+                .with_f32("distance", 0.25)
+                .with_f32("inset", 0.05),
+            Node::new("normal", pcc_id::NodeId(4)).with_input(pcc_id::NodeId(3)),
         ],
     };
     assert!(
@@ -854,38 +855,27 @@ async fn stdio_transport_initialize_discover_probe_replace_and_conflict() {
     let terrain_scene = GraphSnapshot {
         revision: RevisionId(7),
         nodes: vec![
-            pcc_graph::Node::HeightField {
-                id: pcc_id::NodeId(1),
-                rows: 10,
-                cols: 10,
-                size_x: 20.0,
-                size_z: 20.0,
-            },
-            pcc_graph::Node::HeightFieldNoise {
-                id: pcc_id::NodeId(2),
-                input: pcc_id::NodeId(1),
-                amplitude: 5.0,
-                frequency: 0.12,
-                octaves: 3,
-                seed: 42,
-            },
-            pcc_graph::Node::HeightFieldErode {
-                id: pcc_id::NodeId(3),
-                input: pcc_id::NodeId(2),
-                iterations: 8,
-                rain_rate: 0.05,
-                talus_angle: 35.0,
-                seed: 7,
-            },
-            pcc_graph::Node::UvProject {
-                id: pcc_id::NodeId(4),
-                input: pcc_id::NodeId(3),
-                mode: pcc_graph::UvProjectMode::PlanarY,
-            },
-            pcc_graph::Node::Normal {
-                id: pcc_id::NodeId(5),
-                input: pcc_id::NodeId(4),
-            },
+            Node::new("heightfield", pcc_id::NodeId(1))
+                .with_u32("rows", 10)
+                .with_u32("cols", 10)
+                .with_f32("size_x", 20.0)
+                .with_f32("size_z", 20.0),
+            Node::new("hf_noise", pcc_id::NodeId(2))
+                .with_input(pcc_id::NodeId(1))
+                .with_f32("amplitude", 5.0)
+                .with_f32("frequency", 0.12)
+                .with_u32("octaves", 3)
+                .with_u64("seed", 42),
+            Node::new("hf_erode", pcc_id::NodeId(3))
+                .with_input(pcc_id::NodeId(2))
+                .with_u32("iterations", 8)
+                .with_f32("rain_rate", 0.05)
+                .with_f32("talus_angle", 35.0)
+                .with_u64("seed", 7),
+            Node::new("uvproject", pcc_id::NodeId(4))
+                .with_input(pcc_id::NodeId(3))
+                .with_text("mode", pcc_graph::UvProjectMode::PlanarY.as_str()),
+            Node::new("normal", pcc_id::NodeId(5)).with_input(pcc_id::NodeId(4)),
         ],
     };
     assert!(
@@ -965,41 +955,25 @@ async fn stdio_transport_initialize_discover_probe_replace_and_conflict() {
     let vdb_boolean_scene = GraphSnapshot {
         revision: RevisionId(8),
         nodes: vec![
-            pcc_graph::Node::CreateBox {
-                id: pcc_id::NodeId(1),
-                size: Vec3::checked(2.0, 2.0, 2.0).unwrap_or(Vec3::ZERO),
-            },
-            pcc_graph::Node::Transform {
-                id: pcc_id::NodeId(2),
-                input: pcc_id::NodeId(1),
-                offset: Vec3::checked(1.0, 0.0, 0.0).unwrap_or(Vec3::ZERO),
-            },
-            pcc_graph::Node::Boolean {
-                id: pcc_id::NodeId(3),
-                left: pcc_id::NodeId(1),
-                right: pcc_id::NodeId(2),
-                mode: pcc_graph::BooleanMode::Union,
-                voxel_size: 0.5,
-            },
-            pcc_graph::Node::VdbFromPolygons {
-                id: pcc_id::NodeId(4),
-                input: pcc_id::NodeId(3),
-                voxel_size: 0.5,
-            },
-            pcc_graph::Node::VdbReshape {
-                id: pcc_id::NodeId(5),
-                input: pcc_id::NodeId(4),
-                offset: 0.1,
-                smooth_iterations: 1,
-            },
-            pcc_graph::Node::ConvertVdb {
-                id: pcc_id::NodeId(6),
-                input: pcc_id::NodeId(5),
-            },
-            pcc_graph::Node::Normal {
-                id: pcc_id::NodeId(7),
-                input: pcc_id::NodeId(6),
-            },
+            Node::new("box", pcc_id::NodeId(1))
+                .with_vec3("size", Vec3::checked(2.0, 2.0, 2.0).unwrap_or(Vec3::ZERO)),
+            Node::new("transform", pcc_id::NodeId(2))
+                .with_input(pcc_id::NodeId(1))
+                .with_vec3("offset", Vec3::checked(1.0, 0.0, 0.0).unwrap_or(Vec3::ZERO)),
+            Node::new("boolean", pcc_id::NodeId(3))
+                .with_input(pcc_id::NodeId(1))
+                .with_input(pcc_id::NodeId(2))
+                .with_text("mode", pcc_graph::BooleanMode::Union.as_str())
+                .with_f32("voxel_size", 0.5),
+            Node::new("vdb_from_polygons", pcc_id::NodeId(4))
+                .with_input(pcc_id::NodeId(3))
+                .with_f32("voxel_size", 0.5),
+            Node::new("vdb_reshape", pcc_id::NodeId(5))
+                .with_input(pcc_id::NodeId(4))
+                .with_f32("offset", 0.1)
+                .with_u32("smooth_iterations", 1),
+            Node::new("convert_vdb", pcc_id::NodeId(6)).with_input(pcc_id::NodeId(5)),
+            Node::new("normal", pcc_id::NodeId(7)).with_input(pcc_id::NodeId(6)),
         ],
     };
     assert!(
@@ -1068,6 +1042,58 @@ async fn stdio_transport_initialize_discover_probe_replace_and_conflict() {
     }
 
     client.shutdown().await;
+}
+
+/// Completes the MCP handshake.
+async fn initialize(client: &mut StdioClient) {
+    assert!(
+        client
+            .send(&json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "initialize",
+                "params": {
+                    "protocolVersion": "2025-11-25",
+                    "capabilities": {},
+                    "clientInfo": { "name": "integration-test", "version": "0.1.0" }
+                }
+            }))
+            .await
+            .is_ok()
+    );
+    assert!(client.recv().await.is_ok());
+    assert!(
+        client
+            .send(&json!({ "jsonrpc": "2.0", "method": "notifications/initialized" }))
+            .await
+            .is_ok()
+    );
+}
+
+/// A closed tetrahedron with edge lengths of about 2 m, as binary STL.
+fn tetrahedron_stl() -> Vec<u8> {
+    let (a, b, c, d) = (
+        [0f32, 0., 0.],
+        [2f32, 0., 0.],
+        [0f32, 2., 0.],
+        [0f32, 0., 2.],
+    );
+    let mut bytes = vec![0u8; 80];
+    bytes.extend_from_slice(&4u32.to_le_bytes());
+    for face in [[a, c, b], [a, b, d], [b, c, d], [a, d, c]] {
+        bytes.extend_from_slice(&[0u8; 12]);
+        for vertex in face {
+            for component in vertex {
+                bytes.extend_from_slice(&component.to_le_bytes());
+            }
+        }
+        bytes.extend_from_slice(&[0u8; 2]);
+    }
+    bytes
+}
+
+fn error_code(result: &Value) -> &str {
+    result["structuredContent"]["code"].as_str().unwrap_or("?")
 }
 
 /// Sends one `tools/call` and returns its `result` object after checking the response id.
@@ -1154,43 +1180,31 @@ async fn agent_builds_fractures_and_verifies_a_solid_through_the_sop_operators()
     let scene = GraphSnapshot {
         revision: RevisionId(1),
         nodes: vec![
-            pcc_graph::Node::CreateSphere {
-                id: node_id(1),
-                radius: 1.0,
-                rows: 16,
-                cols: 24,
-            },
-            pcc_graph::Node::Remesh {
-                id: node_id(2),
-                input: node_id(1),
-                target_length: 0.25,
-                iterations: 3,
-                feature_angle_degrees: 90.0,
-            },
-            pcc_graph::Node::PolyReduce {
-                id: node_id(3),
-                input: node_id(2),
-                target_ratio: 0.5,
-            },
-            pcc_graph::Node::ScatterSurface {
-                id: node_id(4),
-                input: node_id(1),
-                count: 8,
-                seed: 21,
-                min_distance: 0.4,
-            },
-            pcc_graph::Node::Xform {
-                id: node_id(5),
-                input: node_id(4),
-                translate: Vec3::ZERO,
-                rotate_degrees: Vec3::ZERO,
-                scale: unit(0.6),
-            },
-            pcc_graph::Node::VoronoiFracture {
-                id: node_id(6),
-                input: node_id(3),
-                seeds: node_id(5),
-            },
+            Node::new("sphere", node_id(1))
+                .with_f32("radius", 1.0)
+                .with_u32("rows", 16)
+                .with_u32("cols", 24),
+            Node::new("remesh", node_id(2))
+                .with_input(node_id(1))
+                .with_f32("target_length", 0.25)
+                .with_u32("iterations", 3)
+                .with_f32("feature_angle_degrees", 90.0),
+            Node::new("polyreduce", node_id(3))
+                .with_input(node_id(2))
+                .with_f32("target_ratio", 0.5),
+            Node::new("scatter_surface", node_id(4))
+                .with_input(node_id(1))
+                .with_u32("count", 8)
+                .with_u64("seed", 21)
+                .with_f32("min_distance", 0.4),
+            Node::new("xform", node_id(5))
+                .with_input(node_id(4))
+                .with_vec3("translate", Vec3::ZERO)
+                .with_vec3("rotate_degrees", Vec3::ZERO)
+                .with_vec3("scale", unit(0.6)),
+            Node::new("voronoifracture", node_id(6))
+                .with_input(node_id(3))
+                .with_input(node_id(5)),
         ],
     };
     let replaced = call_tool(
@@ -1235,5 +1249,292 @@ async fn agent_builds_fractures_and_verifies_a_solid_through_the_sop_operators()
         );
     }
 
+    client.shutdown().await;
+}
+
+#[tokio::test]
+async fn agent_imports_a_mesh_processes_it_and_exports_the_result() {
+    let workspace = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("mcp-exchange");
+    if workspace.exists() {
+        assert!(std::fs::remove_dir_all(&workspace).is_ok());
+    }
+    assert!(std::fs::create_dir_all(workspace.join("out")).is_ok());
+    assert!(std::fs::write(workspace.join("input.stl"), tetrahedron_stl()).is_ok());
+    let client_res = StdioClient::spawn_with(&["--workspace".as_ref(), workspace.as_os_str()]);
+    assert!(client_res.is_ok(), "{client_res:?}");
+    let Ok(mut client) = client_res else {
+        return;
+    };
+    initialize(&mut client).await;
+
+    let import = call_tool(&mut client, 2, "geo_import", json!({ "path": "input.stl" })).await;
+    assert_eq!(import["isError"], false, "{import}");
+    assert_eq!(import["structuredContent"]["prim_count"], 4);
+    assert_eq!(import["structuredContent"]["point_count"], 4);
+    let hash = import["structuredContent"]["content_hash"]
+        .as_str()
+        .unwrap_or("")
+        .to_owned();
+    assert_eq!(hash.len(), 64);
+
+    // Deleting the source proves that the scene depends only on the stored content.
+    assert!(std::fs::remove_file(workspace.join("input.stl")).is_ok());
+
+    let node_id = pcc_id::NodeId;
+    let scene = GraphSnapshot {
+        revision: RevisionId(1),
+        nodes: vec![
+            Node::new("asset", node_id(1)).with_text("content_hash", hash.clone()),
+            Node::new("remesh", node_id(2))
+                .with_input(node_id(1))
+                .with_f32("target_length", 0.25)
+                .with_u32("iterations", 2)
+                .with_f32("feature_angle_degrees", 30.0),
+            Node::new("uvflatten", node_id(3))
+                .with_input(node_id(2))
+                .with_f32("seam_angle_degrees", 60.0),
+        ],
+    };
+    let replaced = call_tool(
+        &mut client,
+        3,
+        "replace_scene",
+        json!({ "base_revision": 1, "ofxs": scene.to_ofxs() }),
+    )
+    .await;
+    assert_eq!(replaced["isError"], false, "{replaced}");
+
+    // The final node as OBJ with UVs, and the untouched asset node as lossless OFXG.
+    let exported = call_tool(
+        &mut client,
+        4,
+        "geo_export",
+        json!({ "path": "out/result.obj", "frame_numerator": 0, "frame_denominator": 24 }),
+    )
+    .await;
+    assert_eq!(exported["isError"], false, "{exported}");
+    assert_eq!(exported["structuredContent"]["format"], "obj");
+    assert_eq!(exported["structuredContent"]["revision"], 2);
+    let text = std::fs::read_to_string(workspace.join("out/result.obj")).unwrap_or_default();
+    let parsed = pcc_io::from_obj(&text);
+    assert!(parsed.is_ok(), "{parsed:?}");
+    if let Ok(parsed) = parsed {
+        assert!(parsed.prim_count() > 100, "{}", parsed.prim_count());
+        assert!(parsed.topology_index().is_closed_manifold());
+        // A tetrahedron with 2 m legs has a volume of 8/6.
+        assert!((parsed.enclosed_volume() - 8.0 / 6.0).abs() < 0.01);
+        assert!(text.contains("\nvt "), "UVs must reach the file");
+    }
+    let source = call_tool(
+        &mut client,
+        5,
+        "geo_export",
+        json!({
+            "path": "out/source.ofxg",
+            "node_id": 1,
+            "frame_numerator": 0,
+            "frame_denominator": 24
+        }),
+    )
+    .await;
+    assert_eq!(source["structuredContent"]["content_hash"], hash.as_str());
+
+    // Files are not replaced by accident, and agents cannot leave the workspace.
+    let repeat = json!({ "path": "out/result.obj", "frame_numerator": 0, "frame_denominator": 24 });
+    let again = call_tool(&mut client, 6, "geo_export", repeat).await;
+    assert_eq!(again["isError"], true);
+    assert_eq!(error_code(&again), "file_already_exists", "{again}");
+    let escape = call_tool(
+        &mut client,
+        7,
+        "geo_import",
+        json!({ "path": "../input.stl" }),
+    )
+    .await;
+    assert_eq!(error_code(&escape), "path_rejected", "{escape}");
+    let escape = call_tool(
+        &mut client,
+        8,
+        "geo_export",
+        json!({ "path": "../planted.obj", "frame_numerator": 0, "frame_denominator": 24 }),
+    )
+    .await;
+    assert_eq!(error_code(&escape), "path_rejected", "{escape}");
+    assert!(!workspace.join("../planted.obj").exists());
+
+    // A scene naming content that was never imported fails with its own error.
+    let unknown = GraphSnapshot {
+        revision: RevisionId(2),
+        nodes: vec![
+            Node::new("asset", node_id(1)).with_text("content_hash", "a".repeat(64)),
+            Node::new("reverse", node_id(2)).with_input(node_id(1)),
+        ],
+    };
+    let _ = call_tool(
+        &mut client,
+        9,
+        "replace_scene",
+        json!({ "base_revision": 2, "ofxs": unknown.to_ofxs() }),
+    )
+    .await;
+    let missing = call_tool(
+        &mut client,
+        10,
+        "geo_probe",
+        json!({ "frame_numerator": 0, "frame_denominator": 24 }),
+    )
+    .await;
+    assert_eq!(error_code(&missing), "asset_not_found", "{missing}");
+    client.shutdown().await;
+}
+
+#[tokio::test]
+async fn file_tools_are_refused_unless_the_host_names_a_workspace() {
+    let client_res = StdioClient::spawn();
+    assert!(client_res.is_ok(), "{client_res:?}");
+    let Ok(mut client) = client_res else {
+        return;
+    };
+    initialize(&mut client).await;
+    let import = call_tool(&mut client, 2, "geo_import", json!({ "path": "a.stl" })).await;
+    assert_eq!(import["isError"], true);
+    assert_eq!(error_code(&import), "file_access_disabled", "{import}");
+    let export = call_tool(
+        &mut client,
+        3,
+        "geo_export",
+        json!({ "path": "a.obj", "frame_numerator": 0, "frame_denominator": 24 }),
+    )
+    .await;
+    assert_eq!(error_code(&export), "file_access_disabled", "{export}");
+    client.shutdown().await;
+}
+
+#[tokio::test]
+async fn agent_animates_a_parameter_with_an_expression_and_probes_two_frames() {
+    let client_res = StdioClient::spawn();
+    assert!(client_res.is_ok(), "{client_res:?}");
+    let Ok(mut client) = client_res else {
+        return;
+    };
+    initialize(&mut client).await;
+    // Edits in plain JSON, as an agent writes them, on top of the server's initial scene.
+    let edits = json!({
+        "base_revision": 1,
+        "edits": [
+            { "edit": "remove_node", "id": 2 },
+            { "edit": "remove_node", "id": 1 },
+            { "edit": "add_node", "node": { "id": 10, "op": "box", "params": {
+                "size": { "x": 1, "y": 1, "z": 1 } } } },
+            { "edit": "add_node", "node": { "id": 11, "op": "xform", "inputs": [10], "params": {
+                "translate": { "x": "0", "y": "$F * 2", "z": "0" },
+                "rotate_degrees": { "x": 0, "y": 0, "z": 0 },
+                "scale": { "x": 1, "y": 1, "z": 1 } } } },
+            { "edit": "add_node", "node": { "id": 12, "op": "sphere", "params": {
+                "radius": { "expr": "5 - $F" }, "rows": 8, "cols": 8 } } },
+            { "edit": "add_node", "node": { "id": 13, "op": "merge", "inputs": [11, 12] } }
+        ]
+    });
+    let edited = call_tool(&mut client, 2, "graph_batch_edit", edits).await;
+    assert_eq!(edited["isError"], false, "{edited}");
+    let high_y = |probe: &Value| probe["structuredContent"]["bounds"][1]["y"].as_f64();
+    let frame = |numerator: i64| json!({ "node_id": 11, "frame_numerator": numerator, "frame_denominator": 1 });
+    let at_zero = call_tool(&mut client, 3, "node_cook", frame(0)).await;
+    let at_ten = call_tool(&mut client, 4, "node_cook", frame(10)).await;
+    assert_eq!(at_ten["isError"], false, "{at_ten}");
+    let (start, later) = (
+        high_y(&at_zero).unwrap_or(0.0),
+        high_y(&at_ten).unwrap_or(0.0),
+    );
+    assert!((later - start - 20.0).abs() < 1e-4, "{start} then {later}");
+    // A formula that strays out of range fails at that frame, and names the node and parameter.
+    let bad_frame = json!({ "frame_numerator": 5, "frame_denominator": 1 });
+    let failed = call_tool(&mut client, 5, "geo_probe", bad_frame).await;
+    assert_eq!(failed["isError"], true, "{failed}");
+    assert_eq!(error_code(&failed), "param_evaluation_failed", "{failed}");
+    let message = failed["structuredContent"]["message"]
+        .as_str()
+        .unwrap_or("");
+    assert!(message.contains("node 12"), "{message}");
+    // A syntax error is refused when the edit is made, leaving the scene as it was.
+    let revision = edited["structuredContent"]["committed_revision"]
+        .as_u64()
+        .unwrap_or(0);
+    let typo = json!({ "base_revision": revision, "edits": [
+        { "edit": "set_param", "id": 12, "name": "radius", "value": { "expr": "5 - $" } }
+    ]});
+    let refused = call_tool(&mut client, 6, "graph_batch_edit", typo).await;
+    assert_eq!(refused["isError"], true, "{refused}");
+    assert_eq!(error_code(&refused), "scene_field_invalid", "{refused}");
+    client.shutdown().await;
+}
+
+#[tokio::test]
+async fn agent_runs_a_solver_and_seeks_the_timeline() {
+    let client_res = StdioClient::spawn();
+    assert!(client_res.is_ok(), "{client_res:?}");
+    let Ok(mut client) = client_res else {
+        return;
+    };
+    initialize(&mut client).await;
+    let node_id = pcc_id::NodeId;
+    let zero = Vec3::ZERO;
+    let one = Vec3::checked(1.0, 1.0, 1.0).unwrap_or(zero);
+    // A box rising by one metre per tick, advancing with the timeline.
+    let scene = GraphSnapshot {
+        revision: RevisionId(1),
+        nodes: vec![
+            Node::new("box", node_id(1)).with_vec3("size", one),
+            Node::new("state_prev", node_id(2)).with_u64("zone", 4),
+            Node::new("xform", node_id(3))
+                .with_input(node_id(2))
+                .with_vec3_expr("translate", ["0", "1", "0"])
+                .with_vec3("rotate_degrees", zero)
+                .with_vec3("scale", one),
+            Node::new("solver", node_id(4))
+                .with_input(node_id(1))
+                .with_input(node_id(3))
+                .with_expr("ticks", "$F"),
+        ],
+    };
+    let replaced = call_tool(
+        &mut client,
+        2,
+        "replace_scene",
+        json!({ "base_revision": 1, "ofxs": scene.to_ofxs() }),
+    )
+    .await;
+    assert_eq!(replaced["isError"], false, "{replaced}");
+    let frame = |numerator: i64| json!({ "frame_numerator": numerator, "frame_denominator": 1 });
+    let low_y = |probe: &Value| probe["structuredContent"]["bounds"][0]["y"].as_f64();
+    let start = call_tool(&mut client, 3, "geo_probe", frame(0)).await;
+    let base = low_y(&start).unwrap_or(f64::NAN);
+    // Seek forward, backward, and forward again, as a timeline scrub does.
+    for (id, frames) in [(4u64, 30i64), (5, 7), (6, 12), (7, 30)] {
+        let probe = call_tool(&mut client, id, "geo_probe", frame(frames)).await;
+        assert_eq!(probe["isError"], false, "{probe}");
+        let risen = low_y(&probe).unwrap_or(f64::NAN) - base;
+        assert!(
+            (risen - frames as f64).abs() < 1e-3,
+            "frame {frames}: {risen}"
+        );
+    }
+    // A body reading from outside its zone is refused when the edit is made.
+    let leaky = scene
+        .to_ofxs()
+        .replacen("solver 4 1 3", "reverse 5 3\nsolver 4 1 3", 1);
+    let refused = call_tool(
+        &mut client,
+        8,
+        "replace_scene",
+        json!({ "base_revision": 2, "ofxs": leaky }),
+    )
+    .await;
+    assert_eq!(refused["isError"], true, "{refused}");
+    assert_eq!(
+        error_code(&refused),
+        "scene_node_order_invalid",
+        "{refused}"
+    );
     client.shutdown().await;
 }

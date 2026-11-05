@@ -370,4 +370,45 @@ mod tests {
         assert!(signed_volume(&floor) > 0.0);
         Ok(())
     }
+    #[test]
+    fn back_to_back_faces_are_rejected_as_not_being_a_surface() -> Result<(), GeoError> {
+        let flag = AtomicBool::new(false);
+        let ctx = SopContext::new(1 << 24, &flag);
+        // Topologically a closed sphere, geometrically nothing: both faces share all three points.
+        let doubled = GeoDetail::points(vec![
+            Vec3::checked(0.0, 0.0, 0.0)?,
+            Vec3::checked(1.0, 0.0, 0.0)?,
+            Vec3::checked(0.0, 1.0, 0.0)?,
+        ])
+        .with_primitives(
+            vec![PrimRun {
+                kind: PrimKind::Polygon,
+                arity: 3,
+                prim_count: 2,
+            }],
+            vec![0, 1, 2, 0, 2, 1],
+        )?;
+        assert!(TopologyIndex::build(&doubled).is_closed_manifold());
+        assert!(crate::common::has_repeated_faces(&doubled));
+        let invalid = Some(GeoError::InvalidTopology);
+        assert_eq!(poly_reduce(&doubled, 0.5, &ctx).err(), invalid);
+        let params = crate::remesh::RemeshParams {
+            target_length: 0.1,
+            iterations: 1,
+            feature_angle_degrees: 45.0,
+        };
+        assert_eq!(
+            crate::remesh::remesh(&doubled, &params, &ctx).err(),
+            invalid
+        );
+        let seeds = GeoDetail::points(vec![Vec3::ZERO]);
+        assert_eq!(
+            crate::clip::voronoi_fracture(&doubled, &seeds, &ctx).err(),
+            invalid
+        );
+        assert!(!crate::common::has_repeated_faces(&create_sphere(
+            1.0, 8, 8, &ctx
+        )?));
+        Ok(())
+    }
 }

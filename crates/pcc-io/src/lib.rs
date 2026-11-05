@@ -1,8 +1,17 @@
-//! Pure-Rust geometry serialization and interchange (`.ofxg` native binary cache and Wavefront `.obj`).
+//! Pure-Rust geometry serialization and interchange (`.ofxg` native binary cache, Wavefront `.obj`,
+//! and STL import).
 //! Enforces finite-number validation, resource bounds, and BLAKE3 content integrity on ingress.
 
-use pcc_geo::{AttrDomain, AttributeColumn, GeoDetail, GeoError, GroupDomain, PrimKind, PrimRun};
+mod stl;
+
+use pcc_geo::{
+    AttrDomain, AttributeColumn, GeoDetail, GeoError, GroupDomain, MAX_PACKED_DEPTH,
+    PackedInstance, PrimKind, PrimRun,
+};
 use pcc_math::Vec3;
+use std::sync::Arc;
+
+pub use stl::{from_stl_bytes, to_stl_bytes};
 
 const OFXG_MAGIC: &[u8; 8] = b"OFXG\x01\x00\x00\x00";
 pub const DEFAULT_MAX_IO_ELEMENTS: usize = 10_000_000;
@@ -50,6 +59,7 @@ pub fn to_ofxg_bytes(geo: &GeoDetail) -> Vec<u8> {
         let kind_tag: u8 = match run.kind {
             PrimKind::Polygon => 1,
             PrimKind::Polyline => 2,
+            PrimKind::Packed => 3,
         };
         payload.push(kind_tag);
         write_u32(&mut payload, run.arity);
@@ -95,7 +105,29 @@ pub fn to_ofxg_bytes(geo: &GeoDetail) -> Vec<u8> {
         }
     }
 
-    // 5. Append 32-byte BLAKE3 payload integrity digest
+    // 5. Packed instances, only when present, so that other geometry's files never change.
+    if geo.packed_count() > 0 {
+        let prototypes = geo.packed_prototypes();
+        write_u64(&mut payload, prototypes.len() as u64);
+        for prototype in prototypes {
+            let bytes = to_ofxg_bytes(prototype.geo());
+            write_u64(&mut payload, bytes.len() as u64);
+            payload.extend_from_slice(&bytes);
+        }
+        write_u64(&mut payload, geo.packed_count() as u64);
+        for index in 0..geo.packed_count() {
+            if let Some(instance) = geo.packed_instance(index) {
+                write_u32(&mut payload, instance.prototype);
+                for row in instance.rows {
+                    write_f32(&mut payload, row.x);
+                    write_f32(&mut payload, row.y);
+                    write_f32(&mut payload, row.z);
+                }
+            }
+        }
+    }
+
+    // 6. Append 32-byte BLAKE3 payload integrity digest
     let checksum = blake3::hash(&payload);
     payload.extend_from_slice(checksum.as_bytes());
     payload
@@ -111,6 +143,15 @@ pub fn from_ofxg_bytes_with_limit(
     bytes: &[u8],
     max_elements: usize,
 ) -> Result<GeoDetail, IoFormatError> {
+    read_ofxg(bytes, max_elements, 0)
+}
+
+/// Reads a file, whose packed prototypes are themselves files. `depth` bounds that recursion, so a
+/// crafted file cannot exhaust the stack by nesting.
+fn read_ofxg(bytes: &[u8], max_elements: usize, depth: u32) -> Result<GeoDetail, IoFormatError> {
+    if depth > MAX_PACKED_DEPTH {
+        return Err(IoFormatError::ElementLimitExceeded);
+    }
     if bytes.len() < OFXG_MAGIC.len() + 32 + 32 {
         return Err(IoFormatError::UnexpectedEof);
     }
@@ -146,6 +187,7 @@ pub fn from_ofxg_bytes_with_limit(
         let kind = match kind_tag {
             1 => PrimKind::Polygon,
             2 => PrimKind::Polyline,
+            3 => PrimKind::Packed,
             _ => return Err(IoFormatError::InvalidTypeTag),
         };
         let arity = read_u32(body, &mut cursor)?;
@@ -162,7 +204,7 @@ pub fn from_ofxg_bytes_with_limit(
         vertex_points.push(read_u32(body, &mut cursor)?);
     }
     if !runs.is_empty() || !vertex_points.is_empty() {
-        geo = geo.with_primitives(runs, vertex_points)?;
+        geo = geo.with_runs(runs, vertex_points)?;
     }
 
     // 3. Attributes across all 4 domains
@@ -194,6 +236,38 @@ pub fn from_ofxg_bytes_with_limit(
         }
     }
 
+    // 5. Packed instances, which only exist in files of geometry that has them.
+    let packed_expected: usize = geo
+        .prim_runs()
+        .iter()
+        .filter(|run| run.kind == PrimKind::Packed)
+        .map(|run| run.prim_count)
+        .sum();
+    if packed_expected > 0 {
+        let prototype_count = read_bounded_len(body, &mut cursor, max_elements)?;
+        let mut prototypes = Vec::with_capacity(prototype_count);
+        for _ in 0..prototype_count {
+            let length = read_bounded_len(body, &mut cursor, usize::MAX)?;
+            let nested = read_slice(body, &mut cursor, length)?;
+            prototypes.push(Arc::new(read_ofxg(nested, max_elements, depth + 1)?));
+        }
+        let instance_count = read_bounded_len(body, &mut cursor, max_elements)?;
+        let mut instances = Vec::with_capacity(instance_count);
+        for _ in 0..instance_count {
+            let prototype = read_u32(body, &mut cursor)?;
+            let mut rows = [Vec3::ZERO; 3];
+            for row in &mut rows {
+                let x = read_f32(body, &mut cursor)?;
+                let y = read_f32(body, &mut cursor)?;
+                let z = read_f32(body, &mut cursor)?;
+                *row =
+                    Vec3::checked(x, y, z).map_err(|_| IoFormatError::Geo(GeoError::NonFinite))?;
+            }
+            instances.push(PackedInstance { prototype, rows });
+        }
+        geo = geo.with_packed_parts(prototypes, &instances)?;
+    }
+
     if cursor != body.len() {
         return Err(IoFormatError::TrailingBytes);
     }
@@ -217,18 +291,36 @@ pub fn to_obj(geo: &GeoDetail) -> String {
             canonical(p.z)
         ));
     }
+    let texture = geo
+        .domain_attribute(AttrDomain::Vertex, "uv")
+        .and_then(AttributeColumn::as_vec3);
+    if let Some(column) = texture {
+        for idx in 0..column.len() {
+            let uv = column.get(idx).unwrap_or(Vec3::ZERO);
+            out.push_str(&format!("vt {:e} {:e}\n", canonical(uv.x), canonical(uv.y)));
+        }
+    }
     let mut vtx_cursor = 0usize;
     for run in geo.prim_runs() {
+        let arity = run.arity as usize;
         let prefix = match run.kind {
             PrimKind::Polygon => "f",
             PrimKind::Polyline => "l",
+            // OBJ has no instances. Callers that must not lose them refuse to get here.
+            PrimKind::Packed => {
+                vtx_cursor += arity * run.prim_count;
+                continue;
+            }
         };
-        let arity = run.arity as usize;
         for _ in 0..run.prim_count {
             out.push_str(prefix);
             for offset in 0..arity {
                 let pt_idx = geo.vertex_point(vtx_cursor + offset).unwrap_or(0);
-                out.push_str(&format!(" {}", pt_idx + 1));
+                if texture.is_some() {
+                    out.push_str(&format!(" {}/{}", pt_idx + 1, vtx_cursor + offset + 1));
+                } else {
+                    out.push_str(&format!(" {}", pt_idx + 1));
+                }
             }
             out.push('\n');
             vtx_cursor += arity;
@@ -237,14 +329,38 @@ pub fn to_obj(geo: &GeoDetail) -> String {
     out
 }
 
-/// Parses a `GeoDetail` from Wavefront `.obj` text (`v`, `f`, `l` records).
+/// Parses one `v` or `vt` index of a face corner. OBJ indices are 1-based, and negative values
+/// count back from the most recent element.
+fn parse_obj_index(token: &str, count: usize) -> Result<u32, IoFormatError> {
+    let value = token
+        .parse::<i64>()
+        .map_err(|_| IoFormatError::InvalidSyntax)?;
+    let resolved = if value > 0 {
+        value - 1
+    } else if value < 0 {
+        i64::try_from(count).map_err(|_| IoFormatError::ElementLimitExceeded)? + value
+    } else {
+        -1
+    };
+    u32::try_from(resolved).map_err(|_| IoFormatError::Geo(GeoError::IndexOutOfBounds))
+}
+
+/// Parses Wavefront `.obj` text as exported by common tools: `v`, `vt`, `f`, and `l` records with
+/// any line ending. Vertex colours, normals, groups, and materials are ignored because the engine
+/// derives or lacks them. Free-form surfaces fail loudly rather than vanish. Texture coordinates
+/// become vertex `v@uv` only when every corner has one.
 pub fn from_obj(text: &str) -> Result<GeoDetail, IoFormatError> {
-    if !text.is_ascii() || text.contains('\r') {
-        return Err(IoFormatError::InvalidSyntax);
-    }
+    from_obj_with_limit(text, DEFAULT_MAX_IO_ELEMENTS)
+}
+
+/// [`from_obj`] with an explicit limit on points plus primitive corners.
+pub fn from_obj_with_limit(text: &str, max_elements: usize) -> Result<GeoDetail, IoFormatError> {
     let mut points = Vec::new();
+    let mut texture = Vec::new();
     let mut runs: Vec<PrimRun> = Vec::new();
     let mut vertex_points: Vec<u32> = Vec::new();
+    let mut corner_texture: Vec<u32> = Vec::new();
+    let mut all_textured = true;
 
     for raw_line in text.lines() {
         let line = raw_line.trim();
@@ -255,17 +371,32 @@ pub fn from_obj(text: &str) -> Result<GeoDetail, IoFormatError> {
         let Some(keyword) = parts.next() else {
             continue;
         };
+        if points.len() + vertex_points.len() + texture.len() > max_elements {
+            return Err(IoFormatError::ElementLimitExceeded);
+        }
         match keyword {
             "v" => {
                 let x = parse_f32_obj(parts.next())?;
                 let y = parse_f32_obj(parts.next())?;
                 let z = parse_f32_obj(parts.next())?;
-                if parts.next().is_some() {
+                // Allowed remainders: nothing, a weight, a colour, or a weight and a colour.
+                let extra = parts.count();
+                if !matches!(extra, 0 | 1 | 3 | 4) {
                     return Err(IoFormatError::InvalidSyntax);
                 }
                 let pt =
                     Vec3::checked(x, y, z).map_err(|_| IoFormatError::Geo(GeoError::NonFinite))?;
                 points.push(pt);
+            }
+            "vt" => {
+                let u = parse_f32_obj(parts.next())?;
+                let v = match parts.next() {
+                    Some(token) => parse_f32_obj(Some(token))?,
+                    None => 0.0,
+                };
+                let uv = Vec3::checked(u, v, 0.0)
+                    .map_err(|_| IoFormatError::Geo(GeoError::NonFinite))?;
+                texture.push(uv);
             }
             "f" | "l" => {
                 let kind = if keyword == "f" {
@@ -275,18 +406,19 @@ pub fn from_obj(text: &str) -> Result<GeoDetail, IoFormatError> {
                 };
                 let mut indices = Vec::new();
                 for token in parts {
-                    let head = token.split('/').next().unwrap_or("");
-                    let one_based = head
-                        .parse::<u32>()
-                        .map_err(|_| IoFormatError::InvalidSyntax)?;
-                    if one_based == 0 {
-                        return Err(IoFormatError::Geo(GeoError::IndexOutOfBounds));
+                    let mut fields = token.split('/');
+                    let head = fields.next().unwrap_or("");
+                    indices.push(parse_obj_index(head, points.len())?);
+                    match fields.next() {
+                        Some(field) if !field.is_empty() => {
+                            corner_texture.push(parse_obj_index(field, texture.len())?);
+                        }
+                        _ => all_textured = false,
                     }
-                    indices.push(one_based - 1);
                 }
                 let min_arity = match kind {
                     PrimKind::Polygon => 3,
-                    PrimKind::Polyline => 2,
+                    _ => 2,
                 };
                 if indices.len() < min_arity {
                     return Err(IoFormatError::Geo(GeoError::InvalidTopology));
@@ -307,16 +439,28 @@ pub fn from_obj(text: &str) -> Result<GeoDetail, IoFormatError> {
                     });
                 }
             }
+            "vn" | "vp" | "g" | "o" | "s" | "mg" | "usemtl" | "mtllib" | "usemap" | "maplib" => {}
             _ => return Err(IoFormatError::InvalidSyntax),
         }
     }
 
     let geo = GeoDetail::points(points);
     if runs.is_empty() {
-        Ok(geo)
-    } else {
-        Ok(geo.with_primitives(runs, vertex_points)?)
+        return Ok(geo);
     }
+    let geo = geo.with_primitives(runs, vertex_points)?;
+    if !all_textured || corner_texture.is_empty() {
+        return Ok(geo);
+    }
+    let mut uv = Vec::with_capacity(corner_texture.len());
+    for &index in &corner_texture {
+        uv.push(
+            *texture
+                .get(index as usize)
+                .ok_or(IoFormatError::Geo(GeoError::IndexOutOfBounds))?,
+        );
+    }
+    Ok(geo.with_domain_attribute(AttrDomain::Vertex, "uv", AttributeColumn::vec3_values(uv))?)
 }
 
 fn parse_f32_obj(token: Option<&str>) -> Result<f32, IoFormatError> {
@@ -615,5 +759,121 @@ mod tests {
             corrupted[flip_idx] ^= 0xFF;
             assert!(from_ofxg_bytes(&corrupted).is_err());
         }
+    }
+
+    #[test]
+    fn real_world_obj_files_parse() -> Result<(), IoFormatError> {
+        let exported = "# Blender\r\nmtllib a.mtl\r\no Cube\r\n\
+            v 0 0 0 1 0 0\r\nv 1 0 0 1 0 0\r\nv 1 1 0 0 1 0\r\nv 0 1 0 1.0\r\n\
+            vn 0 0 1\r\nvt 0 0\r\nvt 1 0\r\nvt 1 1\r\nvt 0 1\r\n\
+            usemtl Material\r\ns off\r\ng group\r\nf 1/1/1 2/2/1 3/3/1 4/4/1\r\n";
+        let geo = from_obj(exported)?;
+        assert_eq!((geo.len(), geo.prim_count()), (4, 1));
+        let uv = geo
+            .domain_attribute(AttrDomain::Vertex, "uv")
+            .and_then(AttributeColumn::as_vec3)
+            .and_then(|column| column.get(2));
+        assert_eq!(uv.map(|p| (p.x, p.y, p.z)), Some((1.0, 1.0, 0.0)));
+        // Non-ASCII text in a comment or name is not an error.
+        assert_eq!(
+            from_obj("# café\nv 0 0 0\nv 1 0 0\nv 0 1 0\nf 1 2 3\n")?.prim_count(),
+            1
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn negative_obj_indices_count_back_from_the_latest_element() -> Result<(), IoFormatError> {
+        let relative = from_obj("v 0 0 0\nv 1 0 0\nv 0 1 0\nf -3 -2 -1\nv 5 5 5\nl -1 -2\n")?;
+        assert_eq!(relative.vertex_point(0), Some(0));
+        assert_eq!(relative.vertex_point(2), Some(2));
+        // The polyline's -1 is the fourth point, because it was defined before that line.
+        assert_eq!(relative.vertex_point(3), Some(3));
+        assert_eq!(relative.vertex_point(4), Some(2));
+        for bad in [
+            "v 0 0 0\nv 1 0 0\nv 0 1 0\nf 0 1 2\n",
+            "v 0 0 0\nv 1 0 0\nv 0 1 0\nf -4 -2 -1\n",
+            "v 0 0 0\nv 1 0 0\nv 0 1 0\nf 1 2 9\n",
+            "v 0 0 0\nv 1 0 0\nv 0 1 0\nvt 0 0\nf 1/9 2/9 3/9\n",
+        ] {
+            assert!(from_obj(bad).is_err(), "{bad:?}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn unsupported_obj_content_fails_instead_of_vanishing() {
+        for bad in [
+            "cstype bspline\n",
+            "surf 0 1 0 1 1 2\n",
+            "v 0 0\n",
+            "v 0 0 0 1 2\n",
+            "vt\n",
+            "v nan 0 0\n",
+            "f 1 2\n",
+        ] {
+            assert!(from_obj(bad).is_err(), "{bad:?}");
+        }
+        assert_eq!(
+            from_obj_with_limit("v 0 0 0\nv 1 0 0\nv 0 1 0\nv 0 0 1\n", 2).err(),
+            Some(IoFormatError::ElementLimitExceeded)
+        );
+    }
+
+    #[test]
+    fn uvs_survive_an_obj_round_trip_and_partial_uvs_are_dropped() -> Result<(), IoFormatError> {
+        let v = |x, y, z| Vec3::checked(x, y, z).map_err(|_| GeoError::NonFinite);
+        let geo = GeoDetail::points(vec![v(0., 0., 0.)?, v(1., 0., 0.)?, v(0., 1., 0.)?])
+            .with_primitives(
+                vec![PrimRun {
+                    kind: PrimKind::Polygon,
+                    arity: 3,
+                    prim_count: 1,
+                }],
+                vec![0, 1, 2],
+            )?
+            .with_domain_attribute(
+                AttrDomain::Vertex,
+                "uv",
+                AttributeColumn::vec3_values(vec![
+                    v(0.25, 0.5, 0.)?,
+                    v(0.75, 0.5, 0.)?,
+                    v(0.5, 1.0, 0.)?,
+                ]),
+            )?;
+        let text = to_obj(&geo);
+        assert!(text.contains("f 1/1 2/2 3/3"), "{text}");
+        let back = from_obj(&text)?;
+        assert_eq!(back.hash(), geo.hash());
+        let partial = from_obj("v 0 0 0\nv 1 0 0\nv 0 1 0\nvt 0 0\nf 1/1 2 3\n")?;
+        assert!(partial.domain_attribute(AttrDomain::Vertex, "uv").is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn packed_geometry_round_trips_and_nesting_in_files_is_bounded() -> Result<(), IoFormatError> {
+        let prototype = Arc::new(from_obj("v 0 0 0\nv 1 0 0\nv 0 1 0\nf 1 2 3\n")?);
+        let once = GeoDetail::packed_whole(prototype)?;
+        let bytes = to_ofxg_bytes(&once);
+        let back = from_ofxg_bytes(&bytes)?;
+        assert_eq!(back.hash(), once.hash());
+        assert_eq!(back.packed_count(), 1);
+        assert_eq!(back.packed_prototypes().len(), 1);
+        // Files of geometry with no instances never gained a section.
+        let plain = from_obj("v 0 0 0\nv 1 0 0\nv 0 1 0\nf 1 2 3\n")?;
+        let plain_bytes = to_ofxg_bytes(&plain);
+        assert_eq!(from_ofxg_bytes(&plain_bytes)?.hash(), plain.hash());
+
+        // A nested file at the depth limit must stop rather than recurse further.
+        assert!(read_ofxg(&bytes, DEFAULT_MAX_IO_ELEMENTS, MAX_PACKED_DEPTH).is_err());
+        assert!(read_ofxg(&plain_bytes, DEFAULT_MAX_IO_ELEMENTS, MAX_PACKED_DEPTH).is_ok());
+        assert!(read_ofxg(&plain_bytes, DEFAULT_MAX_IO_ELEMENTS, MAX_PACKED_DEPTH + 1).is_err());
+        // Corruption anywhere in a nested file is detected by some checksum.
+        for at in (40..bytes.len()).step_by(7) {
+            let mut bad = bytes.clone();
+            bad[at] ^= 0xFF;
+            assert!(from_ofxg_bytes(&bad).is_err(), "byte {at}");
+        }
+        Ok(())
     }
 }

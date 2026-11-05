@@ -1,0 +1,53 @@
+ofxs 1
+revision 7
+create 1 12
+grid 2 9 7 8e0 6e0
+box 3 2e0 1.5e0 1e0
+sphere 4 1.5e0 12 16
+tube 5 5e-1 2e0 2 12
+torus 6 2e0 5e-1 16 8
+line 7 0e0 0e0 0e0 1e0 2e0 -3.5e0 9
+heightfield 8 17 17 8e0 8e0
+transform 10 3 1e0 -2e0 5e-1
+normal 11 4
+wrangle 12 11 40686561743d40502e793b
+subdivide 13 3 1
+extrude 14 3 2.5e-1 5e-2
+attribpromote 15 12 heat point detail average
+group_bounds 16 4 top prim -2e0 0e0 -2e0 2e0 2e0 2e0
+blast 17 16 top false
+uvproject 18 4 cylindrical
+hf_noise 19 8 1.5e0 2.5e-1 4 11
+hf_erode 20 19 5 1e-2 3e1 12
+vdb_from_polygons 21 3 2.5e-1
+vdb_reshape 22 21 1e-1 1
+convert_vdb 23 22
+boolean 24 3 10 union 2.5e-1
+scatter 25 3 40 21
+copytopoints 26 3 25
+merge 27 3 10
+xform 28 4 1e0 0e0 0e0 0e0 4.5e1 0e0 1e0 -2e0 1e0
+reverse 29 4
+triangulate 30 4
+fuse 31 27 1e-3
+resample 32 7 2.5e-1
+sweep 33 32 1e-1 6 true
+attribtransfer 34 3 12 heat 1e0
+measure 35 4
+polybevel 36 3 1e-1 3e1
+polyreduce 37 4 5e-1
+remesh 38 3 4e-1 2 4.5e1
+clip 39 4 0e0 2.5e-1 0e0 0e0 1e0 0e0 true
+scatter_surface 40 4 100 18446744073709551615 5e-2
+voronoifracture 41 4 40
+uvflatten 42 3 6.6e1
+uvlayout 43 42 1e-2 4
+state_prev 44 46
+reverse 45 44
+solver 46 3 45 3
+foreach_piece 47 49
+normal 48 47
+foreach 49 41 48 piece
+pack 50 3
+instance 51 3 25
+unpack 52 51

@@ -393,6 +393,7 @@ name = "pcc-eval"
 version = "0.1.0"
 dependencies = [
  "blake3",
+ "pcc-expr",
  "pcc-geo",
  "pcc-graph",
  "pcc-id",
@@ -401,6 +402,13 @@ dependencies = [
  "pcc-terrain",
  "pcc-vdb",
  "pcc-vex",
+]
+
+[[package]]
+name = "pcc-expr"
+version = "0.1.0"
+dependencies = [
+ "pcc-math",
 ]
 
 [[package]]
@@ -415,10 +423,12 @@ dependencies = [
 name = "pcc-graph"
 version = "0.1.0"
 dependencies = [
+ "pcc-expr",
  "pcc-id",
  "pcc-math",
  "schemars",
  "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -455,7 +465,9 @@ dependencies = [
  "pcc-geo",
  "pcc-graph",
  "pcc-id",
+ "pcc-io",
  "pcc-math",
+ "pcc-sop",
  "pcc-store",
  "pcc-vex",
  "schemars",
@@ -469,6 +481,7 @@ dependencies = [
  "pcc-geo",
  "pcc-graph",
  "pcc-id",
+ "pcc-io",
  "pcc-math",
  "pcc-mcp",
  "rmcp",
@@ -505,12 +518,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "pcc-torture"
+version = "0.1.0"
+dependencies = [
+ "pcc-geo",
+ "pcc-io",
+ "pcc-math",
+ "pcc-sop",
+ "pcc-vdb",
+ "serde_json",
+]
+
+[[package]]
 name = "pcc-vdb"
 version = "0.1.0"
 dependencies = [
  "blake3",
  "pcc-geo",
  "pcc-math",
+ "pcc-sop",
 ]
 
 [[package]]

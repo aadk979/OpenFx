@@ -212,6 +212,24 @@ pub(crate) fn build_geo(
     attach_prims(&GeoDetail::points(positions), prims)
 }
 
+/// Whether two polygons use the same set of points. Back-to-back copies of a face pass every
+/// edge-based manifold test, but they enclose nothing, so they are not a solid surface.
+#[must_use]
+pub fn has_repeated_faces(geo: &GeoDetail) -> bool {
+    let Ok(polygons) = load_polygons(geo) else {
+        return false;
+    };
+    let mut keys: Vec<Vec<u32>> = polygons
+        .into_iter()
+        .map(|mut polygon| {
+            polygon.sort_unstable();
+            polygon
+        })
+        .collect();
+    keys.sort_unstable();
+    keys.windows(2).any(|pair| pair[0] == pair[1])
+}
+
 /// Signed enclosed volume of the polygons: positive when closed surfaces face outward.
 #[must_use]
 pub fn signed_volume(geo: &GeoDetail) -> f64 {

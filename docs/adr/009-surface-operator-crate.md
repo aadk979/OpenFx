@@ -3,6 +3,7 @@
 - **Status:** Accepted
 - **Date:** 2026-11-04
 - **Supersedes / Extends:** [ADR 008](008-sparse-vdb-volumes-and-manifold-booleans.md)
+- **Corrected by:** [ADR 010](010-thingi10k-torture-harness.md), on UV inversion and on real-world behaviour generally.
 
 ## Context
 

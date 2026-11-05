@@ -1,10 +1,16 @@
 //! Deterministic DAG evaluator with whole-graph and per-node content-addressed caching
 //! and early cutoff.
+use pcc_expr::{Expr, InputStat, Scope};
 use pcc_geo::{
     AttrDomain as GeoAttrDomain, AttributeColumn, GeoDetail, GeoError, GroupDomain, PAGE_LEN,
-    PrimKind, PrimRun, PromoteMode as GeoPromoteMode, UvProjectMode as GeoUvProjectMode,
+    PackedPrototype, PrimKind, PrimRun, PromoteMode as GeoPromoteMode,
+    UvProjectMode as GeoUvProjectMode,
 };
-use pcc_graph::{AttrDomain, BooleanMode, GraphSnapshot, Node, PromoteMode, UvProjectMode};
+use pcc_graph::{
+    AttrDomain, BooleanMode, GraphSnapshot, Node, NodeDef, NodeRegistrationError, ParamKind,
+    ParamValue, PromoteMode, SceneError, StateZone, UvProjectMode, ZoneKind, node_def,
+    register_node_def,
+};
 use pcc_id::{NodeId, RevisionId};
 use pcc_math::{Philox4x32, Vec3};
 use pcc_sop::{
@@ -19,7 +25,7 @@ use pcc_vex::{DEFAULT_MAX_FUEL_PER_POINT, VexError, compile_vex};
 use std::{
     collections::BTreeMap,
     sync::{
-        Arc, Mutex,
+        Arc, Mutex, OnceLock, RwLock,
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
 };
@@ -30,13 +36,33 @@ pub enum EvalError {
     NodeNotFound(NodeId),
     Resource(GeoError),
     Vex(VexError),
-    ElementLimit { requested: u32, limit: u32 },
+    ElementLimit {
+        requested: u32,
+        limit: u32,
+    },
+    Asset(AssetError),
+    /// A zone asked for more ticks or pieces than the budget allows.
+    StateTickLimit {
+        requested: u32,
+        limit: u32,
+    },
+    /// A parameter expression failed, or produced a value its parameter does not allow.
+    Param {
+        node: NodeId,
+        param: String,
+        message: String,
+    },
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CookBudget {
     pub max_memory_bytes: usize,
     pub max_elements: u32,
+    /// The most solver ticks or foreach pieces one zone may run in a single cook.
+    pub max_state_ticks: u32,
 }
+
+/// Enough for an hour at 24 frames per second with four substeps.
+pub const DEFAULT_MAX_STATE_TICKS: u32 = 345_600;
 impl CookBudget {
     /// Enforces that child/job budgets never exceed the parent budget.
     #[must_use]
@@ -44,12 +70,37 @@ impl CookBudget {
         Self {
             max_memory_bytes: self.max_memory_bytes.min(parent.max_memory_bytes),
             max_elements: self.max_elements.min(parent.max_elements),
+            max_state_ticks: self.max_state_ticks.min(parent.max_state_ticks),
         }
     }
 }
 pub struct EvalContext<'a> {
     pub cancelled: &'a AtomicBool,
     pub budget: CookBudget,
+    pub assets: &'a dyn AssetResolver,
+}
+
+/// Why an `asset` node's content could not be supplied.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AssetError {
+    NotFound,
+    /// Stored data did not match its content hash.
+    Corrupt,
+}
+
+/// Supplies imported geometry by content hash, keeping the evaluator free of file access.
+pub trait AssetResolver: Sync {
+    fn resolve(&self, content_hash: &str) -> Result<Arc<GeoDetail>, AssetError>;
+}
+
+/// For cooks in which no scene may refer to imported geometry.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct NoAssets;
+
+impl AssetResolver for NoAssets {
+    fn resolve(&self, _content_hash: &str) -> Result<Arc<GeoDetail>, AssetError> {
+        Err(AssetError::NotFound)
+    }
 }
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct CacheKey([u8; 32]);
@@ -63,7 +114,12 @@ struct CacheEntry {
     geo: Arc<GeoDetail>,
 }
 
+/// A zone's identity, and the tick its state was stored at.
+type CheckpointKey = ([u8; 32], u32);
+
 pub struct CookCache {
+    checkpoints: Mutex<BTreeMap<CheckpointKey, Arc<GeoDetail>>>,
+    zone_ticks_run: AtomicU64,
     latest_revision: Mutex<RevisionId>,
     entries: Mutex<BTreeMap<CacheKey, CacheEntry>>,
     node_entries: Mutex<BTreeMap<NodeCacheKey, CacheEntry>>,
@@ -72,6 +128,8 @@ pub struct CookCache {
 impl Default for CookCache {
     fn default() -> Self {
         Self {
+            checkpoints: Mutex::new(BTreeMap::new()),
+            zone_ticks_run: AtomicU64::new(0),
             latest_revision: Mutex::new(RevisionId(0)),
             entries: Mutex::new(BTreeMap::new()),
             node_entries: Mutex::new(BTreeMap::new()),
@@ -97,345 +155,30 @@ impl CookCache {
         frame_denominator: u32,
     ) -> NodeCacheKey {
         let mut hasher = blake3::Hasher::new();
-        hasher.update(b"pcc-eval-node-cache-v1");
-        match node {
-            Node::CreatePoints { count, .. } => {
-                hasher.update(b"create");
-                hasher.update(&count.to_le_bytes());
-            }
-            Node::CreateGrid {
-                rows,
-                cols,
-                size_x,
-                size_z,
-                ..
-            } => {
-                hasher.update(b"grid");
-                hasher.update(&rows.to_le_bytes());
-                hasher.update(&cols.to_le_bytes());
-                for c in [*size_x, *size_z] {
-                    let canonical = if c == 0.0 { 0.0 } else { c };
-                    hasher.update(&canonical.to_bits().to_le_bytes());
-                }
-            }
-            Node::CreateBox { size, .. } => {
-                hasher.update(b"box");
-                for c in [size.x, size.y, size.z] {
-                    let canonical = if c == 0.0 { 0.0 } else { c };
-                    hasher.update(&canonical.to_bits().to_le_bytes());
-                }
-            }
-            Node::Transform { offset, .. } => {
-                hasher.update(b"transform");
-                for c in [offset.x, offset.y, offset.z] {
-                    let canonical = if c == 0.0 { 0.0 } else { c };
-                    hasher.update(&canonical.to_bits().to_le_bytes());
-                }
-            }
-            Node::Normal { .. } => {
-                hasher.update(b"normal");
-            }
-            Node::PointWrangle { snippet, .. } => {
-                hasher.update(b"wrangle");
-                hasher.update(&(snippet.len() as u64).to_le_bytes());
-                hasher.update(snippet.as_bytes());
-            }
-            Node::Scatter {
-                id, count, seed, ..
-            } => {
-                hasher.update(b"scatter");
-                hasher.update(&id.0.to_le_bytes());
-                hasher.update(&count.to_le_bytes());
-                hasher.update(&seed.to_le_bytes());
-            }
-            Node::CopyToPoints { .. } => {
-                hasher.update(b"copytopoints");
-            }
-            Node::Merge { .. } => {
-                hasher.update(b"merge");
-            }
-            Node::Subdivide { iterations, .. } => {
-                hasher.update(b"subdivide");
-                hasher.update(&iterations.to_le_bytes());
-            }
-            Node::PolyExtrude {
-                distance, inset, ..
-            } => {
-                hasher.update(b"extrude");
-                for c in [*distance, *inset] {
-                    let canonical = if c == 0.0 { 0.0 } else { c };
-                    hasher.update(&canonical.to_bits().to_le_bytes());
-                }
-            }
-            Node::AttribPromote {
-                name,
-                from_domain,
-                to_domain,
-                mode,
-                ..
-            } => {
-                hasher.update(b"attribpromote");
-                hasher.update(&(name.len() as u64).to_le_bytes());
-                hasher.update(name.as_bytes());
-                hasher.update(from_domain.as_str().as_bytes());
-                hasher.update(b"->");
-                hasher.update(to_domain.as_str().as_bytes());
-                hasher.update(mode.as_str().as_bytes());
-            }
-            Node::Blast {
-                group_name, negate, ..
-            } => {
-                hasher.update(b"blast");
-                hasher.update(&(group_name.len() as u64).to_le_bytes());
-                hasher.update(group_name.as_bytes());
-                hasher.update(&[u8::from(*negate)]);
-            }
-            Node::UvProject { mode, .. } => {
-                hasher.update(b"uvproject");
-                hasher.update(mode.as_str().as_bytes());
-            }
-            Node::HeightField {
-                rows,
-                cols,
-                size_x,
-                size_z,
-                ..
-            } => {
-                hasher.update(b"heightfield");
-                hasher.update(&rows.to_le_bytes());
-                hasher.update(&cols.to_le_bytes());
-                for c in [*size_x, *size_z] {
-                    let canonical = if c == 0.0 { 0.0 } else { c };
-                    hasher.update(&canonical.to_bits().to_le_bytes());
-                }
-            }
-            Node::HeightFieldNoise {
-                amplitude,
-                frequency,
-                octaves,
-                seed,
-                ..
-            } => {
-                hasher.update(b"hf_noise");
-                for c in [*amplitude, *frequency] {
-                    let canonical = if c == 0.0 { 0.0 } else { c };
-                    hasher.update(&canonical.to_bits().to_le_bytes());
-                }
-                hasher.update(&octaves.to_le_bytes());
-                hasher.update(&seed.to_le_bytes());
-            }
-            Node::HeightFieldErode {
-                iterations,
-                rain_rate,
-                talus_angle,
-                seed,
-                ..
-            } => {
-                hasher.update(b"hf_erode");
-                hasher.update(&iterations.to_le_bytes());
-                for c in [*rain_rate, *talus_angle] {
-                    let canonical = if c == 0.0 { 0.0 } else { c };
-                    hasher.update(&canonical.to_bits().to_le_bytes());
-                }
-                hasher.update(&seed.to_le_bytes());
-            }
-            Node::VdbFromPolygons { voxel_size, .. } => {
-                hasher.update(b"vdb_from_polygons");
-                let canonical = if *voxel_size == 0.0 { 0.0 } else { *voxel_size };
-                hasher.update(&canonical.to_bits().to_le_bytes());
-            }
-            Node::VdbReshape {
-                offset,
-                smooth_iterations,
-                ..
-            } => {
-                hasher.update(b"vdb_reshape");
-                let canonical = if *offset == 0.0 { 0.0 } else { *offset };
-                hasher.update(&canonical.to_bits().to_le_bytes());
-                hasher.update(&smooth_iterations.to_le_bytes());
-            }
-            Node::ConvertVdb { .. } => {
-                hasher.update(b"convert_vdb");
-            }
-            Node::Boolean {
-                mode, voxel_size, ..
-            } => {
-                hasher.update(b"boolean");
-                hasher.update(mode.as_str().as_bytes());
-                let canonical = if *voxel_size == 0.0 { 0.0 } else { *voxel_size };
-                hasher.update(&canonical.to_bits().to_le_bytes());
-            }
-            Node::CreateSphere {
-                radius, rows, cols, ..
-            } => {
-                hasher.update(b"sphere");
-                hash_f32s(&mut hasher, &[*radius]);
-                hasher.update(&rows.to_le_bytes());
-                hasher.update(&cols.to_le_bytes());
-            }
-            Node::CreateTube {
-                radius,
-                height,
-                rows,
-                cols,
-                ..
-            } => {
-                hasher.update(b"tube");
-                hash_f32s(&mut hasher, &[*radius]);
-                hash_f32s(&mut hasher, &[*height]);
-                hasher.update(&rows.to_le_bytes());
-                hasher.update(&cols.to_le_bytes());
-            }
-            Node::CreateTorus {
-                major_radius,
-                minor_radius,
-                rows,
-                cols,
-                ..
-            } => {
-                hasher.update(b"torus");
-                hash_f32s(&mut hasher, &[*major_radius]);
-                hash_f32s(&mut hasher, &[*minor_radius]);
-                hasher.update(&rows.to_le_bytes());
-                hasher.update(&cols.to_le_bytes());
-            }
-            Node::CreateLine {
-                start, end, points, ..
-            } => {
-                hasher.update(b"line");
-                hash_f32s(&mut hasher, &[start.x, start.y, start.z]);
-                hash_f32s(&mut hasher, &[end.x, end.y, end.z]);
-                hasher.update(&points.to_le_bytes());
-            }
-            Node::Xform {
-                translate,
-                rotate_degrees,
-                scale,
-                ..
-            } => {
-                hasher.update(b"xform");
-                hash_f32s(&mut hasher, &[translate.x, translate.y, translate.z]);
-                hash_f32s(
-                    &mut hasher,
-                    &[rotate_degrees.x, rotate_degrees.y, rotate_degrees.z],
-                );
-                hash_f32s(&mut hasher, &[scale.x, scale.y, scale.z]);
-            }
-            Node::Reverse { .. } => {
-                hasher.update(b"reverse");
-            }
-            Node::Triangulate { .. } => {
-                hasher.update(b"triangulate");
-            }
-            Node::Fuse { distance, .. } => {
-                hasher.update(b"fuse");
-                hash_f32s(&mut hasher, &[*distance]);
-            }
-            Node::GroupBounds {
-                group_name,
-                domain,
-                min,
-                max,
-                ..
-            } => {
-                hasher.update(b"group_bounds");
-                hasher.update(&(group_name.len() as u64).to_le_bytes());
-                hasher.update(group_name.as_bytes());
-                hasher.update(domain.as_str().as_bytes());
-                hash_f32s(&mut hasher, &[min.x, min.y, min.z]);
-                hash_f32s(&mut hasher, &[max.x, max.y, max.z]);
-            }
-            Node::Resample { segment_length, .. } => {
-                hasher.update(b"resample");
-                hash_f32s(&mut hasher, &[*segment_length]);
-            }
-            Node::Sweep {
-                radius,
-                sides,
-                capped,
-                ..
-            } => {
-                hasher.update(b"sweep");
-                hash_f32s(&mut hasher, &[*radius]);
-                hasher.update(&sides.to_le_bytes());
-                hasher.update(&[u8::from(*capped)]);
-            }
-            Node::AttribTransfer { name, radius, .. } => {
-                hasher.update(b"attribtransfer");
-                hasher.update(&(name.len() as u64).to_le_bytes());
-                hasher.update(name.as_bytes());
-                hash_f32s(&mut hasher, &[*radius]);
-            }
-            Node::Measure { .. } => {
-                hasher.update(b"measure");
-            }
-            Node::PolyBevel {
-                distance,
-                min_angle_degrees,
-                ..
-            } => {
-                hasher.update(b"polybevel");
-                hash_f32s(&mut hasher, &[*distance]);
-                hash_f32s(&mut hasher, &[*min_angle_degrees]);
-            }
-            Node::PolyReduce { target_ratio, .. } => {
-                hasher.update(b"polyreduce");
-                hash_f32s(&mut hasher, &[*target_ratio]);
-            }
-            Node::Remesh {
-                target_length,
-                iterations,
-                feature_angle_degrees,
-                ..
-            } => {
-                hasher.update(b"remesh");
-                hash_f32s(&mut hasher, &[*target_length]);
-                hasher.update(&iterations.to_le_bytes());
-                hash_f32s(&mut hasher, &[*feature_angle_degrees]);
-            }
-            Node::Clip {
-                origin,
-                normal,
-                cap,
-                ..
-            } => {
-                hasher.update(b"clip");
-                hash_f32s(&mut hasher, &[origin.x, origin.y, origin.z]);
-                hash_f32s(&mut hasher, &[normal.x, normal.y, normal.z]);
-                hasher.update(&[u8::from(*cap)]);
-            }
-            Node::VoronoiFracture { .. } => {
-                hasher.update(b"voronoifracture");
-            }
-            Node::ScatterSurface {
-                count,
-                seed,
-                min_distance,
-                ..
-            } => {
-                hasher.update(b"scatter_surface");
-                hasher.update(&count.to_le_bytes());
-                hasher.update(&seed.to_le_bytes());
-                hash_f32s(&mut hasher, &[*min_distance]);
-            }
-            Node::UvFlatten {
-                seam_angle_degrees, ..
-            } => {
-                hasher.update(b"uvflatten");
-                hash_f32s(&mut hasher, &[*seam_angle_degrees]);
-            }
-            Node::UvLayout { padding, tiles, .. } => {
-                hasher.update(b"uvlayout");
-                hash_f32s(&mut hasher, &[*padding]);
-                hasher.update(&tiles.to_le_bytes());
-            }
+        hasher.update(b"pcc-eval-node-cache-v2");
+        hasher.update(&(node.op.len() as u64).to_le_bytes());
+        hasher.update(node.op.as_bytes());
+        if node_def(&node.op).is_some_and(|def| def.seeded_by_node_id) {
+            hasher.update(&node.id.0.to_le_bytes());
+        }
+        for (name, value) in &node.params {
+            hasher.update(&(name.len() as u64).to_le_bytes());
+            hasher.update(name.as_bytes());
+            value.update_hash(|bytes| {
+                hasher.update(bytes);
+            });
         }
         hasher.update(&(upstream_hashes.len() as u64).to_le_bytes());
         for upstream in upstream_hashes {
             hasher.update(upstream.as_bytes());
         }
-        hasher.update(&frame_numerator.to_le_bytes());
-        hasher.update(&frame_denominator.to_le_bytes());
+        // Expressions have already resolved to values, so only an operator that itself reads the
+        // time is keyed by it. Anything else reuses its result across frames while its values and
+        // inputs stay the same.
+        if node_def(&node.op).is_some_and(|def| def.time_dependent) {
+            hasher.update(&frame_numerator.to_le_bytes());
+            hasher.update(&frame_denominator.to_le_bytes());
+        }
         NodeCacheKey(*hasher.finalize().as_bytes())
     }
     pub fn note_published_revision(&self, revision: RevisionId) {
@@ -462,6 +205,27 @@ impl CookCache {
         }
         found
     }
+    /// How many solver ticks have actually been computed, rather than restored or skipped.
+    #[must_use]
+    pub fn zone_ticks_run(&self) -> u64 {
+        self.zone_ticks_run.load(Ordering::Relaxed)
+    }
+
+    /// The latest stored state of a zone at or before `tick`.
+    fn latest_checkpoint(&self, zone: &[u8; 32], tick: u32) -> Option<(u32, Arc<GeoDetail>)> {
+        let checkpoints = self.checkpoints.lock().ok()?;
+        checkpoints
+            .range((*zone, 0)..=(*zone, tick))
+            .next_back()
+            .map(|((_, found), geo)| (*found, Arc::clone(geo)))
+    }
+
+    fn store_checkpoint(&self, zone: &[u8; 32], tick: u32, geo: &Arc<GeoDetail>) {
+        if let Ok(mut checkpoints) = self.checkpoints.lock() {
+            checkpoints.insert((*zone, tick), Arc::clone(geo));
+        }
+    }
+
     #[must_use]
     pub fn node_cache_hits(&self) -> u64 {
         self.node_hits.load(Ordering::Relaxed)
@@ -548,12 +312,199 @@ where
     Ok(Arc::try_unwrap(arc_geo).unwrap_or_else(|shared| (*shared).clone()))
 }
 
-/// Hashes floats with negative zero canonicalized, matching the `.ofxs` text form.
-fn hash_f32s(hasher: &mut blake3::Hasher, values: &[f32]) {
-    for &value in values {
-        let canonical = if value == 0.0 { 0.0 } else { value };
-        hasher.update(&canonical.to_bits().to_le_bytes());
+fn param_f32(node: &Node, name: &str) -> Result<f32, EvalError> {
+    node.f32(name).ok_or(EvalError::InvalidGraph)
+}
+
+fn param_u32(node: &Node, name: &str) -> Result<u32, EvalError> {
+    node.u32(name).ok_or(EvalError::InvalidGraph)
+}
+
+fn param_u64(node: &Node, name: &str) -> Result<u64, EvalError> {
+    node.u64(name).ok_or(EvalError::InvalidGraph)
+}
+
+fn param_bool(node: &Node, name: &str) -> Result<bool, EvalError> {
+    node.boolean(name).ok_or(EvalError::InvalidGraph)
+}
+
+fn param_vec3(node: &Node, name: &str) -> Result<Vec3, EvalError> {
+    node.vec3(name).ok_or(EvalError::InvalidGraph)
+}
+
+fn param_text<'a>(node: &'a Node, name: &str) -> Result<&'a str, EvalError> {
+    node.text(name).ok_or(EvalError::InvalidGraph)
+}
+
+fn param_choice<T, E>(
+    node: &Node,
+    name: &str,
+    from_token: impl Fn(&str) -> Result<T, E>,
+) -> Result<T, EvalError> {
+    from_token(param_text(node, name)?).map_err(|_| EvalError::InvalidGraph)
+}
+
+fn input_slot(node: &Node, slot: usize) -> Result<NodeId, EvalError> {
+    node.inputs
+        .get(slot)
+        .copied()
+        .ok_or(EvalError::InvalidGraph)
+}
+
+/// Frames per second until scenes can state their own.
+const DEFAULT_FPS: f64 = 24.0;
+
+/// What a parameter expression can read while its node resolves.
+struct ParamScope<'a> {
+    frame: f64,
+    node: &'a Node,
+    resolved: &'a BTreeMap<NodeId, Node>,
+    outputs: &'a BTreeMap<NodeId, Arc<GeoDetail>>,
+}
+
+/// A numeric parameter, or one component of a vector parameter when named like `size.x`.
+fn read_channel(node: &Node, name: &str) -> Option<f64> {
+    let (base, component) = match name.split_once('.') {
+        Some((base, component)) => (base, Some(component)),
+        None => (name, None),
+    };
+    match (node.params.get(base)?, component) {
+        (ParamValue::Float(value), None) => Some(f64::from(*value)),
+        (ParamValue::Uint(value), None) => Some(*value as f64),
+        (ParamValue::Bool(value), None) => Some(f64::from(u8::from(*value))),
+        (ParamValue::Vec3(value), Some("x")) => Some(f64::from(value.x)),
+        (ParamValue::Vec3(value), Some("y")) => Some(f64::from(value.y)),
+        (ParamValue::Vec3(value), Some("z")) => Some(f64::from(value.z)),
+        _ => None,
     }
+}
+
+impl Scope for ParamScope<'_> {
+    fn frame(&self) -> f64 {
+        self.frame
+    }
+
+    fn fps(&self) -> f64 {
+        DEFAULT_FPS
+    }
+
+    fn channel(&self, node: Option<u64>, name: &str) -> Option<f64> {
+        match node {
+            // This node's own expression parameters are not resolved yet, so they read as absent.
+            None => read_channel(self.node, name),
+            Some(id) => read_channel(self.resolved.get(&NodeId(id))?, name),
+        }
+    }
+
+    fn input_stat(&self, input: u32, stat: InputStat) -> Option<f64> {
+        let id = self.node.inputs.get(input as usize)?;
+        let geo = self.outputs.get(id)?;
+        let axis_of = |v: Vec3, axis: usize| f64::from([v.x, v.y, v.z][axis]);
+        Some(match stat {
+            InputStat::Points => geo.len() as f64,
+            InputStat::Prims => geo.prim_count() as f64,
+            // Empty geometry has no bounds, and measures as zero rather than failing.
+            InputStat::BoundsMin(axis) => geo.bounds().map_or(0.0, |(low, _)| axis_of(low, axis)),
+            InputStat::BoundsMax(axis) => geo.bounds().map_or(0.0, |(_, high)| axis_of(high, axis)),
+            InputStat::BoundsSize(axis) => geo
+                .bounds()
+                .map_or(0.0, |(low, high)| axis_of(high, axis) - axis_of(low, axis)),
+            InputStat::BoundsCenter(axis) => geo.bounds().map_or(0.0, |(low, high)| {
+                (axis_of(high, axis) + axis_of(low, axis)) * 0.5
+            }),
+        })
+    }
+}
+
+fn evaluate_source(source: &str, scope: &ParamScope<'_>, name: &str) -> Result<f64, EvalError> {
+    let fail = |message: String| EvalError::Param {
+        node: scope.node.id,
+        param: name.to_owned(),
+        message,
+    };
+    Expr::compile(source)
+        .map_err(|error| fail(error.to_string()))?
+        .eval(scope)
+        .map_err(|error| fail(error.to_string()))
+}
+
+/// Replaces every expression with its value at this frame, then applies the operator's constraints
+/// to the result: a formula that strays out of range fails here, naming the node.
+fn resolve_node(node: &Node, scope: &ParamScope<'_>) -> Result<Node, EvalError> {
+    let def = node_def(&node.op).ok_or(EvalError::InvalidGraph)?;
+    let mut resolved = node.clone();
+    let fail = |param: &str, message: &str| EvalError::Param {
+        node: node.id,
+        param: param.to_owned(),
+        message: message.to_owned(),
+    };
+    for param in def.params {
+        let Some(value) = node.params.get(param.name) else {
+            continue;
+        };
+        let replacement = match value {
+            ParamValue::Expr { expr } => {
+                let number = evaluate_source(expr, scope, param.name)?;
+                match param.kind {
+                    ParamKind::F32 => ParamValue::Float(number as f32),
+                    ParamKind::Bool => ParamValue::Bool(number != 0.0),
+                    _ => {
+                        // Integers round, as a frame-driven count would need them to.
+                        let rounded = number.round();
+                        if !(0.0..18_446_744_073_709_551_615.0).contains(&rounded) {
+                            return Err(fail(
+                                param.name,
+                                "the value does not fit an unsigned integer",
+                            ));
+                        }
+                        ParamValue::Uint(rounded as u64)
+                    }
+                }
+            }
+            ParamValue::VecExpr { x, y, z } => ParamValue::Vec3(Vec3 {
+                x: evaluate_source(x, scope, param.name)? as f32,
+                y: evaluate_source(y, scope, param.name)? as f32,
+                z: evaluate_source(z, scope, param.name)? as f32,
+            }),
+            _ => continue,
+        };
+        resolved.params.insert(param.name.to_owned(), replacement);
+    }
+    if node.has_expressions() {
+        def.validate(&resolved).map_err(|error| {
+            fail(
+                "",
+                match error {
+                    SceneError::NonFinite => "a resolved value is not finite",
+                    _ => "a resolved value is outside the range its parameter allows",
+                },
+            )
+        })?;
+    }
+    Ok(resolved)
+}
+
+/// Cooks one node of a runtime-registered operator from its evaluated inputs.
+pub type CookFn = fn(&Node, &[Arc<GeoDetail>], &EvalContext<'_>) -> Result<GeoDetail, EvalError>;
+
+fn cook_table() -> &'static RwLock<BTreeMap<&'static str, CookFn>> {
+    static TABLE: OnceLock<RwLock<BTreeMap<&'static str, CookFn>>> = OnceLock::new();
+    TABLE.get_or_init(|| RwLock::new(BTreeMap::new()))
+}
+
+fn registered_cook(op: &str) -> Option<CookFn> {
+    cook_table().read().ok()?.get(op).copied()
+}
+
+/// Adds an operator at runtime: its definition makes it part of the catalog, validation, and
+/// `.ofxs`, and `cook` evaluates it. This is the seam that external plugins will use.
+pub fn register_operator(def: NodeDef, cook: CookFn) -> Result<(), NodeRegistrationError> {
+    let name = def.type_name;
+    register_node_def(def)?;
+    if let Ok(mut table) = cook_table().write() {
+        table.insert(name, cook);
+    }
+    Ok(())
 }
 
 /// Rejects a generator's requested size before any allocation.
@@ -591,8 +542,10 @@ fn eval_single_node(
     if ctx.cancelled.load(Ordering::Acquire) {
         return Err(EvalError::Cancelled);
     }
-    match node {
-        Node::CreatePoints { count, .. } => {
+    match node.op.as_str() {
+        "create" => {
+            let count = &param_u32(node, "count")?;
+
             if *count > ctx.budget.max_elements {
                 return Err(EvalError::ElementLimit {
                     requested: *count,
@@ -615,13 +568,12 @@ fn eval_single_node(
             }
             Ok(GeoDetail::points(points))
         }
-        Node::CreateGrid {
-            rows,
-            cols,
-            size_x,
-            size_z,
-            ..
-        } => {
+        "grid" => {
+            let rows = &param_u32(node, "rows")?;
+            let cols = &param_u32(node, "cols")?;
+            let size_x = &param_f32(node, "size_x")?;
+            let size_z = &param_f32(node, "size_z")?;
+
             if *rows < 2 || *cols < 2 || !size_x.is_finite() || !size_z.is_finite() {
                 return Err(EvalError::InvalidGraph);
             }
@@ -691,7 +643,9 @@ fn eval_single_node(
                 )
                 .map_err(EvalError::Resource)
         }
-        Node::CreateBox { size, .. } => {
+        "box" => {
+            let size = &param_vec3(node, "size")?;
+
             if size.x <= 0.0 || size.y <= 0.0 || size.z <= 0.0 {
                 return Err(EvalError::InvalidGraph);
             }
@@ -737,7 +691,11 @@ fn eval_single_node(
                 )
                 .map_err(EvalError::Resource)
         }
-        Node::Transform { id, input, offset } => {
+        "transform" => {
+            let id = &node.id;
+            let input = &input_slot(node, 0)?;
+            let offset = &param_vec3(node, "offset")?;
+
             if *id == *input {
                 return Err(EvalError::InvalidGraph);
             }
@@ -749,7 +707,10 @@ fn eval_single_node(
                     other => EvalError::Resource(other),
                 })
         }
-        Node::Normal { id, input } => {
+        "normal" => {
+            let id = &node.id;
+            let input = &input_slot(node, 0)?;
+
             if *id == *input {
                 return Err(EvalError::InvalidGraph);
             }
@@ -761,7 +722,11 @@ fn eval_single_node(
                     other => EvalError::Resource(other),
                 })
         }
-        Node::PointWrangle { id, input, snippet } => {
+        "wrangle" => {
+            let id = &node.id;
+            let input = &input_slot(node, 0)?;
+            let snippet = param_text(node, "snippet")?;
+
             if *id == *input {
                 return Err(EvalError::InvalidGraph);
             }
@@ -781,12 +746,12 @@ fn eval_single_node(
                 other => EvalError::Vex(other),
             })
         }
-        Node::Scatter {
-            id,
-            input,
-            count,
-            seed,
-        } => {
+        "scatter" => {
+            let id = &node.id;
+            let input = &input_slot(node, 0)?;
+            let count = &param_u32(node, "count")?;
+            let seed = &param_u64(node, "seed")?;
+
             if *id == *input {
                 return Err(EvalError::InvalidGraph);
             }
@@ -824,7 +789,50 @@ fn eval_single_node(
             }
             Ok(GeoDetail::points(points))
         }
-        Node::CopyToPoints { id, source, target } => {
+        "pack" => {
+            let input_geo = outputs
+                .get(&input_slot(node, 0)?)
+                .ok_or(EvalError::InvalidGraph)?;
+            finish_sop(GeoDetail::packed_whole(Arc::clone(input_geo)), ctx)
+        }
+        "instance" => {
+            let source = outputs
+                .get(&input_slot(node, 0)?)
+                .ok_or(EvalError::InvalidGraph)?;
+            let target = outputs
+                .get(&input_slot(node, 1)?)
+                .ok_or(EvalError::InvalidGraph)?;
+            // A prototype index and three matrix rows per instance, alongside its point and vertex.
+            let per_instance = std::mem::size_of::<u32>() * 2 + std::mem::size_of::<Vec3>() * 4;
+            if target.len().saturating_mul(per_instance) > ctx.budget.max_memory_bytes {
+                return Err(EvalError::Resource(GeoError::LimitExceeded));
+            }
+            let scales = target.attribute("pscale").and_then(AttributeColumn::as_f32);
+            let scale_of = |point: usize| {
+                scales
+                    .and_then(|column| column.get(point))
+                    .map_or(1.0, |value| value.get())
+            };
+            finish_sop(
+                PackedPrototype::new(Arc::clone(source))
+                    .and_then(|prototype| target.with_instances_on_points(prototype, &scale_of)),
+                ctx,
+            )
+        }
+        "unpack" => {
+            let input_geo = outputs
+                .get(&input_slot(node, 0)?)
+                .ok_or(EvalError::InvalidGraph)?;
+            finish_sop(
+                input_geo.unpacked_cancellable(ctx.budget.max_memory_bytes, ctx.cancelled),
+                ctx,
+            )
+        }
+        "copytopoints" => {
+            let id = &node.id;
+            let source = &input_slot(node, 0)?;
+            let target = &input_slot(node, 1)?;
+
             if *id == *source || *id == *target {
                 return Err(EvalError::InvalidGraph);
             }
@@ -911,7 +919,11 @@ fn eval_single_node(
                     .map_err(EvalError::Resource)
             }
         }
-        Node::Merge { id, left, right } => {
+        "merge" => {
+            let id = &node.id;
+            let left = &input_slot(node, 0)?;
+            let right = &input_slot(node, 1)?;
+
             if *id == *left || *id == *right {
                 return Err(EvalError::InvalidGraph);
             }
@@ -935,11 +947,11 @@ fn eval_single_node(
                     other => EvalError::Resource(other),
                 })
         }
-        Node::Subdivide {
-            id,
-            input,
-            iterations,
-        } => {
+        "subdivide" => {
+            let id = &node.id;
+            let input = &input_slot(node, 0)?;
+            let iterations = &param_u32(node, "iterations")?;
+
             if *id == *input {
                 return Err(EvalError::InvalidGraph);
             }
@@ -960,12 +972,12 @@ fn eval_single_node(
             }
             Ok(out)
         }
-        Node::PolyExtrude {
-            id,
-            input,
-            distance,
-            inset,
-        } => {
+        "extrude" => {
+            let id = &node.id;
+            let input = &input_slot(node, 0)?;
+            let distance = &param_f32(node, "distance")?;
+            let inset = &param_f32(node, "inset")?;
+
             if *id == *input {
                 return Err(EvalError::InvalidGraph);
             }
@@ -991,14 +1003,14 @@ fn eval_single_node(
             }
             Ok(out)
         }
-        Node::AttribPromote {
-            id,
-            input,
-            name,
-            from_domain,
-            to_domain,
-            mode,
-        } => {
+        "attribpromote" => {
+            let id = &node.id;
+            let input = &input_slot(node, 0)?;
+            let name = param_text(node, "name")?;
+            let from_domain = &param_choice(node, "from_domain", AttrDomain::from_token)?;
+            let to_domain = &param_choice(node, "to_domain", AttrDomain::from_token)?;
+            let mode = &param_choice(node, "mode", PromoteMode::from_token)?;
+
             if *id == *input {
                 return Err(EvalError::InvalidGraph);
             }
@@ -1023,12 +1035,12 @@ fn eval_single_node(
                 )
                 .map_err(EvalError::Resource)
         }
-        Node::Blast {
-            id,
-            input,
-            group_name,
-            negate,
-        } => {
+        "blast" => {
+            let id = &node.id;
+            let input = &input_slot(node, 0)?;
+            let group_name = param_text(node, "group_name")?;
+            let negate = &param_bool(node, "negate")?;
+
             if *id == *input {
                 return Err(EvalError::InvalidGraph);
             }
@@ -1045,7 +1057,11 @@ fn eval_single_node(
                     other => EvalError::Resource(other),
                 })
         }
-        Node::UvProject { id, input, mode } => {
+        "uvproject" => {
+            let id = &node.id;
+            let input = &input_slot(node, 0)?;
+            let mode = &param_choice(node, "mode", UvProjectMode::from_token)?;
+
             if *id == *input {
                 return Err(EvalError::InvalidGraph);
             }
@@ -1065,13 +1081,12 @@ fn eval_single_node(
                     other => EvalError::Resource(other),
                 })
         }
-        Node::HeightField {
-            rows,
-            cols,
-            size_x,
-            size_z,
-            ..
-        } => {
+        "heightfield" => {
+            let rows = &param_u32(node, "rows")?;
+            let cols = &param_u32(node, "cols")?;
+            let size_x = &param_f32(node, "size_x")?;
+            let size_z = &param_f32(node, "size_z")?;
+
             if *rows < 2 || *cols < 2 || !size_x.is_finite() || !size_z.is_finite() {
                 return Err(EvalError::InvalidGraph);
             }
@@ -1092,14 +1107,14 @@ fn eval_single_node(
                     other => EvalError::Resource(other),
                 })
         }
-        Node::HeightFieldNoise {
-            id,
-            input,
-            amplitude,
-            frequency,
-            octaves,
-            seed,
-        } => {
+        "hf_noise" => {
+            let id = &node.id;
+            let input = &input_slot(node, 0)?;
+            let amplitude = &param_f32(node, "amplitude")?;
+            let frequency = &param_f32(node, "frequency")?;
+            let octaves = &param_u32(node, "octaves")?;
+            let seed = &param_u64(node, "seed")?;
+
             if *id == *input {
                 return Err(EvalError::InvalidGraph);
             }
@@ -1133,14 +1148,14 @@ fn eval_single_node(
                     other => EvalError::Resource(other),
                 })
         }
-        Node::HeightFieldErode {
-            id,
-            input,
-            iterations,
-            rain_rate,
-            talus_angle,
-            seed,
-        } => {
+        "hf_erode" => {
+            let id = &node.id;
+            let input = &input_slot(node, 0)?;
+            let iterations = &param_u32(node, "iterations")?;
+            let rain_rate = &param_f32(node, "rain_rate")?;
+            let talus_angle = &param_f32(node, "talus_angle")?;
+            let seed = &param_u64(node, "seed")?;
+
             if *id == *input {
                 return Err(EvalError::InvalidGraph);
             }
@@ -1174,11 +1189,11 @@ fn eval_single_node(
                     other => EvalError::Resource(other),
                 })
         }
-        Node::VdbFromPolygons {
-            id,
-            input,
-            voxel_size,
-        } => {
+        "vdb_from_polygons" => {
+            let id = &node.id;
+            let input = &input_slot(node, 0)?;
+            let voxel_size = &param_f32(node, "voxel_size")?;
+
             if *id == *input {
                 return Err(EvalError::InvalidGraph);
             }
@@ -1210,12 +1225,12 @@ fn eval_single_node(
             }
             Ok(out)
         }
-        Node::VdbReshape {
-            id,
-            input,
-            offset,
-            smooth_iterations,
-        } => {
+        "vdb_reshape" => {
+            let id = &node.id;
+            let input = &input_slot(node, 0)?;
+            let offset = &param_f32(node, "offset")?;
+            let smooth_iterations = &param_u32(node, "smooth_iterations")?;
+
             if *id == *input {
                 return Err(EvalError::InvalidGraph);
             }
@@ -1247,7 +1262,10 @@ fn eval_single_node(
                     other => EvalError::Resource(other),
                 })
         }
-        Node::ConvertVdb { id, input } => {
+        "convert_vdb" => {
+            let id = &node.id;
+            let input = &input_slot(node, 0)?;
+
             if *id == *input {
                 return Err(EvalError::InvalidGraph);
             }
@@ -1277,13 +1295,13 @@ fn eval_single_node(
             }
             Ok(out)
         }
-        Node::Boolean {
-            id,
-            left,
-            right,
-            mode,
-            voxel_size,
-        } => {
+        "boolean" => {
+            let id = &node.id;
+            let left = &input_slot(node, 0)?;
+            let right = &input_slot(node, 1)?;
+            let mode = &param_choice(node, "mode", BooleanMode::from_token)?;
+            let voxel_size = &param_f32(node, "voxel_size")?;
+
             if *id == *left || *id == *right {
                 return Err(EvalError::InvalidGraph);
             }
@@ -1316,20 +1334,37 @@ fn eval_single_node(
             }
             Ok(out)
         }
-        Node::CreateSphere {
-            radius, rows, cols, ..
-        } => {
+        "asset" => {
+            let content_hash = param_text(node, "content_hash")?;
+
+            let geo = ctx.assets.resolve(content_hash).map_err(EvalError::Asset)?;
+            let bytes = geo
+                .len()
+                .saturating_mul(std::mem::size_of::<Vec3>())
+                .saturating_add(
+                    geo.vertex_count()
+                        .saturating_mul(std::mem::size_of::<u32>()),
+                );
+            if bytes > ctx.budget.max_memory_bytes {
+                return Err(EvalError::Resource(GeoError::LimitExceeded));
+            }
+            finish_sop(Ok((*geo).clone()), ctx)
+        }
+        "sphere" => {
+            let radius = &param_f32(node, "radius")?;
+            let rows = &param_u32(node, "rows")?;
+            let cols = &param_u32(node, "cols")?;
+
             check_element_estimate(rows.saturating_mul(*cols), ctx)?;
             let sop = SopContext::new(ctx.budget.max_memory_bytes, ctx.cancelled);
             finish_sop(create_sphere(f64::from(*radius), *rows, *cols, &sop), ctx)
         }
-        Node::CreateTube {
-            radius,
-            height,
-            rows,
-            cols,
-            ..
-        } => {
+        "tube" => {
+            let radius = &param_f32(node, "radius")?;
+            let height = &param_f32(node, "height")?;
+            let rows = &param_u32(node, "rows")?;
+            let cols = &param_u32(node, "cols")?;
+
             check_element_estimate(rows.saturating_add(1).saturating_mul(*cols), ctx)?;
             let sop = SopContext::new(ctx.budget.max_memory_bytes, ctx.cancelled);
             finish_sop(
@@ -1337,13 +1372,12 @@ fn eval_single_node(
                 ctx,
             )
         }
-        Node::CreateTorus {
-            major_radius,
-            minor_radius,
-            rows,
-            cols,
-            ..
-        } => {
+        "torus" => {
+            let major_radius = &param_f32(node, "major_radius")?;
+            let minor_radius = &param_f32(node, "minor_radius")?;
+            let rows = &param_u32(node, "rows")?;
+            let cols = &param_u32(node, "cols")?;
+
             check_element_estimate(rows.saturating_mul(*cols), ctx)?;
             let sop = SopContext::new(ctx.budget.max_memory_bytes, ctx.cancelled);
             finish_sop(
@@ -1357,20 +1391,21 @@ fn eval_single_node(
                 ctx,
             )
         }
-        Node::CreateLine {
-            start, end, points, ..
-        } => {
+        "line" => {
+            let start = &param_vec3(node, "start")?;
+            let end = &param_vec3(node, "end")?;
+            let points = &param_u32(node, "points")?;
+
             check_element_estimate(*points, ctx)?;
             let sop = SopContext::new(ctx.budget.max_memory_bytes, ctx.cancelled);
             finish_sop(create_line(*start, *end, *points, &sop), ctx)
         }
-        Node::Xform {
-            input,
-            translate,
-            rotate_degrees,
-            scale,
-            ..
-        } => {
+        "xform" => {
+            let input = &input_slot(node, 0)?;
+            let translate = &param_vec3(node, "translate")?;
+            let rotate_degrees = &param_vec3(node, "rotate_degrees")?;
+            let scale = &param_vec3(node, "scale")?;
+
             let input_geo = outputs.get(input).ok_or(EvalError::InvalidGraph)?;
             let sop = SopContext::new(ctx.budget.max_memory_bytes, ctx.cancelled);
             finish_sop(
@@ -1386,28 +1421,32 @@ fn eval_single_node(
                 ctx,
             )
         }
-        Node::Reverse { input, .. } => {
+        "reverse" => {
+            let input = &input_slot(node, 0)?;
+
             let input_geo = outputs.get(input).ok_or(EvalError::InvalidGraph)?;
             let sop = SopContext::new(ctx.budget.max_memory_bytes, ctx.cancelled);
             finish_sop(reverse_winding(input_geo, &sop), ctx)
         }
-        Node::Triangulate { input, .. } => {
+        "triangulate" => {
+            let input = &input_slot(node, 0)?;
+
             let input_geo = outputs.get(input).ok_or(EvalError::InvalidGraph)?;
             let sop = SopContext::new(ctx.budget.max_memory_bytes, ctx.cancelled);
             finish_sop(triangulate(input_geo, &sop), ctx)
         }
-        Node::Fuse {
-            input, distance, ..
-        } => {
+        "fuse" => {
+            let input = &input_slot(node, 0)?;
+            let distance = &param_f32(node, "distance")?;
+
             let input_geo = outputs.get(input).ok_or(EvalError::InvalidGraph)?;
             let sop = SopContext::new(ctx.budget.max_memory_bytes, ctx.cancelled);
             finish_sop(fuse_points(input_geo, f64::from(*distance), &sop), ctx)
         }
-        Node::Resample {
-            input,
-            segment_length,
-            ..
-        } => {
+        "resample" => {
+            let input = &input_slot(node, 0)?;
+            let segment_length = &param_f32(node, "segment_length")?;
+
             let input_geo = outputs.get(input).ok_or(EvalError::InvalidGraph)?;
             let sop = SopContext::new(ctx.budget.max_memory_bytes, ctx.cancelled);
             finish_sop(
@@ -1415,13 +1454,12 @@ fn eval_single_node(
                 ctx,
             )
         }
-        Node::Sweep {
-            input,
-            radius,
-            sides,
-            capped,
-            ..
-        } => {
+        "sweep" => {
+            let input = &input_slot(node, 0)?;
+            let radius = &param_f32(node, "radius")?;
+            let sides = &param_u32(node, "sides")?;
+            let capped = &param_bool(node, "capped")?;
+
             let input_geo = outputs.get(input).ok_or(EvalError::InvalidGraph)?;
             let sop = SopContext::new(ctx.budget.max_memory_bytes, ctx.cancelled);
             finish_sop(
@@ -1429,13 +1467,12 @@ fn eval_single_node(
                 ctx,
             )
         }
-        Node::AttribTransfer {
-            input,
-            source,
-            name,
-            radius,
-            ..
-        } => {
+        "attribtransfer" => {
+            let input = &input_slot(node, 0)?;
+            let source = &input_slot(node, 1)?;
+            let name = param_text(node, "name")?;
+            let radius = &param_f32(node, "radius")?;
+
             let input_geo = outputs.get(input).ok_or(EvalError::InvalidGraph)?;
             let source_geo = outputs.get(source).ok_or(EvalError::InvalidGraph)?;
             let sop = SopContext::new(ctx.budget.max_memory_bytes, ctx.cancelled);
@@ -1444,17 +1481,18 @@ fn eval_single_node(
                 ctx,
             )
         }
-        Node::Measure { input, .. } => {
+        "measure" => {
+            let input = &input_slot(node, 0)?;
+
             let input_geo = outputs.get(input).ok_or(EvalError::InvalidGraph)?;
             let sop = SopContext::new(ctx.budget.max_memory_bytes, ctx.cancelled);
             finish_sop(measure(input_geo, &sop), ctx)
         }
-        Node::PolyBevel {
-            input,
-            distance,
-            min_angle_degrees,
-            ..
-        } => {
+        "polybevel" => {
+            let input = &input_slot(node, 0)?;
+            let distance = &param_f32(node, "distance")?;
+            let min_angle_degrees = &param_f32(node, "min_angle_degrees")?;
+
             let input_geo = outputs.get(input).ok_or(EvalError::InvalidGraph)?;
             let sop = SopContext::new(ctx.budget.max_memory_bytes, ctx.cancelled);
             finish_sop(
@@ -1467,22 +1505,20 @@ fn eval_single_node(
                 ctx,
             )
         }
-        Node::PolyReduce {
-            input,
-            target_ratio,
-            ..
-        } => {
+        "polyreduce" => {
+            let input = &input_slot(node, 0)?;
+            let target_ratio = &param_f32(node, "target_ratio")?;
+
             let input_geo = outputs.get(input).ok_or(EvalError::InvalidGraph)?;
             let sop = SopContext::new(ctx.budget.max_memory_bytes, ctx.cancelled);
             finish_sop(poly_reduce(input_geo, f64::from(*target_ratio), &sop), ctx)
         }
-        Node::Remesh {
-            input,
-            target_length,
-            iterations,
-            feature_angle_degrees,
-            ..
-        } => {
+        "remesh" => {
+            let input = &input_slot(node, 0)?;
+            let target_length = &param_f32(node, "target_length")?;
+            let iterations = &param_u32(node, "iterations")?;
+            let feature_angle_degrees = &param_f32(node, "feature_angle_degrees")?;
+
             let input_geo = outputs.get(input).ok_or(EvalError::InvalidGraph)?;
             let sop = SopContext::new(ctx.budget.max_memory_bytes, ctx.cancelled);
             finish_sop(
@@ -1498,13 +1534,12 @@ fn eval_single_node(
                 ctx,
             )
         }
-        Node::Clip {
-            input,
-            origin,
-            normal,
-            cap,
-            ..
-        } => {
+        "clip" => {
+            let input = &input_slot(node, 0)?;
+            let origin = &param_vec3(node, "origin")?;
+            let normal = &param_vec3(node, "normal")?;
+            let cap = &param_bool(node, "cap")?;
+
             let input_geo = outputs.get(input).ok_or(EvalError::InvalidGraph)?;
             let sop = SopContext::new(ctx.budget.max_memory_bytes, ctx.cancelled);
             finish_sop(
@@ -1526,19 +1561,21 @@ fn eval_single_node(
                 ctx,
             )
         }
-        Node::VoronoiFracture { input, seeds, .. } => {
+        "voronoifracture" => {
+            let input = &input_slot(node, 0)?;
+            let seeds = &input_slot(node, 1)?;
+
             let input_geo = outputs.get(input).ok_or(EvalError::InvalidGraph)?;
             let seeds_geo = outputs.get(seeds).ok_or(EvalError::InvalidGraph)?;
             let sop = SopContext::new(ctx.budget.max_memory_bytes, ctx.cancelled);
             finish_sop(voronoi_fracture(input_geo, seeds_geo, &sop), ctx)
         }
-        Node::ScatterSurface {
-            input,
-            count,
-            seed,
-            min_distance,
-            ..
-        } => {
+        "scatter_surface" => {
+            let input = &input_slot(node, 0)?;
+            let count = &param_u32(node, "count")?;
+            let seed = &param_u64(node, "seed")?;
+            let min_distance = &param_f32(node, "min_distance")?;
+
             check_element_estimate(*count, ctx)?;
             let input_geo = outputs.get(input).ok_or(EvalError::InvalidGraph)?;
             let sop = SopContext::new(ctx.budget.max_memory_bytes, ctx.cancelled);
@@ -1555,11 +1592,10 @@ fn eval_single_node(
                 ctx,
             )
         }
-        Node::UvFlatten {
-            input,
-            seam_angle_degrees,
-            ..
-        } => {
+        "uvflatten" => {
+            let input = &input_slot(node, 0)?;
+            let seam_angle_degrees = &param_f32(node, "seam_angle_degrees")?;
+
             let input_geo = outputs.get(input).ok_or(EvalError::InvalidGraph)?;
             let sop = SopContext::new(ctx.budget.max_memory_bytes, ctx.cancelled);
             finish_sop(
@@ -1567,24 +1603,22 @@ fn eval_single_node(
                 ctx,
             )
         }
-        Node::UvLayout {
-            input,
-            padding,
-            tiles,
-            ..
-        } => {
+        "uvlayout" => {
+            let input = &input_slot(node, 0)?;
+            let padding = &param_f32(node, "padding")?;
+            let tiles = &param_u32(node, "tiles")?;
+
             let input_geo = outputs.get(input).ok_or(EvalError::InvalidGraph)?;
             let sop = SopContext::new(ctx.budget.max_memory_bytes, ctx.cancelled);
             finish_sop(uv_layout(input_geo, f64::from(*padding), *tiles, &sop), ctx)
         }
-        Node::GroupBounds {
-            input,
-            group_name,
-            domain,
-            min,
-            max,
-            ..
-        } => {
+        "group_bounds" => {
+            let input = &input_slot(node, 0)?;
+            let group_name = param_text(node, "group_name")?;
+            let domain = &param_choice(node, "domain", AttrDomain::from_token)?;
+            let min = &param_vec3(node, "min")?;
+            let max = &param_vec3(node, "max")?;
+
             let input_geo = outputs.get(input).ok_or(EvalError::InvalidGraph)?;
             let group_domain = match domain {
                 AttrDomain::Point => GroupDomain::Point,
@@ -1592,10 +1626,301 @@ fn eval_single_node(
                 AttrDomain::Detail => return Err(EvalError::InvalidGraph),
             };
             finish_sop(
-                input_geo.group_by_bounds(group_domain, group_name.as_str(), *min, *max),
+                input_geo.group_by_bounds(group_domain, group_name, *min, *max),
                 ctx,
             )
         }
+        other => {
+            let cook = registered_cook(other).ok_or(EvalError::InvalidGraph)?;
+            let mut inputs = Vec::with_capacity(node.inputs.len());
+            for id in &node.inputs {
+                inputs.push(Arc::clone(outputs.get(id).ok_or(EvalError::InvalidGraph)?));
+            }
+            cook(node, &inputs, ctx)
+        }
+    }
+}
+
+/// How often a solver stores its state. Seeking replays at most this many ticks minus one.
+const CHECKPOINT_INTERVAL: u32 = 8;
+
+/// One evaluation of a scene at one point in time.
+struct Pass<'a> {
+    snapshot: &'a GraphSnapshot,
+    cache: Option<&'a CookCache>,
+    frame_numerator: i64,
+    frame_denominator: u32,
+    ctx: &'a EvalContext<'a>,
+}
+
+impl Pass<'_> {
+    /// Cooks one resolved node, through the content-addressed cache when there is one.
+    fn cook_node(
+        &self,
+        node: &Node,
+        outputs: &BTreeMap<NodeId, Arc<GeoDetail>>,
+    ) -> Result<Arc<GeoDetail>, EvalError> {
+        // An operator that does not understand instances must not expand or lose them unasked.
+        if !node_def(&node.op).is_some_and(|def| def.accepts_packed) {
+            for id in &node.inputs {
+                if outputs.get(id).is_some_and(|geo| geo.packed_count() > 0) {
+                    return Err(EvalError::Param {
+                        node: node.id,
+                        param: "input".to_owned(),
+                        message: format!(
+                            "`{}` does not accept packed instances: use `unpack` first",
+                            node.op
+                        ),
+                    });
+                }
+            }
+        }
+        let (numerator, denominator) = (self.frame_numerator, self.frame_denominator);
+        let Some(cook_cache) = self.cache else {
+            return Ok(Arc::new(eval_single_node(
+                node,
+                outputs,
+                numerator,
+                denominator,
+                self.ctx,
+            )?));
+        };
+        let mut upstream_hashes = Vec::new();
+        for input_id in node.inputs() {
+            let upstream_geo = outputs.get(&input_id).ok_or(EvalError::InvalidGraph)?;
+            upstream_hashes.push(upstream_geo.hash());
+        }
+        let key = CookCache::node_key(node, &upstream_hashes, numerator, denominator);
+        if let Some(cached) = cook_cache.get_node(&key) {
+            return Ok(cached);
+        }
+        let evaluated = Arc::new(eval_single_node(
+            node,
+            outputs,
+            numerator,
+            denominator,
+            self.ctx,
+        )?);
+        let _ =
+            cook_cache.insert_node_if_fresh(key, self.snapshot.revision, Arc::clone(&evaluated));
+        Ok(evaluated)
+    }
+
+    /// The same pass, but with `$F` and operators that read time seeing `tick` instead.
+    const fn at_tick(&self, tick: i64) -> Pass<'_> {
+        Pass {
+            snapshot: self.snapshot,
+            cache: self.cache,
+            frame_numerator: tick,
+            frame_denominator: 1,
+            ctx: self.ctx,
+        }
+    }
+
+    /// Runs a zone's body once from `state`, in a scratch copy of the evaluated nodes, so that no
+    /// value from inside the body leaks into the rest of the scene.
+    fn run_body(
+        &self,
+        zone: &StateZone,
+        state: &Arc<GeoDetail>,
+        tick: i64,
+        outputs: &BTreeMap<NodeId, Arc<GeoDetail>>,
+        resolved: &BTreeMap<NodeId, Node>,
+    ) -> Result<Arc<GeoDetail>, EvalError> {
+        let pass = self.at_tick(tick);
+        let mut local = outputs.clone();
+        let mut local_resolved = resolved.clone();
+        for id in &zone.body {
+            let node = self
+                .snapshot
+                .nodes
+                .iter()
+                .find(|node| node.id == *id)
+                .ok_or(EvalError::InvalidGraph)?;
+            if zone.entries.contains(id) {
+                local.insert(*id, Arc::clone(state));
+                local_resolved.insert(*id, node.clone());
+                continue;
+            }
+            if self.ctx.cancelled.load(Ordering::Acquire) {
+                return Err(EvalError::Cancelled);
+            }
+            let scope = ParamScope {
+                frame: tick as f64,
+                node,
+                resolved: &local_resolved,
+                outputs: &local,
+            };
+            let ready = resolve_node(node, &scope)?;
+            let geo = pass.cook_node(&ready, &local)?;
+            local.insert(*id, geo);
+            local_resolved.insert(*id, ready);
+        }
+        local
+            .get(&zone.output)
+            .cloned()
+            .ok_or(EvalError::InvalidGraph)
+    }
+
+    /// Identifies a zone's computation: its body as written, and everything the body reads from
+    /// outside, by content. Equal keys mean equal state at every tick.
+    fn zone_key(
+        &self,
+        zone: &StateZone,
+        initial: &GeoDetail,
+        outputs: &BTreeMap<NodeId, Arc<GeoDetail>>,
+        resolved: &BTreeMap<NodeId, Node>,
+    ) -> Result<[u8; 32], EvalError> {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(b"pcc-eval-zone-v1");
+        hasher.update(initial.hash().as_bytes());
+        for id in &zone.body {
+            let node = self
+                .snapshot
+                .nodes
+                .iter()
+                .find(|node| node.id == *id)
+                .ok_or(EvalError::InvalidGraph)?;
+            hasher.update(node.canonical_line().as_bytes());
+            for dependency in node.dependencies() {
+                if zone.body.contains(&dependency) {
+                    continue;
+                }
+                if let Some(geo) = outputs.get(&dependency) {
+                    hasher.update(geo.hash().as_bytes());
+                }
+                if let Some(outside) = resolved.get(&dependency) {
+                    hasher.update(outside.canonical_line().as_bytes());
+                }
+            }
+        }
+        Ok(*hasher.finalize().as_bytes())
+    }
+
+    /// Merging has no element budget of its own, so foreach checks its running total.
+    fn check_merged(&self, state: &GeoDetail) -> Result<(), EvalError> {
+        let elements = u32::try_from(state.len()).unwrap_or(u32::MAX);
+        check_element_estimate(elements, self.ctx)?;
+        let bytes = state
+            .len()
+            .saturating_mul(std::mem::size_of::<Vec3>())
+            .saturating_add(
+                state
+                    .vertex_count()
+                    .saturating_mul(std::mem::size_of::<u32>()),
+            );
+        if bytes > self.ctx.budget.max_memory_bytes {
+            return Err(EvalError::Resource(GeoError::LimitExceeded));
+        }
+        Ok(())
+    }
+
+    /// Runs a solver: restores the latest checkpoint at or before the requested tick, then replays
+    /// fixed ticks to it. Each tick reads only the state committed by the one before.
+    fn run_solver(
+        &self,
+        zone: &StateZone,
+        node: &Node,
+        outputs: &BTreeMap<NodeId, Arc<GeoDetail>>,
+        resolved: &BTreeMap<NodeId, Node>,
+    ) -> Result<Arc<GeoDetail>, EvalError> {
+        let ticks = param_u32(node, "ticks")?;
+        let limit = self.ctx.budget.max_state_ticks;
+        if ticks > limit {
+            return Err(EvalError::StateTickLimit {
+                requested: ticks,
+                limit,
+            });
+        }
+        let initial = outputs.get(&zone.source).ok_or(EvalError::InvalidGraph)?;
+        let key = self.zone_key(zone, initial, outputs, resolved)?;
+        let restored = self
+            .cache
+            .and_then(|cache| cache.latest_checkpoint(&key, ticks));
+        let (done, mut state) = restored.unwrap_or_else(|| (0, Arc::clone(initial)));
+        for tick in done..ticks {
+            let tick = tick + 1;
+            // Each operator in the body enforces the budget on what it produces.
+            state = self.run_body(zone, &state, i64::from(tick), outputs, resolved)?;
+            if let Some(cache) = self.cache {
+                cache.zone_ticks_run.fetch_add(1, Ordering::Relaxed);
+                if tick.is_multiple_of(CHECKPOINT_INTERVAL) || tick == ticks {
+                    cache.store_checkpoint(&key, tick, &state);
+                }
+            }
+        }
+        Ok(state)
+    }
+
+    /// Runs a foreach: pieces are primitives with equal attribute values, in ascending order of
+    /// that value, so the result does not depend on how the input happens to be ordered.
+    fn run_foreach(
+        &self,
+        zone: &StateZone,
+        node: &Node,
+        outputs: &BTreeMap<NodeId, Arc<GeoDetail>>,
+        resolved: &BTreeMap<NodeId, Node>,
+    ) -> Result<Arc<GeoDetail>, EvalError> {
+        const PIECE_GROUP: &str = "pcc_foreach_piece";
+        let name = param_text(node, "attribute")?;
+        let input = outputs.get(&zone.source).ok_or(EvalError::InvalidGraph)?;
+        let fail = |message: &str| EvalError::Param {
+            node: node.id,
+            param: "attribute".to_owned(),
+            message: message.to_owned(),
+        };
+        let column = input
+            .domain_attribute(GeoAttrDomain::Prim, name)
+            .ok_or_else(|| fail("the input has no such primitive attribute"))?;
+        let values: Vec<i64> = match column {
+            AttributeColumn::I32(values) => (0..values.len())
+                .map(|i| values.get(i).map_or(0, i64::from))
+                .collect(),
+            AttributeColumn::U32(values) => (0..values.len())
+                .map(|i| values.get(i).map_or(0, i64::from))
+                .collect(),
+            _ => return Err(fail("the attribute must be an integer")),
+        };
+        let mut pieces: BTreeMap<i64, Vec<usize>> = BTreeMap::new();
+        for (prim, value) in values.into_iter().enumerate() {
+            pieces.entry(value).or_default().push(prim);
+        }
+        let limit = self.ctx.budget.max_state_ticks;
+        let count = u32::try_from(pieces.len()).unwrap_or(u32::MAX);
+        if count > limit {
+            return Err(EvalError::StateTickLimit {
+                requested: count,
+                limit,
+            });
+        }
+        let memory = self.ctx.budget.max_memory_bytes;
+        let resource = |error: GeoError| match error {
+            GeoError::Cancelled => EvalError::Cancelled,
+            other => EvalError::Resource(other),
+        };
+        let mut merged: Option<GeoDetail> = None;
+        for (ordinal, prims) in pieces.values().enumerate() {
+            let piece = input
+                .with_group(GroupDomain::Prim, PIECE_GROUP, prims)
+                .and_then(|grouped| {
+                    grouped.blast_group_cancellable(PIECE_GROUP, true, memory, self.ctx.cancelled)
+                })
+                .map_err(resource)?;
+            let result =
+                self.run_body(zone, &Arc::new(piece), ordinal as i64, outputs, resolved)?;
+            merged = Some(match merged {
+                None => (*result).clone(),
+                Some(sofar) => sofar
+                    .merged_cancellable(&result, memory, self.ctx.cancelled)
+                    .map_err(resource)?,
+            });
+            if let Some(sofar) = &merged {
+                self.check_merged(sofar)?;
+            }
+        }
+        Ok(Arc::new(
+            merged.unwrap_or_else(|| GeoDetail::points(Vec::new())),
+        ))
     }
 }
 
@@ -1617,53 +1942,69 @@ where
     {
         return Err(EvalError::NodeNotFound(target));
     }
+    let zones = snapshot.zones().map_err(|_| EvalError::InvalidGraph)?;
+    let pass = Pass {
+        snapshot,
+        cache,
+        frame_numerator,
+        frame_denominator,
+        ctx,
+    };
     let total_steps = snapshot.nodes.len() as u32;
     on_progress(0, total_steps);
     let mut outputs: BTreeMap<NodeId, Arc<GeoDetail>> = BTreeMap::new();
+    let mut resolved_nodes: BTreeMap<NodeId, Node> = BTreeMap::new();
     let mut last_output: Option<Arc<GeoDetail>> = None;
+    let frame = frame_numerator as f64 / f64::from(frame_denominator.max(1));
 
     for (step_idx, node) in snapshot.nodes.iter().enumerate() {
         if ctx.cancelled.load(Ordering::Acquire) {
             return Err(EvalError::Cancelled);
         }
-        let node_geo = if let Some(cook_cache) = cache {
-            let mut upstream_hashes = Vec::new();
-            for input_id in node.inputs() {
-                let upstream_geo = outputs.get(&input_id).ok_or(EvalError::InvalidGraph)?;
-                upstream_hashes.push(upstream_geo.hash());
+        let done = (step_idx + 1) as u32;
+        let enclosing = zones.iter().find(|zone| zone.body.contains(&node.id));
+        if let Some(zone) = enclosing {
+            // A body only runs from its owner, unless a node inside it is what was asked for. Then
+            // it shows the first evaluation: the source geometry as its state.
+            let wanted = target_node.is_some_and(|target| zone.body.contains(&target));
+            if !wanted {
+                on_progress(done, total_steps);
+                continue;
             }
-            let nkey =
-                CookCache::node_key(node, &upstream_hashes, frame_numerator, frame_denominator);
-            if let Some(cached) = cook_cache.get_node(&nkey) {
-                cached
-            } else {
-                let evaluated = Arc::new(eval_single_node(
-                    node,
-                    &outputs,
-                    frame_numerator,
-                    frame_denominator,
-                    ctx,
-                )?);
-                let _ = cook_cache.insert_node_if_fresh(
-                    nkey,
-                    snapshot.revision,
-                    Arc::clone(&evaluated),
-                );
-                evaluated
+            if zone.entries.contains(&node.id) {
+                let source = outputs.get(&zone.source).ok_or(EvalError::InvalidGraph)?;
+                let source = Arc::clone(source);
+                resolved_nodes.insert(node.id, node.clone());
+                outputs.insert(node.id, Arc::clone(&source));
+                on_progress(done, total_steps);
+                if target_node == Some(node.id) {
+                    return Ok(source);
+                }
+                continue;
             }
-        } else {
-            Arc::new(eval_single_node(
+        }
+        let ready = &resolve_node(
+            node,
+            &ParamScope {
+                frame,
                 node,
-                &outputs,
-                frame_numerator,
-                frame_denominator,
-                ctx,
-            )?)
+                resolved: &resolved_nodes,
+                outputs: &outputs,
+            },
+        )?;
+        let owned = zones.iter().find(|zone| zone.owner == node.id);
+        let node_geo = match owned {
+            Some(zone) if zone.kind == ZoneKind::Solver => {
+                pass.run_solver(zone, ready, &outputs, &resolved_nodes)?
+            }
+            Some(zone) => pass.run_foreach(zone, ready, &outputs, &resolved_nodes)?,
+            None => pass.cook_node(ready, &outputs)?,
         };
         let nid = node.id();
+        resolved_nodes.insert(nid, ready.clone());
         outputs.insert(nid, Arc::clone(&node_geo));
         last_output = Some(Arc::clone(&node_geo));
-        on_progress((step_idx + 1) as u32, total_steps);
+        on_progress(done, total_steps);
         if target_node == Some(nid) {
             return Ok(node_geo);
         }
@@ -1744,8 +2085,10 @@ mod tests {
         let c = AtomicBool::new(false);
         let g = GraphSnapshot::demo(100, Vec3::checked(1., 2., 3.).unwrap_or(Vec3::ZERO));
         let x = EvalContext {
+            assets: &NoAssets,
             cancelled: &c,
             budget: CookBudget {
+                max_state_ticks: DEFAULT_MAX_STATE_TICKS,
                 max_memory_bytes: 1 << 20,
                 max_elements: 1_000,
             },
@@ -1759,8 +2102,10 @@ mod tests {
     fn cancellation_is_observed() {
         let c = AtomicBool::new(true);
         let x = EvalContext {
+            assets: &NoAssets,
             cancelled: &c,
             budget: CookBudget {
+                max_state_ticks: DEFAULT_MAX_STATE_TICKS,
                 max_memory_bytes: 1 << 20,
                 max_elements: 1_000,
             },
@@ -1774,8 +2119,10 @@ mod tests {
     fn cache_key_includes_frame_and_reuses_value() {
         let cancelled = AtomicBool::new(false);
         let context = EvalContext {
+            assets: &NoAssets,
             cancelled: &cancelled,
             budget: CookBudget {
+                max_state_ticks: DEFAULT_MAX_STATE_TICKS,
                 max_memory_bytes: 1 << 20,
                 max_elements: 1_000,
             },
@@ -1810,8 +2157,10 @@ mod tests {
     fn cook_validates_graph_topology_and_supports_distinct_node_ids() {
         let cancelled = AtomicBool::new(false);
         let ctx = EvalContext {
+            assets: &NoAssets,
             cancelled: &cancelled,
             budget: CookBudget {
+                max_state_ticks: DEFAULT_MAX_STATE_TICKS,
                 max_memory_bytes: 1 << 20,
                 max_elements: 1_000,
             },
@@ -1819,15 +2168,10 @@ mod tests {
         let valid_custom_ids = GraphSnapshot {
             revision: RevisionId(3),
             nodes: vec![
-                Node::CreatePoints {
-                    id: pcc_id::NodeId(5),
-                    count: 4,
-                },
-                Node::Transform {
-                    id: pcc_id::NodeId(9),
-                    input: pcc_id::NodeId(5),
-                    offset: Vec3::checked(2.0, 0.0, 0.0).unwrap_or(Vec3::ZERO),
-                },
+                Node::new("create", pcc_id::NodeId(5)).with_u32("count", 4),
+                Node::new("transform", pcc_id::NodeId(9))
+                    .with_input(pcc_id::NodeId(5))
+                    .with_vec3("offset", Vec3::checked(2.0, 0.0, 0.0).unwrap_or(Vec3::ZERO)),
             ],
         };
         assert_eq!(cook(&valid_custom_ids, &ctx).map(|g| g.len()), Ok(4));
@@ -1835,15 +2179,10 @@ mod tests {
         let invalid_self_loop = GraphSnapshot {
             revision: RevisionId(3),
             nodes: vec![
-                Node::CreatePoints {
-                    id: pcc_id::NodeId(5),
-                    count: 4,
-                },
-                Node::Transform {
-                    id: pcc_id::NodeId(5),
-                    input: pcc_id::NodeId(5),
-                    offset: Vec3::ZERO,
-                },
+                Node::new("create", pcc_id::NodeId(5)).with_u32("count", 4),
+                Node::new("transform", pcc_id::NodeId(5))
+                    .with_input(pcc_id::NodeId(5))
+                    .with_vec3("offset", Vec3::ZERO),
             ],
         };
         assert!(matches!(
@@ -1857,8 +2196,10 @@ mod tests {
         use pcc_graph::GraphEdit;
         let cancelled = AtomicBool::new(false);
         let ctx = EvalContext {
+            assets: &NoAssets,
             cancelled: &cancelled,
             budget: CookBudget {
+                max_state_ticks: DEFAULT_MAX_STATE_TICKS,
                 max_memory_bytes: 1 << 20,
                 max_elements: 1_000,
             },
@@ -1867,25 +2208,16 @@ mod tests {
         let diamond_r1 = GraphSnapshot {
             revision: RevisionId(1),
             nodes: vec![
-                Node::CreatePoints {
-                    id: NodeId(1),
-                    count: 10,
-                },
-                Node::Transform {
-                    id: NodeId(2),
-                    input: NodeId(1),
-                    offset: Vec3::checked(1.0, 0.0, 0.0).unwrap_or(Vec3::ZERO),
-                },
-                Node::Transform {
-                    id: NodeId(3),
-                    input: NodeId(1),
-                    offset: Vec3::checked(0.0, 2.0, 0.0).unwrap_or(Vec3::ZERO),
-                },
-                Node::Merge {
-                    id: NodeId(4),
-                    left: NodeId(2),
-                    right: NodeId(3),
-                },
+                Node::new("create", NodeId(1)).with_u32("count", 10),
+                Node::new("transform", NodeId(2))
+                    .with_input(NodeId(1))
+                    .with_vec3("offset", Vec3::checked(1.0, 0.0, 0.0).unwrap_or(Vec3::ZERO)),
+                Node::new("transform", NodeId(3))
+                    .with_input(NodeId(1))
+                    .with_vec3("offset", Vec3::checked(0.0, 2.0, 0.0).unwrap_or(Vec3::ZERO)),
+                Node::new("merge", NodeId(4))
+                    .with_input(NodeId(2))
+                    .with_input(NodeId(3)),
             ],
         };
         let first = cook_cached(&cache, &diamond_r1, 0, 1, &ctx);
@@ -1896,9 +2228,12 @@ mod tests {
         // should hit the per-node content-addressed cache!
         let edited = diamond_r1.apply_edits(
             RevisionId(2),
-            &[GraphEdit::SetTransformOffset {
+            &[GraphEdit::SetParam {
                 id: NodeId(3),
-                offset: Vec3::checked(0.0, 5.0, 0.0).unwrap_or(Vec3::ZERO),
+                name: "offset".to_owned(),
+                value: pcc_graph::ParamValue::Vec3(
+                    Vec3::checked(0.0, 5.0, 0.0).unwrap_or(Vec3::ZERO),
+                ),
             }],
         );
         assert!(edited.is_ok());
@@ -1913,8 +2248,10 @@ mod tests {
     fn grid_and_scatter_cook_and_intermediate_node_cook() {
         let cancelled = AtomicBool::new(false);
         let ctx = EvalContext {
+            assets: &NoAssets,
             cancelled: &cancelled,
             budget: CookBudget {
+                max_state_ticks: DEFAULT_MAX_STATE_TICKS,
                 max_memory_bytes: 1 << 20,
                 max_elements: 10_000,
             },
@@ -1923,19 +2260,15 @@ mod tests {
         let snapshot = GraphSnapshot {
             revision: RevisionId(1),
             nodes: vec![
-                Node::CreateGrid {
-                    id: NodeId(1),
-                    rows: 4,
-                    cols: 5,
-                    size_x: 10.0,
-                    size_z: 8.0,
-                },
-                Node::Scatter {
-                    id: NodeId(2),
-                    input: NodeId(1),
-                    count: 50,
-                    seed: 42,
-                },
+                Node::new("grid", NodeId(1))
+                    .with_u32("rows", 4)
+                    .with_u32("cols", 5)
+                    .with_f32("size_x", 10.0)
+                    .with_f32("size_z", 8.0),
+                Node::new("scatter", NodeId(2))
+                    .with_input(NodeId(1))
+                    .with_u32("count", 50)
+                    .with_u64("seed", 42),
             ],
         };
         // Cook intermediate node 1 (CreateGrid): 4 * 5 = 20 points, (4-1)*(5-1) = 12 quad polygons, 48 vertices.
@@ -1970,8 +2303,10 @@ mod tests {
     fn box_normal_wrangle_and_copy_to_points_cook() {
         let cancelled = AtomicBool::new(false);
         let ctx = EvalContext {
+            assets: &NoAssets,
             cancelled: &cancelled,
             budget: CookBudget {
+                max_state_ticks: DEFAULT_MAX_STATE_TICKS,
                 max_memory_bytes: 1 << 20,
                 max_elements: 10_000,
             },
@@ -1980,28 +2315,19 @@ mod tests {
         let snapshot = GraphSnapshot {
             revision: RevisionId(1),
             nodes: vec![
-                Node::CreateBox {
-                    id: NodeId(1),
-                    size: Vec3::checked(2.0, 2.0, 2.0).unwrap_or(Vec3::ZERO),
-                },
-                Node::Normal {
-                    id: NodeId(2),
-                    input: NodeId(1),
-                },
-                Node::CreatePoints {
-                    id: NodeId(3),
-                    count: 3,
-                },
-                Node::PointWrangle {
-                    id: NodeId(4),
-                    input: NodeId(3),
-                    snippet: "f@pscale = 0.5; @P.x = float(@ptnum) * 10.0;".to_owned(),
-                },
-                Node::CopyToPoints {
-                    id: NodeId(5),
-                    source: NodeId(2),
-                    target: NodeId(4),
-                },
+                Node::new("box", NodeId(1))
+                    .with_vec3("size", Vec3::checked(2.0, 2.0, 2.0).unwrap_or(Vec3::ZERO)),
+                Node::new("normal", NodeId(2)).with_input(NodeId(1)),
+                Node::new("create", NodeId(3)).with_u32("count", 3),
+                Node::new("wrangle", NodeId(4))
+                    .with_input(NodeId(3))
+                    .with_text(
+                        "snippet",
+                        "f@pscale = 0.5; @P.x = float(@ptnum) * 10.0;".to_owned(),
+                    ),
+                Node::new("copytopoints", NodeId(5))
+                    .with_input(NodeId(2))
+                    .with_input(NodeId(4)),
             ],
         };
 
@@ -2032,8 +2358,10 @@ mod tests {
     fn subdivide_extrude_promote_and_blast_dag_cook() {
         let cancelled = AtomicBool::new(false);
         let ctx = EvalContext {
+            assets: &NoAssets,
             cancelled: &cancelled,
             budget: CookBudget {
+                max_state_ticks: DEFAULT_MAX_STATE_TICKS,
                 max_memory_bytes: 1 << 20,
                 max_elements: 10_000,
             },
@@ -2042,53 +2370,37 @@ mod tests {
         let snapshot = GraphSnapshot {
             revision: RevisionId(1),
             nodes: vec![
-                Node::CreateBox {
-                    id: NodeId(1),
-                    size: Vec3::checked(2.0, 2.0, 2.0).unwrap_or(Vec3::ZERO),
-                },
-                Node::Subdivide {
-                    id: NodeId(2),
-                    input: NodeId(1),
-                    iterations: 1,
-                },
-                Node::Subdivide {
-                    id: NodeId(3),
-                    input: NodeId(2),
-                    iterations: 1,
-                },
-                Node::PolyExtrude {
-                    id: NodeId(4),
-                    input: NodeId(1),
-                    distance: 0.5,
-                    inset: 0.1,
-                },
-                Node::PointWrangle {
-                    id: NodeId(5),
-                    input: NodeId(1),
-                    snippet: "f@elev = @P.y; i@top = @P.y > 1.0;".to_owned(),
-                },
-                Node::AttribPromote {
-                    id: NodeId(6),
-                    input: NodeId(5),
-                    name: "elev".to_owned(),
-                    from_domain: AttrDomain::Point,
-                    to_domain: AttrDomain::Prim,
-                    mode: PromoteMode::Average,
-                },
-                Node::AttribPromote {
-                    id: NodeId(7),
-                    input: NodeId(6),
-                    name: "elev".to_owned(),
-                    from_domain: AttrDomain::Prim,
-                    to_domain: AttrDomain::Detail,
-                    mode: PromoteMode::Max,
-                },
-                Node::Blast {
-                    id: NodeId(8),
-                    input: NodeId(5),
-                    group_name: "top".to_owned(),
-                    negate: false,
-                },
+                Node::new("box", NodeId(1))
+                    .with_vec3("size", Vec3::checked(2.0, 2.0, 2.0).unwrap_or(Vec3::ZERO)),
+                Node::new("subdivide", NodeId(2))
+                    .with_input(NodeId(1))
+                    .with_u32("iterations", 1),
+                Node::new("subdivide", NodeId(3))
+                    .with_input(NodeId(2))
+                    .with_u32("iterations", 1),
+                Node::new("extrude", NodeId(4))
+                    .with_input(NodeId(1))
+                    .with_f32("distance", 0.5)
+                    .with_f32("inset", 0.1),
+                Node::new("wrangle", NodeId(5))
+                    .with_input(NodeId(1))
+                    .with_text("snippet", "f@elev = @P.y; i@top = @P.y > 1.0;".to_owned()),
+                Node::new("attribpromote", NodeId(6))
+                    .with_input(NodeId(5))
+                    .with_text("name", "elev".to_owned())
+                    .with_text("from_domain", AttrDomain::Point.as_str())
+                    .with_text("to_domain", AttrDomain::Prim.as_str())
+                    .with_text("mode", PromoteMode::Average.as_str()),
+                Node::new("attribpromote", NodeId(7))
+                    .with_input(NodeId(6))
+                    .with_text("name", "elev".to_owned())
+                    .with_text("from_domain", AttrDomain::Prim.as_str())
+                    .with_text("to_domain", AttrDomain::Detail.as_str())
+                    .with_text("mode", PromoteMode::Max.as_str()),
+                Node::new("blast", NodeId(8))
+                    .with_input(NodeId(5))
+                    .with_text("group_name", "top".to_owned())
+                    .with_bool("negate", false),
             ],
         };
 
@@ -2162,8 +2474,10 @@ mod tests {
     fn heightfield_noise_erode_and_uv_project_dag_cook() {
         let cancelled = AtomicBool::new(false);
         let ctx = EvalContext {
+            assets: &NoAssets,
             cancelled: &cancelled,
             budget: CookBudget {
+                max_state_ticks: DEFAULT_MAX_STATE_TICKS,
                 max_memory_bytes: 2 << 20,
                 max_elements: 10_000,
             },
@@ -2172,38 +2486,27 @@ mod tests {
         let snapshot = GraphSnapshot {
             revision: RevisionId(1),
             nodes: vec![
-                Node::HeightField {
-                    id: NodeId(1),
-                    rows: 12,
-                    cols: 12,
-                    size_x: 24.0,
-                    size_z: 24.0,
-                },
-                Node::HeightFieldNoise {
-                    id: NodeId(2),
-                    input: NodeId(1),
-                    amplitude: 6.0,
-                    frequency: 0.1,
-                    octaves: 4,
-                    seed: 42,
-                },
-                Node::HeightFieldErode {
-                    id: NodeId(3),
-                    input: NodeId(2),
-                    iterations: 10,
-                    rain_rate: 0.06,
-                    talus_angle: 35.0,
-                    seed: 7,
-                },
-                Node::UvProject {
-                    id: NodeId(4),
-                    input: NodeId(3),
-                    mode: UvProjectMode::PlanarY,
-                },
-                Node::Normal {
-                    id: NodeId(5),
-                    input: NodeId(4),
-                },
+                Node::new("heightfield", NodeId(1))
+                    .with_u32("rows", 12)
+                    .with_u32("cols", 12)
+                    .with_f32("size_x", 24.0)
+                    .with_f32("size_z", 24.0),
+                Node::new("hf_noise", NodeId(2))
+                    .with_input(NodeId(1))
+                    .with_f32("amplitude", 6.0)
+                    .with_f32("frequency", 0.1)
+                    .with_u32("octaves", 4)
+                    .with_u64("seed", 42),
+                Node::new("hf_erode", NodeId(3))
+                    .with_input(NodeId(2))
+                    .with_u32("iterations", 10)
+                    .with_f32("rain_rate", 0.06)
+                    .with_f32("talus_angle", 35.0)
+                    .with_u64("seed", 7),
+                Node::new("uvproject", NodeId(4))
+                    .with_input(NodeId(3))
+                    .with_text("mode", UvProjectMode::PlanarY.as_str()),
+                Node::new("normal", NodeId(5)).with_input(NodeId(4)),
             ],
         };
 
@@ -2228,8 +2531,10 @@ mod tests {
     fn vdb_pipeline_and_boolean_dag_cook_produce_closed_manifolds() {
         let cancelled = AtomicBool::new(false);
         let ctx = EvalContext {
+            assets: &NoAssets,
             cancelled: &cancelled,
             budget: CookBudget {
+                max_state_ticks: DEFAULT_MAX_STATE_TICKS,
                 max_memory_bytes: 8 << 20,
                 max_elements: 50_000,
             },
@@ -2238,37 +2543,24 @@ mod tests {
         let snapshot = GraphSnapshot {
             revision: RevisionId(1),
             nodes: vec![
-                Node::CreateBox {
-                    id: NodeId(1),
-                    size: Vec3::checked(2.0, 2.0, 2.0).unwrap_or(Vec3::ZERO),
-                },
-                Node::Transform {
-                    id: NodeId(2),
-                    input: NodeId(1),
-                    offset: Vec3::checked(1.0, 0.0, 0.0).unwrap_or(Vec3::ZERO),
-                },
-                Node::VdbFromPolygons {
-                    id: NodeId(3),
-                    input: NodeId(1),
-                    voxel_size: 0.5,
-                },
-                Node::VdbReshape {
-                    id: NodeId(4),
-                    input: NodeId(3),
-                    offset: 0.25,
-                    smooth_iterations: 1,
-                },
-                Node::ConvertVdb {
-                    id: NodeId(5),
-                    input: NodeId(4),
-                },
-                Node::Boolean {
-                    id: NodeId(6),
-                    left: NodeId(1),
-                    right: NodeId(2),
-                    mode: BooleanMode::Union,
-                    voxel_size: 0.5,
-                },
+                Node::new("box", NodeId(1))
+                    .with_vec3("size", Vec3::checked(2.0, 2.0, 2.0).unwrap_or(Vec3::ZERO)),
+                Node::new("transform", NodeId(2))
+                    .with_input(NodeId(1))
+                    .with_vec3("offset", Vec3::checked(1.0, 0.0, 0.0).unwrap_or(Vec3::ZERO)),
+                Node::new("vdb_from_polygons", NodeId(3))
+                    .with_input(NodeId(1))
+                    .with_f32("voxel_size", 0.5),
+                Node::new("vdb_reshape", NodeId(4))
+                    .with_input(NodeId(3))
+                    .with_f32("offset", 0.25)
+                    .with_u32("smooth_iterations", 1),
+                Node::new("convert_vdb", NodeId(5)).with_input(NodeId(4)),
+                Node::new("boolean", NodeId(6))
+                    .with_input(NodeId(1))
+                    .with_input(NodeId(2))
+                    .with_text("mode", BooleanMode::Union.as_str())
+                    .with_f32("voxel_size", 0.5),
             ],
         };
 
@@ -2300,8 +2592,10 @@ mod tests {
     }
     fn sop_ctx(cancelled: &AtomicBool) -> EvalContext<'_> {
         EvalContext {
+            assets: &NoAssets,
             cancelled,
             budget: CookBudget {
+                max_state_ticks: DEFAULT_MAX_STATE_TICKS,
                 max_memory_bytes: 256 << 20,
                 max_elements: 2_000_000,
             },
@@ -2331,69 +2625,45 @@ mod tests {
         let snapshot = GraphSnapshot {
             revision: RevisionId(1),
             nodes: vec![
-                Node::CreateTube {
-                    id: NodeId(1),
-                    radius: 1.0,
-                    height: 2.0,
-                    rows: 1,
-                    cols: 32,
-                },
-                Node::PolyBevel {
-                    id: NodeId(2),
-                    input: NodeId(1),
-                    distance: 0.05,
-                    min_angle_degrees: 45.0,
-                },
-                Node::Xform {
-                    id: NodeId(3),
-                    input: NodeId(2),
-                    translate: v3(0.0, 1.0, 0.0),
-                    rotate_degrees: v3(0.0, 30.0, 0.0),
-                    scale: v3(1.0, 1.0, 1.0),
-                },
-                Node::Clip {
-                    id: NodeId(4),
-                    input: NodeId(3),
-                    origin: v3(0.0, 1.0, 0.0),
-                    normal: v3(0.0, 1.0, 0.0),
-                    cap: true,
-                },
-                Node::Triangulate {
-                    id: NodeId(5),
-                    input: NodeId(4),
-                },
-                Node::Fuse {
-                    id: NodeId(6),
-                    input: NodeId(5),
-                    distance: 1e-5,
-                },
-                Node::PolyReduce {
-                    id: NodeId(7),
-                    input: NodeId(6),
-                    target_ratio: 0.5,
-                },
-                Node::Remesh {
-                    id: NodeId(8),
-                    input: NodeId(7),
-                    target_length: 0.25,
-                    iterations: 3,
-                    feature_angle_degrees: 30.0,
-                },
-                Node::UvFlatten {
-                    id: NodeId(9),
-                    input: NodeId(8),
-                    seam_angle_degrees: 60.0,
-                },
-                Node::UvLayout {
-                    id: NodeId(10),
-                    input: NodeId(9),
-                    padding: 0.01,
-                    tiles: 2,
-                },
-                Node::Measure {
-                    id: NodeId(11),
-                    input: NodeId(10),
-                },
+                Node::new("tube", NodeId(1))
+                    .with_f32("radius", 1.0)
+                    .with_f32("height", 2.0)
+                    .with_u32("rows", 1)
+                    .with_u32("cols", 32),
+                Node::new("polybevel", NodeId(2))
+                    .with_input(NodeId(1))
+                    .with_f32("distance", 0.05)
+                    .with_f32("min_angle_degrees", 45.0),
+                Node::new("xform", NodeId(3))
+                    .with_input(NodeId(2))
+                    .with_vec3("translate", v3(0.0, 1.0, 0.0))
+                    .with_vec3("rotate_degrees", v3(0.0, 30.0, 0.0))
+                    .with_vec3("scale", v3(1.0, 1.0, 1.0)),
+                Node::new("clip", NodeId(4))
+                    .with_input(NodeId(3))
+                    .with_vec3("origin", v3(0.0, 1.0, 0.0))
+                    .with_vec3("normal", v3(0.0, 1.0, 0.0))
+                    .with_bool("cap", true),
+                Node::new("triangulate", NodeId(5)).with_input(NodeId(4)),
+                Node::new("fuse", NodeId(6))
+                    .with_input(NodeId(5))
+                    .with_f32("distance", 1e-5),
+                Node::new("polyreduce", NodeId(7))
+                    .with_input(NodeId(6))
+                    .with_f32("target_ratio", 0.5),
+                Node::new("remesh", NodeId(8))
+                    .with_input(NodeId(7))
+                    .with_f32("target_length", 0.25)
+                    .with_u32("iterations", 3)
+                    .with_f32("feature_angle_degrees", 30.0),
+                Node::new("uvflatten", NodeId(9))
+                    .with_input(NodeId(8))
+                    .with_f32("seam_angle_degrees", 60.0),
+                Node::new("uvlayout", NodeId(10))
+                    .with_input(NodeId(9))
+                    .with_f32("padding", 0.01)
+                    .with_u32("tiles", 2),
+                Node::new("measure", NodeId(11)).with_input(NodeId(10)),
             ],
         };
         let volume = |id| -> Result<f64, String> {
@@ -2458,31 +2728,23 @@ mod tests {
         let snapshot = GraphSnapshot {
             revision: RevisionId(1),
             nodes: vec![
-                Node::CreateSphere {
-                    id: NodeId(1),
-                    radius: 1.0,
-                    rows: 16,
-                    cols: 24,
-                },
-                Node::ScatterSurface {
-                    id: NodeId(2),
-                    input: NodeId(1),
-                    count: 12,
-                    seed: 5,
-                    min_distance: 0.3,
-                },
-                Node::Xform {
-                    id: NodeId(3),
-                    input: NodeId(2),
-                    translate: Vec3::ZERO,
-                    rotate_degrees: Vec3::ZERO,
-                    scale: v3(0.7, 0.7, 0.7),
-                },
-                Node::VoronoiFracture {
-                    id: NodeId(4),
-                    input: NodeId(1),
-                    seeds: NodeId(3),
-                },
+                Node::new("sphere", NodeId(1))
+                    .with_f32("radius", 1.0)
+                    .with_u32("rows", 16)
+                    .with_u32("cols", 24),
+                Node::new("scatter_surface", NodeId(2))
+                    .with_input(NodeId(1))
+                    .with_u32("count", 12)
+                    .with_u64("seed", 5)
+                    .with_f32("min_distance", 0.3),
+                Node::new("xform", NodeId(3))
+                    .with_input(NodeId(2))
+                    .with_vec3("translate", Vec3::ZERO)
+                    .with_vec3("rotate_degrees", Vec3::ZERO)
+                    .with_vec3("scale", v3(0.7, 0.7, 0.7)),
+                Node::new("voronoifracture", NodeId(4))
+                    .with_input(NodeId(1))
+                    .with_input(NodeId(3)),
             ],
         };
         let whole = pcc_sop::signed_volume(&*cook_at(&cache, &snapshot, 1, &ctx)?);
@@ -2503,56 +2765,40 @@ mod tests {
         let snapshot = GraphSnapshot {
             revision: RevisionId(1),
             nodes: vec![
-                Node::CreateLine {
-                    id: NodeId(1),
-                    start: Vec3::ZERO,
-                    end: v3(0.0, 4.0, 0.0),
-                    points: 2,
-                },
-                Node::Resample {
-                    id: NodeId(2),
-                    input: NodeId(1),
-                    segment_length: 0.5,
-                },
-                Node::Sweep {
-                    id: NodeId(3),
-                    input: NodeId(2),
-                    radius: 0.25,
-                    sides: 8,
-                    capped: true,
-                },
-                Node::PointWrangle {
-                    id: NodeId(4),
-                    input: NodeId(3),
-                    snippet: "@heat = @P.y;".to_owned(),
-                },
-                Node::CreateSphere {
-                    id: NodeId(5),
-                    radius: 3.0,
-                    rows: 16,
-                    cols: 24,
-                },
-                Node::AttribTransfer {
-                    id: NodeId(6),
-                    input: NodeId(5),
-                    source: NodeId(4),
-                    name: "heat".to_owned(),
-                    radius: 2.0,
-                },
-                Node::GroupBounds {
-                    id: NodeId(7),
-                    input: NodeId(6),
-                    group_name: "upper".to_owned(),
-                    domain: AttrDomain::Prim,
-                    min: v3(-4.0, 0.0, -4.0),
-                    max: v3(4.0, 4.0, 4.0),
-                },
-                Node::Blast {
-                    id: NodeId(8),
-                    input: NodeId(7),
-                    group_name: "upper".to_owned(),
-                    negate: false,
-                },
+                Node::new("line", NodeId(1))
+                    .with_vec3("start", Vec3::ZERO)
+                    .with_vec3("end", v3(0.0, 4.0, 0.0))
+                    .with_u32("points", 2),
+                Node::new("resample", NodeId(2))
+                    .with_input(NodeId(1))
+                    .with_f32("segment_length", 0.5),
+                Node::new("sweep", NodeId(3))
+                    .with_input(NodeId(2))
+                    .with_f32("radius", 0.25)
+                    .with_u32("sides", 8)
+                    .with_bool("capped", true),
+                Node::new("wrangle", NodeId(4))
+                    .with_input(NodeId(3))
+                    .with_text("snippet", "@heat = @P.y;".to_owned()),
+                Node::new("sphere", NodeId(5))
+                    .with_f32("radius", 3.0)
+                    .with_u32("rows", 16)
+                    .with_u32("cols", 24),
+                Node::new("attribtransfer", NodeId(6))
+                    .with_input(NodeId(5))
+                    .with_input(NodeId(4))
+                    .with_text("name", "heat".to_owned())
+                    .with_f32("radius", 2.0),
+                Node::new("group_bounds", NodeId(7))
+                    .with_input(NodeId(6))
+                    .with_text("group_name", "upper".to_owned())
+                    .with_text("domain", AttrDomain::Prim.as_str())
+                    .with_vec3("min", v3(-4.0, 0.0, -4.0))
+                    .with_vec3("max", v3(4.0, 4.0, 4.0)),
+                Node::new("blast", NodeId(8))
+                    .with_input(NodeId(7))
+                    .with_text("group_name", "upper".to_owned())
+                    .with_bool("negate", false),
             ],
         };
         let resampled = cook_at(&cache, &snapshot, 2, &ctx)?;
@@ -2588,17 +2834,13 @@ mod tests {
         let graph = |ratio: f32| GraphSnapshot {
             revision: RevisionId(1),
             nodes: vec![
-                Node::CreateSphere {
-                    id: NodeId(1),
-                    radius: 1.0,
-                    rows: 12,
-                    cols: 16,
-                },
-                Node::PolyReduce {
-                    id: NodeId(2),
-                    input: NodeId(1),
-                    target_ratio: ratio,
-                },
+                Node::new("sphere", NodeId(1))
+                    .with_f32("radius", 1.0)
+                    .with_u32("rows", 12)
+                    .with_u32("cols", 16),
+                Node::new("polyreduce", NodeId(2))
+                    .with_input(NodeId(1))
+                    .with_f32("target_ratio", ratio),
             ],
         };
         let first = cook_at(&cache, &graph(0.5), 2, &ctx)?;
@@ -2616,8 +2858,10 @@ mod tests {
         assert_ne!(other.hash(), first.hash());
 
         let tight = EvalContext {
+            assets: &NoAssets,
             cancelled: &cancelled,
             budget: CookBudget {
+                max_state_ticks: DEFAULT_MAX_STATE_TICKS,
                 max_memory_bytes: 1 << 30,
                 max_elements: 1_000,
             },
@@ -2625,16 +2869,11 @@ mod tests {
         let oversized = GraphSnapshot {
             revision: RevisionId(1),
             nodes: vec![
-                Node::CreateSphere {
-                    id: NodeId(1),
-                    radius: 1.0,
-                    rows: 2_000,
-                    cols: 2_000,
-                },
-                Node::Reverse {
-                    id: NodeId(2),
-                    input: NodeId(1),
-                },
+                Node::new("sphere", NodeId(1))
+                    .with_f32("radius", 1.0)
+                    .with_u32("rows", 2_000)
+                    .with_u32("cols", 2_000),
+                Node::new("reverse", NodeId(2)).with_input(NodeId(1)),
             ],
         };
         assert_eq!(
@@ -2645,8 +2884,10 @@ mod tests {
             })
         );
         let starved = EvalContext {
+            assets: &NoAssets,
             cancelled: &cancelled,
             budget: CookBudget {
+                max_state_ticks: DEFAULT_MAX_STATE_TICKS,
                 max_memory_bytes: 64,
                 max_elements: 1_000_000,
             },
@@ -2664,24 +2905,505 @@ mod tests {
         let open_input = GraphSnapshot {
             revision: RevisionId(1),
             nodes: vec![
-                Node::CreateGrid {
-                    id: NodeId(1),
-                    rows: 3,
-                    cols: 3,
-                    size_x: 1.0,
-                    size_z: 1.0,
-                },
-                Node::VoronoiFracture {
-                    id: NodeId(2),
-                    input: NodeId(1),
-                    seeds: NodeId(1),
-                },
+                Node::new("grid", NodeId(1))
+                    .with_u32("rows", 3)
+                    .with_u32("cols", 3)
+                    .with_f32("size_x", 1.0)
+                    .with_f32("size_z", 1.0),
+                Node::new("voronoifracture", NodeId(2))
+                    .with_input(NodeId(1))
+                    .with_input(NodeId(1)),
             ],
         };
         assert_eq!(
             cook(&open_input, &ctx).err(),
             Some(EvalError::Resource(GeoError::InvalidTopology))
         );
+        Ok(())
+    }
+
+    /// Serves one fixed geometry under one hash.
+    struct OneAsset(String, Arc<GeoDetail>);
+
+    impl AssetResolver for OneAsset {
+        fn resolve(&self, content_hash: &str) -> Result<Arc<GeoDetail>, AssetError> {
+            if content_hash == self.0 {
+                Ok(Arc::clone(&self.1))
+            } else {
+                Err(AssetError::NotFound)
+            }
+        }
+    }
+
+    #[test]
+    fn asset_nodes_cook_through_the_resolver_and_key_the_cache_by_content() -> Result<(), String> {
+        let cancelled = AtomicBool::new(false);
+        let point = Vec3::checked(7.0, 0.0, 0.0).map_err(|e| format!("{e:?}"))?;
+        let geo = Arc::new(GeoDetail::points(vec![point]));
+        let hash = geo.hash().to_hex().to_string();
+        let resolver = OneAsset(hash.clone(), Arc::clone(&geo));
+        let graph = |content_hash: String| GraphSnapshot {
+            revision: RevisionId(1),
+            nodes: vec![
+                Node::new("asset", NodeId(1)).with_text("content_hash", content_hash),
+                Node::new("normal", NodeId(2)).with_input(NodeId(1)),
+            ],
+        };
+        let budget = CookBudget {
+            max_state_ticks: DEFAULT_MAX_STATE_TICKS,
+            max_memory_bytes: 1 << 20,
+            max_elements: 1000,
+        };
+        let ctx = EvalContext {
+            assets: &resolver,
+            cancelled: &cancelled,
+            budget,
+        };
+        let cache = CookCache::default();
+        let cooked = cook_node_cached(&cache, &graph(hash.clone()), NodeId(1), 0, 1, &ctx);
+        assert_eq!(cooked.map(|g| g.hash()).ok(), Some(geo.hash()));
+        // A different hash is a different cache entry and must not reuse the first result.
+        let other = "f".repeat(64);
+        assert_eq!(
+            cook_node_cached(&cache, &graph(other), NodeId(1), 0, 1, &ctx).err(),
+            Some(EvalError::Asset(AssetError::NotFound))
+        );
+        // Without a resolver, a scene with assets fails with a clear error.
+        let no_assets = EvalContext {
+            assets: &NoAssets,
+            cancelled: &cancelled,
+            budget,
+        };
+        assert_eq!(
+            cook(&graph(hash.clone()), &no_assets).err(),
+            Some(EvalError::Asset(AssetError::NotFound))
+        );
+        // Budgets apply to imported geometry as they do to generated geometry.
+        let tight = EvalContext {
+            assets: &resolver,
+            cancelled: &cancelled,
+            budget: CookBudget {
+                max_state_ticks: DEFAULT_MAX_STATE_TICKS,
+                max_memory_bytes: 1,
+                max_elements: 1000,
+            },
+        };
+        // Cooks the asset node alone, so that no later node can be what enforces the limit.
+        assert_eq!(
+            cook_node_cached(&CookCache::default(), &graph(hash), NodeId(1), 0, 1, &tight).err(),
+            Some(EvalError::Resource(GeoError::LimitExceeded))
+        );
+        Ok(())
+    }
+
+    /// Moves every point up by `height`, reading only its definition's parameters.
+    fn cook_lift(
+        node: &Node,
+        inputs: &[Arc<GeoDetail>],
+        ctx: &EvalContext<'_>,
+    ) -> Result<GeoDetail, EvalError> {
+        let height = param_f32(node, "height")?;
+        let offset = Vec3::checked(0.0, height, 0.0).map_err(|_| EvalError::InvalidGraph)?;
+        let input = inputs.first().ok_or(EvalError::InvalidGraph)?;
+        input
+            .translated_cancellable(offset, ctx.budget.max_memory_bytes, ctx.cancelled)
+            .map_err(EvalError::Resource)
+    }
+
+    static LIFT_INPUTS: [pcc_graph::NodeInput; 1] = [pcc_graph::NodeInput {
+        name: "input",
+        description: "Geometry to lift.",
+    }];
+    static LIFT_PARAMS: [pcc_graph::NodeParam; 1] = [pcc_graph::NodeParam {
+        name: "height",
+        kind: pcc_graph::ParamKind::F32,
+        check: pcc_graph::Check::Any,
+        description: "Distance to move up.",
+    }];
+
+    #[test]
+    fn a_runtime_operator_cooks_and_caches_like_a_built_in() -> Result<(), String> {
+        let def = NodeDef::new(
+            "test:lift",
+            "deform",
+            "Moves points up, defined entirely outside the built-in table.",
+            &LIFT_INPUTS,
+            &LIFT_PARAMS,
+        );
+        assert_eq!(register_operator(def, cook_lift), Ok(()));
+        assert_eq!(
+            register_operator(def, cook_lift),
+            Err(NodeRegistrationError::AlreadyDefined)
+        );
+        let cancelled = AtomicBool::new(false);
+        let ctx = sop_ctx(&cancelled);
+        let cache = CookCache::default();
+        let scene = |height: f32| GraphSnapshot {
+            revision: RevisionId(1),
+            nodes: vec![
+                Node::new("create", NodeId(1)).with_u32("count", 2),
+                Node::new("test:lift", NodeId(2))
+                    .with_input(NodeId(1))
+                    .with_f32("height", height),
+                // A built-in downstream of a custom operator.
+                Node::new("normal", NodeId(3)).with_input(NodeId(2)),
+            ],
+        };
+        let lifted = cook_at(&cache, &scene(2.5), 3, &ctx)?;
+        assert_eq!(lifted.point(1).map(|p| (p.x, p.y)), Some((1.0, 2.5)));
+        let hits = cache.node_cache_hits();
+        let again = cook_at(&cache, &scene(2.5), 3, &ctx)?;
+        assert_eq!(again.hash(), lifted.hash());
+        assert_eq!(
+            cache.node_cache_hits(),
+            hits + 3,
+            "all three nodes must hit"
+        );
+        // A parameter change invalidates the entry, as it does for a built-in.
+        let higher = cook_at(&cache, &scene(9.0), 3, &ctx)?;
+        assert_eq!(higher.point(0).map(|p| p.y), Some(9.0));
+        Ok(())
+    }
+
+    #[test]
+    fn cache_keys_ignore_ids_except_for_operators_seeded_by_their_id() {
+        let key = |node: &Node| CookCache::node_key(node, &[], 0, 1);
+        let box_at = |id| Node::new("box", NodeId(id)).with_vec3("size", v3(1.0, 1.0, 1.0));
+        assert_eq!(
+            key(&box_at(1)),
+            key(&box_at(2)),
+            "same work must share a cache entry"
+        );
+        let scatter_at = |id| {
+            Node::new("scatter", NodeId(id))
+                .with_input(NodeId(9))
+                .with_u32("count", 5)
+                .with_u64("seed", 1)
+        };
+        assert_ne!(
+            key(&scatter_at(1)),
+            key(&scatter_at(2)),
+            "its output depends on its id"
+        );
+        // Parameters and their values both matter, and negative zero equals zero.
+        let sized = |x: f32| Node::new("box", NodeId(1)).with_vec3("size", v3(x, 1.0, 1.0));
+        assert_ne!(key(&sized(1.0)), key(&sized(2.0)));
+        let offset = |x: f32| {
+            Node::new("transform", NodeId(1))
+                .with_input(NodeId(9))
+                .with_vec3("offset", Vec3 { x, y: 0.0, z: 0.0 })
+        };
+        assert_eq!(key(&offset(0.0)), key(&offset(-0.0)));
+        // Operators with the same parameters are still different operators.
+        let grid = Node::new("grid", NodeId(1))
+            .with_u32("rows", 2)
+            .with_u32("cols", 2)
+            .with_f32("size_x", 1.0)
+            .with_f32("size_z", 1.0);
+        let field = Node::new("heightfield", NodeId(1))
+            .with_u32("rows", 2)
+            .with_u32("cols", 2)
+            .with_f32("size_x", 1.0)
+            .with_f32("size_z", 1.0);
+        assert_ne!(key(&grid), key(&field));
+    }
+
+    #[test]
+    fn unregistered_operators_cannot_cook() {
+        let cancelled = AtomicBool::new(false);
+        let ctx = sop_ctx(&cancelled);
+        let scene = GraphSnapshot {
+            revision: RevisionId(1),
+            nodes: vec![
+                Node::new("create", NodeId(1)).with_u32("count", 2),
+                Node::new("test:never_registered", NodeId(2)).with_input(NodeId(1)),
+            ],
+        };
+        assert_eq!(cook(&scene, &ctx).err(), Some(EvalError::InvalidGraph));
+    }
+
+    fn scene(nodes: Vec<Node>) -> GraphSnapshot {
+        GraphSnapshot {
+            revision: RevisionId(1),
+            nodes,
+        }
+    }
+
+    fn cook_frame(
+        cache: &CookCache,
+        scene: &GraphSnapshot,
+        id: u64,
+        frame: i64,
+        ctx: &EvalContext<'_>,
+    ) -> Result<Arc<GeoDetail>, EvalError> {
+        cook_node_cached(cache, scene, NodeId(id), frame, 1, ctx)
+    }
+
+    #[test]
+    fn expressions_animate_parameters_with_the_frame() -> Result<(), EvalError> {
+        let cancelled = AtomicBool::new(false);
+        let ctx = sop_ctx(&cancelled);
+        let cache = CookCache::default();
+        let graph = scene(vec![
+            Node::new("box", NodeId(1)).with_vec3("size", v3(1.0, 1.0, 1.0)),
+            Node::new("xform", NodeId(2))
+                .with_input(NodeId(1))
+                .with_vec3_expr("translate", ["0", "$F * 2", "$T"])
+                .with_vec3("rotate_degrees", Vec3::ZERO)
+                .with_vec3("scale", v3(1.0, 1.0, 1.0)),
+        ]);
+        let at = |frame| -> Result<Option<(Vec3, Vec3)>, EvalError> {
+            Ok(cook_frame(&cache, &graph, 2, frame, &ctx)?.bounds())
+        };
+        let (low, _) = at(0)?.unwrap_or((Vec3::ZERO, Vec3::ZERO));
+        let (low_later, _) = at(24)?.unwrap_or((Vec3::ZERO, Vec3::ZERO));
+        // Frame 24 is one second: 48 up, and one along Z.
+        assert!((low_later.y - low.y - 48.0).abs() < 1e-4, "{low_later:?}");
+        assert!((low_later.z - low.z - 1.0).abs() < 1e-5, "{low_later:?}");
+        Ok(())
+    }
+
+    #[test]
+    fn unchanged_values_reuse_results_across_frames() -> Result<(), EvalError> {
+        let cancelled = AtomicBool::new(false);
+        let ctx = sop_ctx(&cancelled);
+        let cache = CookCache::default();
+        // The offset only steps at frame 10, and the box and its reversal never depend on time.
+        let graph = scene(vec![
+            Node::new("box", NodeId(1)).with_vec3("size", v3(1.0, 1.0, 1.0)),
+            Node::new("xform", NodeId(2))
+                .with_input(NodeId(1))
+                .with_vec3_expr("translate", ["if($F < 10, 0, 5)", "0", "0"])
+                .with_vec3("rotate_degrees", Vec3::ZERO)
+                .with_vec3("scale", v3(1.0, 1.0, 1.0)),
+            Node::new("reverse", NodeId(3)).with_input(NodeId(2)),
+        ]);
+        let first = cook_frame(&cache, &graph, 3, 1, &ctx)?;
+        let hits = cache.node_cache_hits();
+        // Same resolved values at another frame: all three nodes come from the cache.
+        let same = cook_frame(&cache, &graph, 3, 2, &ctx)?;
+        assert_eq!(cache.node_cache_hits(), hits + 3);
+        assert_eq!(same.hash(), first.hash());
+        // Past the step the box still hits, but the other two recook.
+        let hits = cache.node_cache_hits();
+        let moved = cook_frame(&cache, &graph, 3, 10, &ctx)?;
+        assert_eq!(cache.node_cache_hits(), hits + 1);
+        assert_ne!(moved.hash(), first.hash());
+        Ok(())
+    }
+
+    #[test]
+    fn operators_that_read_time_recook_every_frame() -> Result<(), EvalError> {
+        let cancelled = AtomicBool::new(false);
+        let ctx = sop_ctx(&cancelled);
+        let cache = CookCache::default();
+        let graph = scene(vec![
+            Node::new("create", NodeId(1)).with_u32("count", 2),
+            Node::new("wrangle", NodeId(2))
+                .with_input(NodeId(1))
+                .with_text("snippet", "@age = @Frame;"),
+        ]);
+        let first = cook_frame(&cache, &graph, 2, 1, &ctx)?;
+        let second = cook_frame(&cache, &graph, 2, 2, &ctx)?;
+        assert_ne!(
+            first.hash(),
+            second.hash(),
+            "the wrangle must see the new frame"
+        );
+        let hits = cache.node_cache_hits();
+        cook_frame(&cache, &graph, 2, 3, &ctx)?;
+        assert_eq!(
+            cache.node_cache_hits(),
+            hits + 1,
+            "only the generator is reusable"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn channel_references_read_resolved_values_from_earlier_nodes() -> Result<(), EvalError> {
+        let cancelled = AtomicBool::new(false);
+        let ctx = sop_ctx(&cancelled);
+        let cache = CookCache::default();
+        let graph = scene(vec![
+            // An expression feeding an expression: the sphere's radius follows the frame.
+            Node::new("sphere", NodeId(1))
+                .with_expr("radius", "1 + $F")
+                .with_u32("rows", 8)
+                .with_u32("cols", 8),
+            Node::new("box", NodeId(2))
+                .with_vec3_expr("size", ["ch(1, \"radius\") * 2", "ch(1, \"rows\")", "1"]),
+            // A vector component of another node, used by a node with no input from it.
+            Node::new("tube", NodeId(3))
+                .with_expr("radius", "ch(2, \"size.y\") + 1")
+                .with_expr("height", "ch(\"cols\") / 2")
+                .with_u32("rows", 1)
+                .with_u32("cols", 8),
+            Node::new("merge", NodeId(4))
+                .with_input(NodeId(1))
+                .with_input(NodeId(2)),
+        ]);
+        let cooked = cook_frame(&cache, &graph, 2, 2, &ctx)?;
+        let (low, high) = cooked.bounds().unwrap_or((Vec3::ZERO, Vec3::ZERO));
+        // Frame 2 gives radius 3, so the box is 6 by 8 by 1.
+        assert_eq!(
+            (high.x - low.x, high.y - low.y, high.z - low.z),
+            (6.0, 8.0, 1.0)
+        );
+        let tube = cook_frame(&cache, &graph, 3, 2, &ctx)?;
+        let (low, high) = tube.bounds().unwrap_or((Vec3::ZERO, Vec3::ZERO));
+        // Radius 8 + 1, and height 8 / 2 read from its own literal parameter.
+        assert!((high.y - low.y - 4.0).abs() < 1e-5, "{low:?} {high:?}");
+        assert!((high.x - 9.0).abs() < 1e-4, "{high:?}");
+        Ok(())
+    }
+
+    #[test]
+    fn expressions_can_measure_input_geometry() -> Result<(), EvalError> {
+        let cancelled = AtomicBool::new(false);
+        let ctx = sop_ctx(&cancelled);
+        let cache = CookCache::default();
+        let graph = scene(vec![
+            Node::new("box", NodeId(1)).with_vec3("size", v3(4.0, 2.0, 6.0)),
+            // Rests the box on the ground whatever its size.
+            Node::new("xform", NodeId(2))
+                .with_input(NodeId(1))
+                .with_vec3_expr("translate", ["0", "-bbox(0, \"ymin\")", "npoints(0)"])
+                .with_vec3("rotate_degrees", Vec3::ZERO)
+                .with_vec3_expr("scale", ["1", "1", "if(nprims(0) == 6, 1, 2)"]),
+        ]);
+        let rested = cook_frame(&cache, &graph, 2, 0, &ctx)?;
+        let (low, high) = rested.bounds().unwrap_or((Vec3::ZERO, Vec3::ZERO));
+        assert_eq!(low.y, 0.0);
+        assert_eq!(high.y, 2.0);
+        assert_eq!(high.z - low.z, 6.0, "six prims keeps the scale at one");
+        assert_eq!(low.z, 8.0, "moved along Z by the eight points of its input");
+        Ok(())
+    }
+
+    #[test]
+    fn resolved_values_obey_their_parameter_constraints() {
+        let cancelled = AtomicBool::new(false);
+        let ctx = sop_ctx(&cancelled);
+        let cache = CookCache::default();
+        let sphere_at = |radius: &str| {
+            scene(vec![
+                Node::new("sphere", NodeId(1))
+                    .with_expr("radius", radius)
+                    .with_u32("rows", 8)
+                    .with_u32("cols", 8),
+                Node::new("reverse", NodeId(2)).with_input(NodeId(1)),
+            ])
+        };
+        let graph = sphere_at("5 - $F");
+        assert!(cook_frame(&cache, &graph, 2, 4, &ctx).is_ok());
+        // At frame 5 the radius reaches zero, which a sphere does not allow.
+        let fails_on = |result: Result<Arc<GeoDetail>, EvalError>| match result {
+            Err(EvalError::Param { node, .. }) => node,
+            // Zero is never a real node id, so success can never pass for the expected failure.
+            _ => NodeId(0),
+        };
+        assert_eq!(fails_on(cook_frame(&cache, &graph, 2, 5, &ctx)), NodeId(1));
+        // Division by zero and an unknown channel name the node and the parameter.
+        let by_zero = cook_frame(&cache, &sphere_at("1 / ($F - 3)"), 2, 3, &ctx);
+        assert!(
+            matches!(&by_zero, Err(EvalError::Param { param, message, .. })
+                if param == "radius" && message.contains("not finite")),
+            "{by_zero:?}"
+        );
+        assert_eq!(
+            fails_on(cook_frame(&cache, &sphere_at("ch(\"nope\")"), 2, 0, &ctx)),
+            NodeId(1)
+        );
+        // An own parameter that is itself an expression has no value yet.
+        let own = scene(vec![
+            Node::new("tube", NodeId(1))
+                .with_expr("radius", "ch(\"height\")")
+                .with_expr("height", "1")
+                .with_u32("rows", 1)
+                .with_u32("cols", 8),
+            Node::new("reverse", NodeId(2)).with_input(NodeId(1)),
+        ]);
+        assert_eq!(fails_on(cook_frame(&cache, &own, 2, 0, &ctx)), NodeId(1));
+        // Integer parameters round, and refuse negative values.
+        let rows = |expr: &str| {
+            scene(vec![
+                Node::new("sphere", NodeId(1))
+                    .with_f32("radius", 1.0)
+                    .with_expr("rows", expr)
+                    .with_u32("cols", 8),
+                Node::new("reverse", NodeId(2)).with_input(NodeId(1)),
+            ])
+        };
+        let rounded = cook_frame(&cache, &rows("7.6"), 2, 0, &ctx);
+        // Eight bands around eight segments: two poles and seven rings.
+        assert_eq!(rounded.map(|g| g.len()).ok(), Some(2 + 7 * 8));
+        assert_eq!(
+            fails_on(cook_frame(&cache, &rows("-1"), 2, 0, &ctx)),
+            NodeId(1)
+        );
+        assert_eq!(
+            fails_on(cook_frame(&cache, &rows("1e30"), 2, 0, &ctx)),
+            NodeId(1)
+        );
+        // With no range for a later check to catch them, integers must still fit themselves.
+        let count = |expr: &str| {
+            scene(vec![
+                Node::new("create", NodeId(1)).with_expr("count", expr),
+                Node::new("reverse", NodeId(2)).with_input(NodeId(1)),
+            ])
+        };
+        assert_eq!(
+            cook_frame(&cache, &count("3"), 2, 0, &ctx)
+                .map(|g| g.len())
+                .ok(),
+            Some(3)
+        );
+        assert_eq!(
+            fails_on(cook_frame(&cache, &count("-1"), 2, 0, &ctx)),
+            NodeId(1)
+        );
+        let seed = scene(vec![
+            Node::new("box", NodeId(1)).with_vec3("size", v3(1.0, 1.0, 1.0)),
+            Node::new("scatter", NodeId(2))
+                .with_input(NodeId(1))
+                .with_u32("count", 2)
+                .with_expr("seed", "1e30"),
+        ]);
+        assert_eq!(fails_on(cook_frame(&cache, &seed, 2, 0, &ctx)), NodeId(2));
+        // Cross-parameter rules apply once the values exist.
+        let torus = scene(vec![
+            Node::new("torus", NodeId(1))
+                .with_expr("major_radius", "$F")
+                .with_f32("minor_radius", 1.0)
+                .with_u32("rows", 8)
+                .with_u32("cols", 8),
+            Node::new("reverse", NodeId(2)).with_input(NodeId(1)),
+        ]);
+        assert!(cook_frame(&cache, &torus, 2, 2, &ctx).is_ok());
+        assert_eq!(fails_on(cook_frame(&cache, &torus, 2, 1, &ctx)), NodeId(1));
+    }
+
+    #[test]
+    fn boolean_parameters_follow_the_truth_of_their_expression() -> Result<(), EvalError> {
+        let cancelled = AtomicBool::new(false);
+        let ctx = sop_ctx(&cancelled);
+        let cache = CookCache::default();
+        let graph = scene(vec![
+            Node::new("line", NodeId(1))
+                .with_vec3("start", Vec3::ZERO)
+                .with_vec3("end", v3(0.0, 1.0, 0.0))
+                .with_u32("points", 2),
+            Node::new("sweep", NodeId(2))
+                .with_input(NodeId(1))
+                .with_f32("radius", 0.5)
+                .with_u32("sides", 6)
+                .with_expr("capped", "$F > 3"),
+        ]);
+        let open = cook_frame(&cache, &graph, 2, 3, &ctx)?;
+        let capped = cook_frame(&cache, &graph, 2, 4, &ctx)?;
+        assert_eq!(open.prim_count(), 6, "false: the six side quads alone");
+        assert_eq!(capped.prim_count(), 8, "true: the sides and both caps");
         Ok(())
     }
 }

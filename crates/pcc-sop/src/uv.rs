@@ -2,11 +2,13 @@
 //!
 //! Charts start from dihedral-angle flood fill and are bisected until each is a topological disk
 //! that flattens with no inverted triangle and bounded area distortion. A single triangle always
-//! satisfies this, so termination and zero flips hold for any input, at the cost of more islands.
+//! satisfies this, so termination and flip-free charts hold for any input. On difficult models the
+//! price is fragmentation, down to one island per face. UVs are stored as `f32`, so a sliver's area
+//! can round to zero or slightly below; it is never inverted by more than that rounding.
 
 use crate::common::{
-    D3, SopContext, add, cross, distance, dot, length, load_points, load_polygons, normalized,
-    polygon_area_vector, scale, sub,
+    D3, SopContext, add, any_perpendicular, cross, distance, dot, length, load_points,
+    load_polygons, normalized, polygon_area_vector, scale, sub,
 };
 use pcc_geo::{AttrDomain, AttributeColumn, GeoDetail, GeoError, TopologyIndex};
 use pcc_math::Vec3;
@@ -390,6 +392,27 @@ fn accept_chart(flat: &mut Flattened, faces: &FaceSet, chart: &[u32], points: &[
     true
 }
 
+/// Projects one polygon isometrically onto its own plane, so that a triangle always has positive
+/// area. A polygon with no area at all gets a tiny counter-clockwise placeholder, which lets the
+/// attribute cover every vertex without implying a real parameterization.
+fn flatten_single_face(points: &[D3], polygon: &[u32]) -> Vec<[f64; 2]> {
+    let Some(normal) = normalized(polygon_area_vector(points, polygon)) else {
+        let step = std::f64::consts::TAU / polygon.len() as f64;
+        return (0..polygon.len())
+            .map(|k| {
+                let (sin, cos) = (step * k as f64).sin_cos();
+                [1e-6 * cos, 1e-6 * sin]
+            })
+            .collect();
+    };
+    let u = any_perpendicular(normal);
+    let v = cross(normal, u);
+    polygon
+        .iter()
+        .map(|&p| [dot(points[p as usize], u), dot(points[p as usize], v)])
+        .collect()
+}
+
 /// Divides a chart along the longest axis of its face centroids.
 fn bisect(faces: &FaceSet, chart: &[u32]) -> (Vec<u32>, Vec<u32>) {
     let mut low = [f64::INFINITY; 3];
@@ -586,7 +609,8 @@ fn pack_islands(
 
 /// Flattens polygons into non-overlapping UV islands in the unit square: vertex `v@uv` and
 /// primitive `i@uv_island`. Faces meeting at more than `seam_angle_degrees` start in separate
-/// charts. Every output triangle has positive UV area and islands share one texel density.
+/// charts. Output triangles have positive UV area up to `f32` rounding of their coordinates, and
+/// islands share one texel density.
 /// Polylines are not supported; existing attributes stay attached.
 pub fn uv_flatten(
     geo: &GeoDetail,
@@ -611,6 +635,19 @@ pub fn uv_flatten(
     while let Some(chart) = pending.pop() {
         rounds += 1;
         ctx.poll_every(rounds)?;
+        if let [face] = chart[..] {
+            let start = faces.starts[face as usize];
+            let corners = flatten_single_face(&points, &faces.polygons[face as usize])
+                .into_iter()
+                .enumerate()
+                .map(|(k, uv)| (start + k as u32, uv))
+                .collect();
+            islands.push(Island {
+                corners,
+                faces: chart,
+            });
+            continue;
+        }
         let disk = is_disk(&faces, &topology, &chart);
         let mut flattened = None;
         if disk {
@@ -629,19 +666,6 @@ pub fn uv_flatten(
                         corners.push((start + k as u32, flat.uv[local as usize]));
                     }
                 }
-                islands.push(Island {
-                    corners,
-                    faces: chart,
-                });
-            }
-            None if chart.len() == 1 => {
-                // A degenerate face cannot flatten; give it a tiny placeholder island so that the
-                // attribute still covers every vertex.
-                let face = chart[0];
-                let start = faces.starts[face as usize];
-                let corners = (0..faces.polygons[face as usize].len() as u32)
-                    .map(|k| (start + k, [f64::from(k) * 1e-6, f64::from(k % 2) * 1e-6]))
-                    .collect();
                 islands.push(Island {
                     corners,
                     faces: chart,
@@ -989,6 +1013,30 @@ mod tests {
         assert_eq!(uv_flatten(&grid, 60.0, &ctx)?.hash(), flat.hash());
         Ok(())
     }
+    #[test]
+    fn single_faces_flatten_with_positive_area_at_any_shape_or_orientation() {
+        // Slivers and arbitrary orientations are what broke the general path on real models.
+        let cases: [[D3; 3]; 4] = [
+            [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
+            [[0.0, 0.0, 0.0], [0.0, 1.0, 0.0], [1.0, 0.0, 0.0]],
+            [[5.0, -2.0, 1.0], [5.0, 8.0, 1.0], [5.0, 3.0, 1.00001]],
+            [[1.0, 1.0, 1.0], [2.0, 2.0, 2.0], [3.0, 3.0, 3.000001]],
+        ];
+        for points in cases {
+            let uv = flatten_single_face(&points, &[0, 1, 2]);
+            let flat_area = signed_uv_area(&uv, &[0, 1, 2]);
+            let true_area = length(polygon_area_vector(&points, &[0, 1, 2])) * 0.5;
+            assert!(flat_area > 0.0, "{points:?}");
+            assert!(
+                (flat_area - true_area).abs() < 1e-9,
+                "{flat_area} vs {true_area}"
+            );
+        }
+        // Zero-area faces still get a valid counter-clockwise placeholder.
+        let collapsed = [[1.0, 1.0, 1.0]; 3];
+        assert!(signed_uv_area(&flatten_single_face(&collapsed, &[0, 1, 2]), &[0, 1, 2]) > 0.0);
+    }
+
     /// `(mesh area, uv area)` of every polygon, grouped by island.
     fn island_areas(geo: &GeoDetail) -> Result<BTreeMap<i32, Vec<(f64, f64)>>, GeoError> {
         let tags = geo

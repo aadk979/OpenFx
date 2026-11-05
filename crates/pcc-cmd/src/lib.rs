@@ -77,9 +77,10 @@ mod tests {
             &current,
             EngineCommand::BatchEdit {
                 base: RevisionId(1),
-                edits: &[GraphEdit::SetCreateCount {
+                edits: &[GraphEdit::SetParam {
                     id: NodeId(1),
-                    count: 32,
+                    name: "count".to_owned(),
+                    value: pcc_graph::ParamValue::Uint(32),
                 }],
             },
         );

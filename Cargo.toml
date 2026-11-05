@@ -9,6 +9,10 @@ license = "MIT OR Apache-2.0"
 version = "0.1.0"
 authors = ["OpenFX contributors"]
 
+# Geometry tests do real numerical work; unoptimized builds make them needlessly slow.
+[profile.dev]
+opt-level = 1
+
 [workspace.lints.rust]
 unsafe_code = "forbid"
 unused_must_use = "deny"

@@ -17,6 +17,10 @@ pub struct RemeshParams {
     pub feature_angle_degrees: f64,
 }
 
+/// Upper limit on triangles along boundaries and features. Each split on such an edge can fan into
+/// one vertex that may never collapse, making the work quadratic in this count.
+const MAX_CONSTRAINED_TRIANGLES: f64 = 200_000.0;
+
 struct Constraints {
     edges: BTreeSet<(u32, u32)>,
     locked: Vec<bool>,
@@ -270,6 +274,23 @@ pub fn remesh(
     let (reference_points, reference_triangles) = triangles_of(geo)?;
     let reference = TriBvh::build(reference_points, reference_triangles);
     let mut constraints = detect_constraints(&mesh, feature_angle_degrees.to_radians().cos());
+    // Constrained edges are split but never collapsed, so their total length also bounds the
+    // output. Area alone misses slivers: almost no area, yet very long locked edges to subdivide.
+    let constrained_length: f64 = constraints
+        .edges
+        .iter()
+        .map(|&(a, b)| distance(mesh.verts[a as usize], mesh.verts[b as usize]))
+        .sum();
+    let constrained_triangles = 2.0 * constrained_length / target_length;
+    if !constrained_triangles.is_finite() || constrained_triangles > MAX_CONSTRAINED_TRIANGLES {
+        return Err(GeoError::LimitExceeded);
+    }
+    ctx.check_output(
+        estimated_triangles.saturating_add(constrained_triangles as usize),
+        estimated_triangles
+            .saturating_add(constrained_triangles as usize)
+            .saturating_mul(6),
+    )?;
     let (low, high) = (0.8 * target_length, 4.0 / 3.0 * target_length);
     for _ in 0..iterations {
         ctx.poll()?;
@@ -408,6 +429,46 @@ mod tests {
             let on_face = p.iter().any(|&c| c.abs() < 1e-5 || (c - 2.0).abs() < 1e-5);
             assert!(on_face, "{p:?} left the surface");
         }
+        Ok(())
+    }
+
+    #[test]
+    fn sliver_budgets_count_locked_edge_length_not_just_area() -> Result<(), GeoError> {
+        let flag = AtomicBool::new(false);
+        let ctx = SopContext::new(1 << 30, &flag);
+        // Almost no area, so the area estimate allows nearly any edge length.
+        let sliver = GeoDetail::points(vec![
+            Vec3::checked(0.0, 0.0, 0.0)?,
+            Vec3::checked(10.0, 0.0, 0.0)?,
+            Vec3::checked(5.0, 1e-5, 0.0)?,
+        ])
+        .with_primitives(
+            vec![PrimRun {
+                kind: PrimKind::Polygon,
+                arity: 3,
+                prim_count: 1,
+            }],
+            vec![0, 1, 2],
+        )?;
+        let params = RemeshParams {
+            target_length: 1e-4,
+            iterations: 1,
+            feature_angle_degrees: 45.0,
+        };
+        assert_eq!(
+            remesh(&sliver, &params, &ctx).err(),
+            Some(GeoError::LimitExceeded)
+        );
+        // A sensible length on the same shape still works and subdivides the boundary.
+        let out = remesh(
+            &sliver,
+            &RemeshParams {
+                target_length: 0.5,
+                ..params
+            },
+            &ctx,
+        )?;
+        assert!(out.len() > 30, "{}", out.len());
         Ok(())
     }
 

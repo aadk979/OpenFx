@@ -3,6 +3,7 @@
 - **Status:** Accepted
 - **Date:** 2026-10-31
 - **Supersedes / Extends:** [ADR 007](007-terrain-heightfields-and-uv-projection.md)
+- **Corrected by:** [ADR 010](010-thingi10k-torture-harness.md). The manifold guarantee claimed below did not hold on real data.
 
 ## Context
 

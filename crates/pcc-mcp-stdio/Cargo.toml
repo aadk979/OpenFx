@@ -16,5 +16,8 @@ serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
 
+[dev-dependencies]
+pcc-io = { path = "../pcc-io" }
+
 [lints]
 workspace = true

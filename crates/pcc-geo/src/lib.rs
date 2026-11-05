@@ -1,6 +1,11 @@
 //! Paged copy-on-write geometry detail and validated typed attribute columns.
 //! Page starts are logical 16,384-element boundaries (`PAGE_LEN`).
 
+mod packed;
+
+use packed::PackedTable;
+pub use packed::{MAX_PACKED_DEPTH, PackedInstance, PackedPrototype};
+
 use pcc_math::{MathError, Vec3};
 use std::{
     collections::BTreeMap,
@@ -65,6 +70,8 @@ pub enum AttrType {
 pub enum PrimKind {
     Polygon,
     Polyline,
+    /// An instance of a shared prototype. Arity one: its vertex is the instance's point.
+    Packed,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -152,6 +159,7 @@ pub struct GeoDetail {
     detail_attributes: Arc<BTreeMap<String, AttributeColumn>>,
     point_groups: Arc<BTreeMap<String, ElementGroup>>,
     prim_groups: Arc<BTreeMap<String, ElementGroup>>,
+    packed: Option<Arc<PackedTable>>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -389,6 +397,52 @@ impl AttributeColumn {
         }
     }
 
+    /// Joins two columns end to end, filling a missing side with zeros. Both sides must have the
+    /// same type where both exist.
+    fn concatenated(
+        first: Option<&Self>,
+        first_len: usize,
+        second: Option<&Self>,
+        second_len: usize,
+    ) -> Result<Self, GeoError> {
+        Self::concatenated_all(&[(first, first_len), (second, second_len)])
+    }
+
+    /// Joins any number of `(column, length)` parts end to end, filling a missing part with zeros.
+    pub(crate) fn concatenated_all(parts: &[(Option<&Self>, usize)]) -> Result<Self, GeoError> {
+        fn join<T: HashableValue>(
+            parts: &[(Option<&AttributeColumn>, usize)],
+            view: fn(&AttributeColumn) -> Option<&PagedColumn<T>>,
+            zero: T,
+        ) -> PagedColumn<T> {
+            let total = parts.iter().map(|part| part.1).sum();
+            let mut values = Vec::with_capacity(total);
+            for (column, len) in parts {
+                let column = column.and_then(view);
+                values.extend((0..*len).map(|i| column.and_then(|c| c.get(i)).unwrap_or(zero)));
+            }
+            PagedColumn::from_vec(values)
+        }
+        let kind = parts
+            .iter()
+            .find_map(|part| part.0)
+            .ok_or(GeoError::AttributeNotFound)?
+            .attr_type();
+        if parts
+            .iter()
+            .any(|part| part.0.is_some_and(|c| c.attr_type() != kind))
+        {
+            return Err(GeoError::AttributeTypeMismatch);
+        }
+        Ok(match kind {
+            AttrType::F32 => Self::F32(join(parts, Self::as_f32, FiniteF32::ZERO)),
+            AttrType::I32 => Self::I32(join(parts, Self::as_i32, 0)),
+            AttrType::U32 => Self::U32(join(parts, Self::as_u32, 0)),
+            AttrType::Bool => Self::Bool(join(parts, Self::as_bool, false)),
+            AttrType::Vec3 => Self::Vec3(join(parts, Self::as_vec3, Vec3::ZERO)),
+        })
+    }
+
     /// Builds a new column holding `indices` of this one, in order.
     pub fn selected(&self, indices: &[usize]) -> Result<Self, GeoError> {
         fn pick<T: HashableValue>(
@@ -496,6 +550,7 @@ impl GeoDetail {
             detail_attributes: Arc::new(BTreeMap::new()),
             point_groups: Arc::new(BTreeMap::new()),
             prim_groups: Arc::new(BTreeMap::new()),
+            packed: None,
         }
     }
 
@@ -587,6 +642,15 @@ impl GeoDetail {
         runs: Vec<PrimRun>,
         vertex_points: Vec<u32>,
     ) -> Result<Self, GeoError> {
+        // A packed primitive needs table entries, which only the packed API supplies.
+        if runs.iter().any(|run| run.kind == PrimKind::Packed) {
+            return Err(GeoError::InvalidTopology);
+        }
+        self.with_runs(runs, vertex_points)
+    }
+
+    /// Attaches topology of any kind, without packed data. Callers supply that separately.
+    pub fn with_runs(&self, runs: Vec<PrimRun>, vertex_points: Vec<u32>) -> Result<Self, GeoError> {
         let mut expected_vertices = 0usize;
         let mut total_prims = 0usize;
         for run in &runs {
@@ -596,8 +660,9 @@ impl GeoDetail {
             let min_arity = match run.kind {
                 PrimKind::Polygon => 3,
                 PrimKind::Polyline => 2,
+                PrimKind::Packed => 1,
             };
-            if run.arity < min_arity {
+            if run.arity < min_arity || (run.kind == PrimKind::Packed && run.arity != 1) {
                 return Err(GeoError::InvalidTopology);
             }
             let run_verts = (run.arity as usize)
@@ -626,6 +691,7 @@ impl GeoDetail {
         next.vertex_attributes = Arc::new(BTreeMap::new());
         next.prim_attributes = Arc::new(BTreeMap::new());
         next.prim_groups = Arc::new(BTreeMap::new());
+        next.packed = None;
         Ok(next)
     }
 
@@ -823,7 +889,7 @@ impl GeoDetail {
         }
         let base = Self::points(points);
         if self.prim_runs.is_empty() && other.prim_runs.is_empty() {
-            return Ok(base);
+            return base.with_merged_data(self, other);
         }
         let mut runs = Vec::with_capacity(self.prim_runs.len() + other.prim_runs.len());
         runs.extend_from_slice(&self.prim_runs);
@@ -855,7 +921,97 @@ impl GeoDetail {
                 vertex_points.push(shifted);
             }
         }
-        base.with_primitives(runs, vertex_points)
+        base.with_runs(runs, vertex_points)?
+            .with_merged_data(self, other)
+    }
+
+    /// Fills in attributes and groups after a merge. Elements from the side lacking an attribute
+    /// read as zero and elements of a side lacking a group are unselected, while detail values come
+    /// from the first side that has them. An attribute must have one type on both sides.
+    fn with_merged_data(mut self, first: &Self, second: &Self) -> Result<Self, GeoError> {
+        let columns = |left: &BTreeMap<String, AttributeColumn>,
+                       right: &BTreeMap<String, AttributeColumn>,
+                       left_len: usize,
+                       right_len: usize|
+         -> Result<BTreeMap<String, AttributeColumn>, GeoError> {
+            let mut merged = BTreeMap::new();
+            for name in left.keys().chain(right.keys()) {
+                if !merged.contains_key(name) {
+                    let column = AttributeColumn::concatenated(
+                        left.get(name),
+                        left_len,
+                        right.get(name),
+                        right_len,
+                    )?;
+                    merged.insert(name.clone(), column);
+                }
+            }
+            Ok(merged)
+        };
+        self.point_attributes = Arc::new(columns(
+            &first.point_attributes,
+            &second.point_attributes,
+            first.len(),
+            second.len(),
+        )?);
+        self.vertex_attributes = Arc::new(columns(
+            &first.vertex_attributes,
+            &second.vertex_attributes,
+            first.vertex_count(),
+            second.vertex_count(),
+        )?);
+        self.prim_attributes = Arc::new(columns(
+            &first.prim_attributes,
+            &second.prim_attributes,
+            first.prim_count(),
+            second.prim_count(),
+        )?);
+        let mut detail = (*first.detail_attributes).clone();
+        for (name, column) in &*second.detail_attributes {
+            detail.entry(name.clone()).or_insert_with(|| column.clone());
+        }
+        self.detail_attributes = Arc::new(detail);
+        self.packed =
+            PackedTable::merged(first.packed.as_deref(), second.packed.as_deref()).map(Arc::new);
+        let groups = |left: &BTreeMap<String, ElementGroup>,
+                      right: &BTreeMap<String, ElementGroup>,
+                      left_len: usize,
+                      right_len: usize| {
+            let mut merged = BTreeMap::new();
+            for name in left.keys().chain(right.keys()) {
+                if merged.contains_key(name) {
+                    continue;
+                }
+                let selected = |group: Option<&ElementGroup>, index: usize| {
+                    group.is_some_and(|found| found.contains(index))
+                };
+                let mut mask = Vec::with_capacity(left_len + right_len);
+                mask.extend((0..left_len).map(|i| selected(left.get(name), i)));
+                mask.extend((0..right_len).map(|i| selected(right.get(name), i)));
+                let selected_count = mask.iter().filter(|&&selected| selected).count();
+                merged.insert(
+                    name.clone(),
+                    ElementGroup {
+                        mask: PagedColumn::from_vec(mask),
+                        selected_count,
+                    },
+                );
+            }
+            merged
+        };
+        self.point_groups = Arc::new(groups(
+            &first.point_groups,
+            &second.point_groups,
+            first.len(),
+            second.len(),
+        ));
+        self.prim_groups = Arc::new(groups(
+            &first.prim_groups,
+            &second.prim_groups,
+            first.prim_count(),
+            second.prim_count(),
+        ));
+        Ok(self)
     }
 
     #[must_use]
@@ -2036,7 +2192,7 @@ impl GeoDetail {
             for _ in 0..run.prim_count {
                 match run.kind {
                     PrimKind::Polygon => order.extend((cursor..cursor + arity).rev()),
-                    PrimKind::Polyline => order.extend(cursor..cursor + arity),
+                    PrimKind::Polyline | PrimKind::Packed => order.extend(cursor..cursor + arity),
                 }
                 cursor += arity;
             }
@@ -2092,6 +2248,7 @@ impl GeoDetail {
                 let kind_tag: u8 = match run.kind {
                     PrimKind::Polygon => 1,
                     PrimKind::Polyline => 2,
+                    PrimKind::Packed => 3,
                 };
                 h.update(&[kind_tag]);
                 h.update(&run.arity.to_le_bytes());
@@ -2128,6 +2285,9 @@ impl GeoDetail {
                 }
             }
         }
+        if let Some(table) = &self.packed {
+            table.update_hash(&mut h);
+        }
         h.finalize()
     }
 
@@ -2145,6 +2305,19 @@ impl GeoDetail {
                 hi.y = hi.y.max(p.y);
                 hi.z = hi.z.max(p.z);
             }
+        }
+        // Instances reach past their points, by as much as their prototypes extend.
+        if let Some((low, high)) = self.packed_bounds() {
+            lo = Vec3 {
+                x: lo.x.min(low.x),
+                y: lo.y.min(low.y),
+                z: lo.z.min(low.z),
+            };
+            hi = Vec3 {
+                x: hi.x.max(high.x),
+                y: hi.y.max(high.y),
+                z: hi.z.max(high.z),
+            };
         }
         Some((lo, hi))
     }
@@ -2342,6 +2515,7 @@ impl TopologyIndex {
             let kind_tag: u8 = match run.kind {
                 PrimKind::Polygon => 1,
                 PrimKind::Polyline => 2,
+                PrimKind::Packed => 3,
             };
             h.update(&[kind_tag]);
             h.update(&run.arity.to_le_bytes());
@@ -2399,7 +2573,8 @@ impl TopologyIndex {
                                 }
                             }
                         }
-                        PrimKind::Polyline => {
+                        // A packed primitive has one vertex, and so no edges at all.
+                        PrimKind::Polyline | PrimKind::Packed => {
                             if k + 1 < arity
                                 && let Some(slot) = next_he.get_mut(he)
                             {
@@ -2534,6 +2709,47 @@ impl TopologyIndex {
     #[must_use]
     pub fn prim_kind(&self, prim: u32) -> Option<PrimKind> {
         self.prim_kinds.get(prim as usize).copied()
+    }
+
+    /// Counts points whose incident polygon corners form more than one edge-connected fan. Such a
+    /// point pinches the surface even though every edge may be manifold, which
+    /// [`Self::is_closed_manifold`] does not detect.
+    #[must_use]
+    pub fn non_manifold_vertex_count(&self, geo: &GeoDetail) -> usize {
+        let corners = self.next_he.len();
+        let mut visited = vec![false; corners];
+        let mut fans = vec![0u32; geo.len()];
+        for start in 0..corners as u32 {
+            if visited[start as usize]
+                || self.prim_of_vertex(start).and_then(|p| self.prim_kind(p))
+                    != Some(PrimKind::Polygon)
+            {
+                continue;
+            }
+            let Some(point) = geo.vertex_point(start as usize) else {
+                continue;
+            };
+            fans[point as usize] += 1;
+            visited[start as usize] = true;
+            // Sweep around the point in both directions until the fan closes or hits a boundary.
+            let mut corner = start;
+            while let Some(step) = self.prev(corner).and_then(|prev| self.twin(prev)) {
+                if visited[step as usize] {
+                    break;
+                }
+                visited[step as usize] = true;
+                corner = step;
+            }
+            corner = start;
+            while let Some(step) = self.twin(corner).and_then(|twin| self.next(twin)) {
+                if visited[step as usize] {
+                    break;
+                }
+                visited[step as usize] = true;
+                corner = step;
+            }
+        }
+        fans.iter().filter(|&&count| count > 1).count()
     }
 }
 
@@ -3111,5 +3327,174 @@ mod tests {
                 }
             }
         }
+    }
+    #[test]
+    fn pinched_vertices_are_counted_even_when_every_edge_is_manifold() -> Result<(), GeoError> {
+        let v = |x, y, z| Vec3::checked(x, y, z);
+        // Two tetrahedra sharing only point 0.
+        let pinched = GeoDetail::points(vec![
+            v(0.0, 0.0, 0.0)?,
+            v(1.0, 0.0, 0.0)?,
+            v(0.0, 1.0, 0.0)?,
+            v(0.0, 0.0, 1.0)?,
+            v(-1.0, 0.0, 0.0)?,
+            v(0.0, -1.0, 0.0)?,
+            v(0.0, 0.0, -1.0)?,
+        ])
+        .with_primitives(
+            vec![PrimRun {
+                kind: PrimKind::Polygon,
+                arity: 3,
+                prim_count: 8,
+            }],
+            vec![
+                0, 2, 1, 0, 1, 3, 1, 2, 3, 0, 3, 2, 0, 5, 4, 0, 4, 6, 4, 5, 6, 0, 6, 5,
+            ],
+        )?;
+        let topology = TopologyIndex::build(&pinched);
+        assert!(topology.is_closed_manifold(), "edges alone look fine");
+        assert_eq!(topology.non_manifold_vertex_count(&pinched), 1);
+
+        // Three separate fans around one point count once, and a clean tetrahedron not at all.
+        let clean = GeoDetail::points(vec![
+            v(0.0, 0.0, 0.0)?,
+            v(1.0, 0.0, 0.0)?,
+            v(0.0, 1.0, 0.0)?,
+            v(0.0, 0.0, 1.0)?,
+        ])
+        .with_primitives(
+            vec![PrimRun {
+                kind: PrimKind::Polygon,
+                arity: 3,
+                prim_count: 4,
+            }],
+            vec![0, 2, 1, 0, 1, 3, 1, 2, 3, 0, 3, 2],
+        )?;
+        assert_eq!(
+            TopologyIndex::build(&clean).non_manifold_vertex_count(&clean),
+            0
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn merging_keeps_attributes_and_groups_from_both_sides() -> Result<(), GeoError> {
+        let triangle = |x: f32| -> Result<GeoDetail, GeoError> {
+            GeoDetail::points(vec![
+                Vec3::checked(x, 0.0, 0.0)?,
+                Vec3::checked(x + 1.0, 0.0, 0.0)?,
+                Vec3::checked(x, 1.0, 0.0)?,
+            ])
+            .with_primitives(
+                vec![PrimRun {
+                    kind: PrimKind::Polygon,
+                    arity: 3,
+                    prim_count: 1,
+                }],
+                vec![0, 1, 2],
+            )
+        };
+        let f32s = |values: Vec<f32>| AttributeColumn::f32_checked(values);
+        let left = triangle(0.0)?
+            .with_attribute("shared", f32s(vec![1.0, 2.0, 3.0])?)?
+            .with_attribute("left_only", AttributeColumn::i32_values(vec![7, 8, 9]))?
+            .with_domain_attribute(
+                AttrDomain::Prim,
+                "piece",
+                AttributeColumn::i32_values(vec![4]),
+            )?
+            .with_domain_attribute(
+                AttrDomain::Vertex,
+                "uv",
+                AttributeColumn::vec3_values(vec![Vec3::UP; 3]),
+            )?
+            .with_domain_attribute(
+                AttrDomain::Detail,
+                "note",
+                AttributeColumn::i32_values(vec![1]),
+            )?
+            .with_group(GroupDomain::Point, "picked", &[1])?;
+        let right = triangle(5.0)?
+            .with_attribute("shared", f32s(vec![4.0, 5.0, 6.0])?)?
+            .with_attribute("right_only", AttributeColumn::bool_values(vec![true; 3]))?
+            .with_domain_attribute(
+                AttrDomain::Prim,
+                "piece",
+                AttributeColumn::i32_values(vec![6]),
+            )?
+            .with_domain_attribute(
+                AttrDomain::Detail,
+                "note",
+                AttributeColumn::i32_values(vec![2]),
+            )?
+            .with_domain_attribute(
+                AttrDomain::Detail,
+                "extra",
+                AttributeColumn::i32_values(vec![3]),
+            )?
+            .with_group(GroupDomain::Prim, "hero", &[0])?;
+        let both = left.merged(&right, usize::MAX)?;
+        let shared = both.attribute("shared").and_then(AttributeColumn::as_f32);
+        let read = (0..6).map(|i| shared.and_then(|c| c.get(i)).map(|f| f.get()));
+        assert_eq!(
+            read.collect::<Vec<_>>(),
+            [1., 2., 3., 4., 5., 6.].map(Some).to_vec()
+        );
+        // Elements from the side lacking an attribute read as zero.
+        let only = both
+            .attribute("left_only")
+            .and_then(AttributeColumn::as_i32);
+        assert_eq!(only.and_then(|c| c.get(1)), Some(8));
+        assert_eq!(only.and_then(|c| c.get(4)), Some(0));
+        let only = both
+            .attribute("right_only")
+            .and_then(AttributeColumn::as_bool);
+        assert_eq!(only.and_then(|c| c.get(1)), Some(false));
+        assert_eq!(only.and_then(|c| c.get(4)), Some(true));
+        let piece = both
+            .domain_attribute(AttrDomain::Prim, "piece")
+            .and_then(AttributeColumn::as_i32);
+        assert_eq!(
+            (piece.and_then(|c| c.get(0)), piece.and_then(|c| c.get(1))),
+            (Some(4), Some(6))
+        );
+        let uv = both
+            .domain_attribute(AttrDomain::Vertex, "uv")
+            .and_then(AttributeColumn::as_vec3);
+        assert_eq!(uv.map(PagedColumn::len), Some(6));
+        assert_eq!(uv.and_then(|c| c.get(1)), Some(Vec3::UP));
+        assert_eq!(uv.and_then(|c| c.get(4)), Some(Vec3::ZERO));
+        // Detail values come from the first side that has them.
+        let detail = |name| {
+            both.domain_attribute(AttrDomain::Detail, name)
+                .and_then(AttributeColumn::as_i32)
+                .and_then(|c| c.get(0))
+        };
+        assert_eq!((detail("note"), detail("extra")), (Some(1), Some(3)));
+        let picked = both.group(GroupDomain::Point, "picked");
+        assert_eq!(picked.map(ElementGroup::selected_count), Some(1));
+        assert_eq!(
+            picked.map(|g| (g.contains(1), g.contains(4))),
+            Some((true, false))
+        );
+        let hero = both.group(GroupDomain::Prim, "hero");
+        assert_eq!(
+            hero.map(|g| (g.contains(0), g.contains(1))),
+            Some((false, true))
+        );
+
+        // One name with two types is an error, not a silent choice.
+        let conflict =
+            triangle(0.0)?.with_attribute("shared", AttributeColumn::i32_values(vec![1; 3]))?;
+        assert_eq!(
+            left.merged(&conflict, usize::MAX).err(),
+            Some(GeoError::AttributeTypeMismatch)
+        );
+        // Merging plain points keeps their attributes too.
+        let cloud = GeoDetail::points(vec![Vec3::ZERO]).with_attribute("mass", f32s(vec![2.5])?)?;
+        let clouds = cloud.merged(&cloud, usize::MAX)?;
+        let mass = clouds.attribute("mass").and_then(AttributeColumn::as_f32);
+        assert_eq!(mass.and_then(|c| c.get(1)).map(|f| f.get()), Some(2.5));
+        Ok(())
     }
 }

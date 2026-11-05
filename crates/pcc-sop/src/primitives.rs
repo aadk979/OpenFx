@@ -1,7 +1,7 @@
 //! Parametric closed-surface generators (Y-up, outward-facing) and straight polylines.
 
 use crate::common::{D3, SopContext, build_geo, lerp, to_d3};
-use pcc_geo::{GeoDetail, GeoError, PrimKind};
+use pcc_geo::{GeoDetail, GeoError, PrimKind, PrimRun};
 use pcc_math::Vec3;
 use std::f64::consts::{PI, TAU};
 
@@ -189,6 +189,91 @@ pub fn create_line(
     )
 }
 
+/// A solid box of tetrahedra, centred on the origin, with `divisions` cells along each axis.
+///
+/// Each cell is cut into six elements around its main diagonal. Every cell uses the same diagonal
+/// direction, so neighbours agree on the triangles of the face they share and the mesh is conforming.
+pub fn create_tet_box(
+    size: Vec3,
+    divisions: u32,
+    ctx: &SopContext<'_>,
+) -> Result<GeoDetail, GeoError> {
+    if divisions == 0 || size.x <= 0.0 || size.y <= 0.0 || size.z <= 0.0 {
+        return Err(GeoError::InvalidTopology);
+    }
+    let cells_per_axis = divisions as usize;
+    let side = cells_per_axis + 1;
+    let points = side
+        .checked_mul(side)
+        .and_then(|n| n.checked_mul(side))
+        .ok_or(GeoError::LimitExceeded)?;
+    let cells = cells_per_axis
+        .checked_mul(cells_per_axis)
+        .and_then(|n| n.checked_mul(cells_per_axis))
+        .ok_or(GeoError::LimitExceeded)?;
+    let elements = cells.checked_mul(6).ok_or(GeoError::LimitExceeded)?;
+    let corners = elements.checked_mul(4).ok_or(GeoError::LimitExceeded)?;
+    ctx.check_output(points, corners)?;
+    let extent = to_d3(size);
+    let coordinate =
+        |index: usize, axis: usize| extent[axis] * (index as f64 / cells_per_axis as f64 - 0.5);
+    let mut positions = Vec::with_capacity(points);
+    for z in 0..side {
+        ctx.poll()?;
+        for y in 0..side {
+            for x in 0..side {
+                positions.push(Vec3::checked(
+                    coordinate(x, 0) as f32,
+                    coordinate(y, 1) as f32,
+                    coordinate(z, 2) as f32,
+                )?);
+            }
+        }
+    }
+    let at = |[x, y, z]: [usize; 3]| ((z * side + y) * side + x) as u32;
+    // Walking from a cell's low corner to its high corner one axis at a time gives one element
+    // per order of the axes. An odd order is inverted, so its middle corners swap.
+    let walks: [([usize; 3], bool); 6] = [
+        ([0, 1, 2], false),
+        ([1, 2, 0], false),
+        ([2, 0, 1], false),
+        ([0, 2, 1], true),
+        ([1, 0, 2], true),
+        ([2, 1, 0], true),
+    ];
+    let mut vertices = Vec::with_capacity(corners);
+    for z in 0..cells_per_axis {
+        ctx.poll()?;
+        for y in 0..cells_per_axis {
+            for x in 0..cells_per_axis {
+                for (walk, odd) in walks {
+                    let mut corner = [x, y, z];
+                    let start = at(corner);
+                    corner[walk[0]] += 1;
+                    let first = at(corner);
+                    corner[walk[1]] += 1;
+                    let second = at(corner);
+                    let end = at([x + 1, y + 1, z + 1]);
+                    let (b, c) = if odd {
+                        (second, first)
+                    } else {
+                        (first, second)
+                    };
+                    vertices.extend_from_slice(&[start, b, c, end]);
+                }
+            }
+        }
+    }
+    GeoDetail::points(positions).with_primitives(
+        vec![PrimRun {
+            kind: PrimKind::Tetrahedron,
+            arity: 4,
+            prim_count: elements,
+        }],
+        vertices,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -254,6 +339,77 @@ mod tests {
         assert_eq!(
             create_sphere(1.0, 4096, 4096, &SopContext::new(1024, &flag)).err(),
             Some(GeoError::LimitExceeded)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_tet_box_is_a_conforming_solid_of_the_right_size() -> Result<(), GeoError> {
+        let flag = AtomicBool::new(false);
+        let ctx = SopContext::new(1 << 28, &flag);
+        let size = Vec3 {
+            x: 2.0,
+            y: 3.0,
+            z: 5.0,
+        };
+        for divisions in [1u32, 2, 5] {
+            let n = divisions as usize;
+            let geo = create_tet_box(size, divisions, &ctx)?;
+            assert_eq!(geo.tet_count(), 6 * n * n * n);
+            assert_eq!(geo.len(), (n + 1) * (n + 1) * (n + 1));
+            assert!((geo.tet_volume()? - 30.0).abs() < 1e-3, "{divisions}");
+            let (low, high) = geo.bounds().ok_or(GeoError::IndexOutOfBounds)?;
+            assert_eq!(
+                (low.x, low.y, low.z, high.x, high.y, high.z),
+                (-1.0, -1.5, -2.5, 1.0, 1.5, 2.5)
+            );
+            // Extracting a surface refuses inverted or overlapping elements, so this also
+            // proves that every element is positive and that neighbours conform.
+            let surface = geo.tet_surface_cancellable(1 << 28, &flag)?;
+            assert_eq!(surface.prim_count(), 12 * n * n);
+            assert!(surface.topology_index().is_closed_manifold());
+            assert!((surface.surface_area() - 62.0).abs() < 1e-3, "{divisions}");
+            assert!(
+                (surface.enclosed_volume() - 30.0).abs() < 1e-3,
+                "{divisions}"
+            );
+            // Only a cell count above one leaves any point inside.
+            let inside = (n + 1).pow(3) - (n.saturating_sub(1)).pow(3);
+            assert_eq!(surface.len(), inside);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn a_tet_box_refuses_bad_input_and_respects_its_budget() -> Result<(), GeoError> {
+        let flag = AtomicBool::new(false);
+        let ctx = SopContext::new(1 << 28, &flag);
+        let unit = Vec3 {
+            x: 1.0,
+            y: 1.0,
+            z: 1.0,
+        };
+        let refused = Some(GeoError::InvalidTopology);
+        assert_eq!(create_tet_box(unit, 0, &ctx).err(), refused);
+        for flat in [
+            Vec3 { x: 0.0, ..unit },
+            Vec3 { y: 0.0, ..unit },
+            Vec3 { z: -1.0, ..unit },
+        ] {
+            assert_eq!(create_tet_box(flat, 1, &ctx).err(), refused);
+        }
+        assert_eq!(
+            create_tet_box(unit, u32::MAX, &ctx).err(),
+            Some(GeoError::LimitExceeded)
+        );
+        assert_eq!(
+            create_tet_box(unit, 64, &SopContext::new(1024, &flag)).err(),
+            Some(GeoError::LimitExceeded)
+        );
+        let cancelled = AtomicBool::new(true);
+        assert_eq!(
+            create_tet_box(unit, 1, &SopContext::new(1 << 28, &cancelled)).err(),
+            Some(GeoError::Cancelled)
         );
         Ok(())
     }

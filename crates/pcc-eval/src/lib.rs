@@ -15,12 +15,12 @@ use pcc_id::{NodeId, RevisionId};
 use pcc_math::{Philox4x32, Vec3};
 use pcc_sop::{
     RemeshParams, SopContext, SurfaceScatter, Trs, attrib_transfer, clip_halfspace, create_line,
-    create_sphere, create_torus, create_tube, fuse_points, measure, poly_bevel, poly_reduce,
-    remesh, resample_curves, reverse_winding, scatter_surface, sweep_curves, transform_trs,
-    triangulate, uv_flatten, uv_layout, voronoi_fracture,
+    create_sphere, create_tet_box, create_torus, create_tube, fuse_points, measure, poly_bevel,
+    poly_reduce, remesh, resample_curves, reverse_winding, scatter_surface, sweep_curves,
+    transform_trs, triangulate, uv_flatten, uv_layout, voronoi_fracture,
 };
 use pcc_terrain::{HeightField, HfErodeParams, HfNoiseParams};
-use pcc_vdb::{VdbCombineOp, VdbGrid, boolean_meshes_cancellable};
+use pcc_vdb::{VdbCombineOp, VdbGrid, VdbOps, boolean_meshes_cancellable};
 use pcc_vex::{DEFAULT_MAX_FUEL_PER_POINT, VexError, compile_vex};
 use std::{
     collections::BTreeMap,
@@ -518,6 +518,109 @@ fn check_element_estimate(requested: u32, ctx: &EvalContext<'_>) -> Result<(), E
     Ok(())
 }
 
+fn geo_error(error: GeoError) -> EvalError {
+    match error {
+        GeoError::Cancelled => EvalError::Cancelled,
+        other => EvalError::Resource(other),
+    }
+}
+
+/// Whether an operator handles one kind of primitive, and what to do if it does not.
+struct PrimSupport {
+    accepted: bool,
+    count: fn(&GeoDetail) -> usize,
+    name: &'static str,
+    remedy: &'static str,
+}
+
+/// An operator that does not understand a kind of primitive must not expand, skip, or lose it.
+fn refuse_unsupported_inputs(
+    node: &Node,
+    outputs: &BTreeMap<NodeId, Arc<GeoDetail>>,
+) -> Result<(), EvalError> {
+    let def = node_def(&node.op);
+    let kinds = [
+        PrimSupport {
+            accepted: def.is_some_and(|d| d.accepts_packed),
+            count: GeoDetail::packed_count,
+            name: "packed instances",
+            remedy: "unpack",
+        },
+        PrimSupport {
+            accepted: def.is_some_and(|d| d.accepts_tets),
+            count: GeoDetail::tet_count,
+            name: "tetrahedra",
+            remedy: "tet_surface",
+        },
+        PrimSupport {
+            accepted: def.is_some_and(|d| d.accepts_volumes),
+            count: GeoDetail::volume_count,
+            name: "volumes",
+            remedy: "convert_vdb",
+        },
+    ];
+    for kind in kinds.iter().filter(|kind| !kind.accepted) {
+        for id in &node.inputs {
+            if outputs.get(id).is_some_and(|geo| (kind.count)(geo) > 0) {
+                return Err(EvalError::Param {
+                    node: node.id,
+                    param: "input".to_owned(),
+                    message: format!(
+                        "`{}` does not accept {}: use `{}` first",
+                        node.op, kind.name, kind.remedy
+                    ),
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Every grid of geometry that must hold volumes and nothing else.
+fn only_volumes(node: &Node, geo: &GeoDetail) -> Result<Vec<Arc<VdbGrid>>, EvalError> {
+    if geo.volume_count() == 0 || geo.prim_count() != geo.volume_count() {
+        return Err(EvalError::Param {
+            node: node.id,
+            param: "input".to_owned(),
+            message: format!(
+                "`{}` needs volumes and nothing else: `vdb_from_polygons` makes them",
+                node.op
+            ),
+        });
+    }
+    (0..geo.volume_count())
+        .map(|index| geo.volume(index).cloned().ok_or(EvalError::InvalidGraph))
+        .collect()
+}
+
+/// Applies `each` to every grid and merges the results, in primitive order.
+fn merge_each(
+    grids: Vec<Arc<VdbGrid>>,
+    ctx: &EvalContext<'_>,
+    each: impl Fn(&VdbGrid) -> Result<GeoDetail, GeoError>,
+) -> Result<GeoDetail, GeoError> {
+    let mut merged: Option<GeoDetail> = None;
+    for grid in grids {
+        let next = each(&grid)?;
+        merged = Some(match merged {
+            Some(sofar) => {
+                sofar.merged_cancellable(&next, ctx.budget.max_memory_bytes, ctx.cancelled)?
+            }
+            None => next,
+        });
+    }
+    merged.ok_or(GeoError::InvalidTopology)
+}
+
+/// Voxels count as elements, as they did when they travelled between nodes as points.
+fn check_voxel_budget(geo: &GeoDetail, ctx: &EvalContext<'_>) -> Result<(), EvalError> {
+    let voxels: usize = (0..geo.volume_count())
+        .filter_map(|index| geo.volume(index))
+        .map(|grid| grid.active_voxel_count())
+        .sum();
+    check_element_estimate(u32::try_from(voxels).unwrap_or(u32::MAX), ctx)
+}
+
 /// Maps operator errors onto evaluator errors and enforces the element budget on the output.
 fn finish_sop(
     result: Result<GeoDetail, GeoError>,
@@ -816,6 +919,22 @@ fn eval_single_node(
             finish_sop(
                 PackedPrototype::new(Arc::clone(source))
                     .and_then(|prototype| target.with_instances_on_points(prototype, &scale_of)),
+                ctx,
+            )
+        }
+        "tetbox" => {
+            let size = param_vec3(node, "size")?;
+            let divisions = param_u32(node, "divisions")?;
+            check_element_estimate(divisions.saturating_add(1).saturating_pow(3), ctx)?;
+            let sop = SopContext::new(ctx.budget.max_memory_bytes, ctx.cancelled);
+            finish_sop(create_tet_box(size, divisions, &sop), ctx)
+        }
+        "tet_surface" => {
+            let input_geo = outputs
+                .get(&input_slot(node, 0)?)
+                .ok_or(EvalError::InvalidGraph)?;
+            finish_sop(
+                input_geo.tet_surface_cancellable(ctx.budget.max_memory_bytes, ctx.cancelled),
                 ctx,
             )
         }
@@ -1190,110 +1309,66 @@ fn eval_single_node(
                 })
         }
         "vdb_from_polygons" => {
-            let id = &node.id;
-            let input = &input_slot(node, 0)?;
-            let voxel_size = &param_f32(node, "voxel_size")?;
-
-            if *id == *input {
-                return Err(EvalError::InvalidGraph);
-            }
-            let prior_geo = outputs.get(input).ok_or(EvalError::InvalidGraph)?;
-            let vdb = VdbGrid::from_polygons_cancellable(
-                prior_geo,
-                *voxel_size,
+            let input_geo = outputs
+                .get(&input_slot(node, 0)?)
+                .ok_or(EvalError::InvalidGraph)?;
+            let grid = VdbGrid::from_polygons_cancellable(
+                input_geo,
+                param_f32(node, "voxel_size")?,
                 3,
                 ctx.budget.max_memory_bytes,
                 ctx.cancelled,
             )
-            .map_err(|e| match e {
-                GeoError::Cancelled => EvalError::Cancelled,
-                other => EvalError::Resource(other),
-            })?;
-            let out = vdb
-                .to_voxel_geo_detail_cancellable(ctx.budget.max_memory_bytes, ctx.cancelled)
-                .map_err(|e| match e {
-                    GeoError::Cancelled => EvalError::Cancelled,
-                    other => EvalError::Resource(other),
-                })?;
-            let pts_u32 = u32::try_from(out.len())
-                .map_err(|_| EvalError::Resource(GeoError::LimitExceeded))?;
-            if pts_u32 > ctx.budget.max_elements {
-                return Err(EvalError::ElementLimit {
-                    requested: pts_u32,
-                    limit: ctx.budget.max_elements,
-                });
-            }
+            .map_err(geo_error)?;
+            let out = GeoDetail::from_volumes(vec![Arc::new(grid)]).map_err(geo_error)?;
+            check_voxel_budget(&out, ctx)?;
             Ok(out)
         }
         "vdb_reshape" => {
-            let id = &node.id;
-            let input = &input_slot(node, 0)?;
-            let offset = &param_f32(node, "offset")?;
-            let smooth_iterations = &param_u32(node, "smooth_iterations")?;
-
-            if *id == *input {
-                return Err(EvalError::InvalidGraph);
+            let input_geo = outputs
+                .get(&input_slot(node, 0)?)
+                .ok_or(EvalError::InvalidGraph)?;
+            let offset = param_f32(node, "offset")?;
+            let smooth_iterations = param_u32(node, "smooth_iterations")?;
+            let mut reshaped = Vec::with_capacity(input_geo.volume_count());
+            for grid in only_volumes(node, input_geo)? {
+                let next = grid
+                    .reshape_cancellable(
+                        offset,
+                        smooth_iterations,
+                        ctx.budget.max_memory_bytes,
+                        ctx.cancelled,
+                    )
+                    .map_err(geo_error)?;
+                reshaped.push(Arc::new(next));
             }
-            let prior_geo = outputs.get(input).ok_or(EvalError::InvalidGraph)?;
-            let vdb = VdbGrid::from_voxel_geo_detail_cancellable(
-                prior_geo,
-                ctx.budget.max_memory_bytes,
-                ctx.cancelled,
+            let out = input_geo.with_volume_grids(reshaped).map_err(geo_error)?;
+            check_voxel_budget(&out, ctx)?;
+            Ok(out)
+        }
+        "vdb_to_points" => {
+            let input_geo = outputs
+                .get(&input_slot(node, 0)?)
+                .ok_or(EvalError::InvalidGraph)?;
+            let grids = only_volumes(node, input_geo)?;
+            finish_sop(
+                merge_each(grids, ctx, |grid| {
+                    grid.to_voxel_geo_detail_cancellable(ctx.budget.max_memory_bytes, ctx.cancelled)
+                }),
+                ctx,
             )
-            .map_err(|e| match e {
-                GeoError::Cancelled => EvalError::Cancelled,
-                other => EvalError::Resource(other),
-            })?;
-            let reshaped = vdb
-                .reshape_cancellable(
-                    *offset,
-                    *smooth_iterations,
-                    ctx.budget.max_memory_bytes,
-                    ctx.cancelled,
-                )
-                .map_err(|e| match e {
-                    GeoError::Cancelled => EvalError::Cancelled,
-                    other => EvalError::Resource(other),
-                })?;
-            reshaped
-                .to_voxel_geo_detail_cancellable(ctx.budget.max_memory_bytes, ctx.cancelled)
-                .map_err(|e| match e {
-                    GeoError::Cancelled => EvalError::Cancelled,
-                    other => EvalError::Resource(other),
-                })
         }
         "convert_vdb" => {
-            let id = &node.id;
-            let input = &input_slot(node, 0)?;
-
-            if *id == *input {
-                return Err(EvalError::InvalidGraph);
-            }
-            let prior_geo = outputs.get(input).ok_or(EvalError::InvalidGraph)?;
-            let vdb = VdbGrid::from_voxel_geo_detail_cancellable(
-                prior_geo,
-                ctx.budget.max_memory_bytes,
-                ctx.cancelled,
+            let input_geo = outputs
+                .get(&input_slot(node, 0)?)
+                .ok_or(EvalError::InvalidGraph)?;
+            let grids = only_volumes(node, input_geo)?;
+            finish_sop(
+                merge_each(grids, ctx, |grid| {
+                    grid.to_polygons_cancellable(ctx.budget.max_memory_bytes, ctx.cancelled)
+                }),
+                ctx,
             )
-            .map_err(|e| match e {
-                GeoError::Cancelled => EvalError::Cancelled,
-                other => EvalError::Resource(other),
-            })?;
-            let out = vdb
-                .to_polygons_cancellable(ctx.budget.max_memory_bytes, ctx.cancelled)
-                .map_err(|e| match e {
-                    GeoError::Cancelled => EvalError::Cancelled,
-                    other => EvalError::Resource(other),
-                })?;
-            let pts_u32 = u32::try_from(out.len())
-                .map_err(|_| EvalError::Resource(GeoError::LimitExceeded))?;
-            if pts_u32 > ctx.budget.max_elements {
-                return Err(EvalError::ElementLimit {
-                    requested: pts_u32,
-                    limit: ctx.budget.max_elements,
-                });
-            }
-            Ok(out)
         }
         "boolean" => {
             let id = &node.id;
@@ -1660,21 +1735,7 @@ impl Pass<'_> {
         node: &Node,
         outputs: &BTreeMap<NodeId, Arc<GeoDetail>>,
     ) -> Result<Arc<GeoDetail>, EvalError> {
-        // An operator that does not understand instances must not expand or lose them unasked.
-        if !node_def(&node.op).is_some_and(|def| def.accepts_packed) {
-            for id in &node.inputs {
-                if outputs.get(id).is_some_and(|geo| geo.packed_count() > 0) {
-                    return Err(EvalError::Param {
-                        node: node.id,
-                        param: "input".to_owned(),
-                        message: format!(
-                            "`{}` does not accept packed instances: use `unpack` first",
-                            node.op
-                        ),
-                    });
-                }
-            }
-        }
+        refuse_unsupported_inputs(node, outputs)?;
         let (numerator, denominator) = (self.frame_numerator, self.frame_denominator);
         let Some(cook_cache) = self.cache else {
             return Ok(Arc::new(eval_single_node(
@@ -2564,13 +2625,17 @@ mod tests {
             ],
         };
 
-        // Intermediate VdbFromPolygons (Node 3) exposes active narrow-band voxels (`phi`, `vx`, `vy`, `vz`)
-        let vdb_pts = cook_node_cached(&cache, &snapshot, NodeId(3), 0, 24, &ctx);
-        assert!(vdb_pts.is_ok());
-        if let Ok(vdb_pts) = vdb_pts {
-            assert!(vdb_pts.len() > 10);
-            assert!(vdb_pts.attribute("phi").is_some());
-            assert!(vdb_pts.attribute("vx").is_some());
+        // Intermediate VdbFromPolygons (Node 3) carries a real volume primitive.
+        let volume = cook_node_cached(&cache, &snapshot, NodeId(3), 0, 24, &ctx);
+        assert!(volume.is_ok());
+        if let Ok(volume) = volume {
+            assert_eq!(volume.volume_count(), 1);
+            assert_eq!(volume.prim_count(), 1);
+            assert!(
+                volume
+                    .volume(0)
+                    .is_some_and(|g| g.active_voxel_count() > 10)
+            );
         }
 
         // ConvertVDB (Node 5) extracts a closed 2-manifold quad mesh

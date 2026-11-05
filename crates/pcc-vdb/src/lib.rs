@@ -7,64 +7,14 @@ mod fast_winding;
 use fast_winding::MeshField;
 use pcc_geo::{
     AttrDomain, AttributeColumn, FiniteF32, GeoDetail, GeoError, PAGE_LEN, PrimKind, PrimRun,
+    local_index, split_coord,
 };
+pub use pcc_geo::{BRICK_DIM, BRICK_LEN, Brick8x8x8, VdbGrid};
 use pcc_math::Vec3;
 use std::{
     collections::{BTreeMap, BTreeSet},
-    sync::{
-        Arc,
-        atomic::{AtomicBool, AtomicUsize, Ordering},
-    },
+    sync::atomic::{AtomicBool, AtomicUsize, Ordering},
 };
-
-/// Logical brick edge length ($8 \times 8 \times 8 = 512$ voxels per sparse leaf brick).
-pub const BRICK_DIM: usize = 8;
-pub const BRICK_LEN: usize = BRICK_DIM * BRICK_DIM * BRICK_DIM;
-
-#[derive(Clone, Debug)]
-pub struct Brick8x8x8 {
-    values: Arc<[FiniteF32]>,
-    hash: blake3::Hash,
-}
-
-impl Brick8x8x8 {
-    pub fn from_vec(values: Vec<FiniteF32>) -> Result<Self, GeoError> {
-        if values.len() != BRICK_LEN {
-            return Err(GeoError::AttributeLengthMismatch {
-                expected: BRICK_LEN,
-                actual: values.len(),
-            });
-        }
-        let mut hasher = blake3::Hasher::new();
-        hasher.update(b"pcc-vdb-brick-v1");
-        for v in &values {
-            hasher.update(&v.get().to_bits().to_le_bytes());
-        }
-        Ok(Self {
-            values: Arc::from(values),
-            hash: hasher.finalize(),
-        })
-    }
-
-    #[must_use]
-    pub fn filled(value: FiniteF32) -> Self {
-        let values = vec![value; BRICK_LEN];
-        let mut hasher = blake3::Hasher::new();
-        hasher.update(b"pcc-vdb-brick-v1");
-        for v in &values {
-            hasher.update(&v.get().to_bits().to_le_bytes());
-        }
-        Self {
-            values: Arc::from(values),
-            hash: hasher.finalize(),
-        }
-    }
-
-    #[must_use]
-    pub const fn hash(&self) -> blake3::Hash {
-        self.hash
-    }
-}
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum VdbCombineOp {
@@ -74,131 +24,57 @@ pub enum VdbCombineOp {
     SmoothUnion { radius: f32 },
 }
 
-/// Sparse $8^3$ Copy-on-Write brick volumetric grid.
-#[derive(Clone, Debug)]
-pub struct VdbGrid {
-    voxel_size: FiniteF32,
-    background: FiniteF32,
-    bricks: Arc<BTreeMap<(i32, i32, i32), Brick8x8x8>>,
-}
-
-fn split_coord(v: i32) -> (i32, usize) {
-    let bx = v.div_euclid(BRICK_DIM as i32);
-    let lx = v.rem_euclid(BRICK_DIM as i32) as usize;
-    (bx, lx)
-}
-
-fn local_index(lx: usize, ly: usize, lz: usize) -> usize {
-    (lz * BRICK_DIM + ly) * BRICK_DIM + lx
-}
-
-impl VdbGrid {
-    pub fn new(voxel_size: f32, background: f32) -> Result<Self, GeoError> {
-        let vs = FiniteF32::checked(voxel_size)?;
-        let bg = FiniteF32::checked(background)?;
-        if vs.get() <= 0.0 || bg.get() <= 0.0 {
-            return Err(GeoError::InvalidTopology);
-        }
-        Ok(Self {
-            voxel_size: vs,
-            background: bg,
-            bricks: Arc::new(BTreeMap::new()),
-        })
-    }
-
-    #[must_use]
-    pub const fn voxel_size(&self) -> f32 {
-        self.voxel_size.get()
-    }
-
-    #[must_use]
-    pub const fn background(&self) -> f32 {
-        self.background.get()
-    }
-
-    #[must_use]
-    pub fn active_brick_count(&self) -> usize {
-        self.bricks.len()
-    }
-
-    #[must_use]
-    pub fn get(&self, vx: i32, vy: i32, vz: i32) -> f32 {
-        let (bx, lx) = split_coord(vx);
-        let (by, ly) = split_coord(vy);
-        let (bz, lz) = split_coord(vz);
-        self.bricks
-            .get(&(bx, by, bz))
-            .and_then(|b| b.values.get(local_index(lx, ly, lz)))
-            .map_or_else(|| self.background.get(), |v| v.get())
-    }
-
-    /// Returns a new `VdbGrid` with voxel `(vx, vy, vz)` set to `value`, copying only the
-    /// affected $8^3$ brick and sharing all other bricks via `Arc`.
-    pub fn with_voxel(&self, vx: i32, vy: i32, vz: i32, value: f32) -> Result<Self, GeoError> {
-        let checked = FiniteF32::checked(value)?;
-        let (bx, lx) = split_coord(vx);
-        let (by, ly) = split_coord(vy);
-        let (bz, lz) = split_coord(vz);
-        let key = (bx, by, bz);
-        let idx = local_index(lx, ly, lz);
-
-        let mut next_bricks = (*self.bricks).clone();
-        let mut vals = next_bricks
-            .get(&key)
-            .map_or_else(|| vec![self.background; BRICK_LEN], |b| b.values.to_vec());
-        if let Some(slot) = vals.get_mut(idx) {
-            *slot = checked;
-        } else {
-            return Err(GeoError::IndexOutOfBounds);
-        }
-        next_bricks.insert(key, Brick8x8x8::from_vec(vals)?);
-        Ok(Self {
-            voxel_size: self.voxel_size,
-            background: self.background,
-            bricks: Arc::new(next_bricks),
-        })
-    }
-
-    #[must_use]
-    pub fn brick_shared_with(&self, other: &Self, brick_coord: (i32, i32, i32)) -> bool {
-        self.bricks.get(&brick_coord).is_some_and(|a| {
-            other
-                .bricks
-                .get(&brick_coord)
-                .is_some_and(|b| Arc::ptr_eq(&a.values, &b.values))
-        })
-    }
-
-    #[must_use]
-    pub fn hash(&self) -> blake3::Hash {
-        let mut hasher = blake3::Hasher::new();
-        hasher.update(b"pcc-vdb-grid-v1");
-        hasher.update(&self.voxel_size.get().to_bits().to_le_bytes());
-        hasher.update(&self.background.get().to_bits().to_le_bytes());
-        hasher.update(&(self.bricks.len() as u64).to_le_bytes());
-        for (&(bx, by, bz), brick) in &*self.bricks {
-            hasher.update(&bx.to_le_bytes());
-            hasher.update(&by.to_le_bytes());
-            hasher.update(&bz.to_le_bytes());
-            hasher.update(brick.hash.as_bytes());
-        }
-        hasher.finalize()
-    }
-
-    #[must_use]
-    pub fn voxel_center(&self, vx: i32, vy: i32, vz: i32) -> Vec3 {
-        let vs = self.voxel_size.get();
-        Vec3::checked(
-            (vx as f32 + 0.5) * vs,
-            (vy as f32 + 0.5) * vs,
-            (vz as f32 + 0.5) * vs,
-        )
-        .unwrap_or(Vec3::ZERO)
-    }
-
+/// What can be done with a grid, beyond storing it.
+pub trait VdbOps: Sized {
     /// Builds a narrow-band signed distance field (`VdbGrid`) from polygon primitives of `geo`
     /// using exact point-to-triangle distance and generalized solid-angle winding numbers.
-    pub fn from_polygons_cancellable(
+    fn from_polygons_cancellable(
+        geo: &GeoDetail,
+        voxel_size: f32,
+        half_band_voxels: u32,
+        memory_limit: usize,
+        cancelled: &AtomicBool,
+    ) -> Result<Self, GeoError>;
+
+    /// Applies a morphological level-set offset (`offset > 0` dilates the solid interior $\phi < 0$;
+    /// `offset < 0` erodes/shrinks it) and optional 6-neighbor Laplacian smoothing iterations.
+    fn reshape_cancellable(
+        &self,
+        offset: f32,
+        smooth_iterations: u32,
+        memory_limit: usize,
+        cancelled: &AtomicBool,
+    ) -> Result<Self, GeoError>;
+
+    /// Combines two `VdbGrid` signed distance fields using level-set CSG (`Union`, `Intersection`, `Difference`, `SmoothUnion`).
+    fn csg_combine_cancellable(
+        &self,
+        other: &Self,
+        op: VdbCombineOp,
+        memory_limit: usize,
+        cancelled: &AtomicBool,
+    ) -> Result<Self, GeoError>;
+
+    /// Extracts the $\phi = 0$ isosurface of this `VdbGrid` as a guaranteed closed manifold
+    /// all-quad `GeoDetail` (`is_closed_manifold() == true`) using Dual Surface Nets with
+    /// checkerboard saddle regularization.
+    fn to_polygons_cancellable(
+        &self,
+        memory_limit: usize,
+        cancelled: &AtomicBool,
+    ) -> Result<GeoDetail, GeoError>;
+
+    /// Lists active narrow-band voxels of this `VdbGrid` as a `GeoDetail` point cloud, to inspect them,
+    /// with point attributes `f@phi`, `i@vx`, `i@vy`, `i@vz` and detail attributes `f@vdb_voxel_size`, `f@vdb_background`.
+    fn to_voxel_geo_detail_cancellable(
+        &self,
+        memory_limit: usize,
+        cancelled: &AtomicBool,
+    ) -> Result<GeoDetail, GeoError>;
+}
+
+impl VdbOps for VdbGrid {
+    fn from_polygons_cancellable(
         geo: &GeoDetail,
         voxel_size: f32,
         half_band_voxels: u32,
@@ -292,16 +168,10 @@ impl VdbGrid {
         for (coord, vals) in brick_vecs {
             bricks.insert(coord, Brick8x8x8::from_vec(vals)?);
         }
-        Ok(Self {
-            voxel_size: vs,
-            background: bg,
-            bricks: Arc::new(bricks),
-        })
+        Self::from_parts(vs, bg, bricks)
     }
 
-    /// Applies a morphological level-set offset (`offset > 0` dilates the solid interior $\phi < 0$;
-    /// `offset < 0` erodes/shrinks it) and optional 6-neighbor Laplacian smoothing iterations.
-    pub fn reshape_cancellable(
+    fn reshape_cancellable(
         &self,
         offset: f32,
         smooth_iterations: u32,
@@ -318,7 +188,7 @@ impl VdbGrid {
             return Err(GeoError::InvalidTopology);
         }
         let brick_bytes = self
-            .bricks
+            .bricks()
             .len()
             .checked_mul(BRICK_LEN * std::mem::size_of::<FiniteF32>())
             .ok_or(GeoError::LimitExceeded)?;
@@ -326,22 +196,22 @@ impl VdbGrid {
             return Err(GeoError::LimitExceeded);
         }
 
-        let bg = self.background.get();
+        let bg = self.background();
         let mut current = self.clone();
         if offset != 0.0 {
             let mut next_bricks = BTreeMap::new();
-            for (&coord, brick) in &*current.bricks {
+            for (&coord, brick) in current.bricks() {
                 if cancelled.load(Ordering::Acquire) {
                     return Err(GeoError::Cancelled);
                 }
                 let mut vals = Vec::with_capacity(BRICK_LEN);
-                for &v in &*brick.values {
+                for &v in brick.values() {
                     let shifted = (v.get() - offset).clamp(-bg, bg);
                     vals.push(FiniteF32::checked(shifted)?);
                 }
                 next_bricks.insert(coord, Brick8x8x8::from_vec(vals)?);
             }
-            current.bricks = Arc::new(next_bricks);
+            current = current.with_bricks(next_bricks);
         }
 
         for _ in 0..smooth_iterations {
@@ -349,8 +219,8 @@ impl VdbGrid {
                 return Err(GeoError::Cancelled);
             }
             let mut next_bricks = BTreeMap::new();
-            for &(bx, by, bz) in current.bricks.keys() {
-                let mut vals = vec![current.background; BRICK_LEN];
+            for &(bx, by, bz) in current.bricks().keys() {
+                let mut vals = vec![FiniteF32::checked(current.background())?; BRICK_LEN];
                 for lz in 0..BRICK_DIM {
                     for ly in 0..BRICK_DIM {
                         for lx in 0..BRICK_DIM {
@@ -371,13 +241,12 @@ impl VdbGrid {
                 }
                 next_bricks.insert((bx, by, bz), Brick8x8x8::from_vec(vals)?);
             }
-            current.bricks = Arc::new(next_bricks);
+            current = current.with_bricks(next_bricks);
         }
         Ok(current)
     }
 
-    /// Combines two `VdbGrid` signed distance fields using level-set CSG (`Union`, `Intersection`, `Difference`, `SmoothUnion`).
-    pub fn csg_combine_cancellable(
+    fn csg_combine_cancellable(
         &self,
         other: &Self,
         op: VdbCombineOp,
@@ -388,10 +257,10 @@ impl VdbGrid {
             return Err(GeoError::Cancelled);
         }
         let mut all_bricks = BTreeSet::new();
-        for &k in self.bricks.keys() {
+        for &k in self.bricks().keys() {
             all_bricks.insert(k);
         }
-        for &k in other.bricks.keys() {
+        for &k in other.bricks().keys() {
             all_bricks.insert(k);
         }
         let bytes = all_bricks
@@ -402,7 +271,7 @@ impl VdbGrid {
             return Err(GeoError::LimitExceeded);
         }
 
-        let bg = self.background.get().max(other.background.get());
+        let bg = self.background().max(other.background());
         let bg_checked = FiniteF32::checked(bg)?;
         let mut out_bricks = BTreeMap::new();
         for (bx, by, bz) in all_bricks {
@@ -441,17 +310,14 @@ impl VdbGrid {
                 out_bricks.insert((bx, by, bz), Brick8x8x8::from_vec(vals)?);
             }
         }
-        Ok(Self {
-            voxel_size: self.voxel_size,
-            background: bg_checked,
-            bricks: Arc::new(out_bricks),
-        })
+        Self::from_parts(
+            FiniteF32::checked(self.voxel_size())?,
+            bg_checked,
+            out_bricks,
+        )
     }
 
-    /// Extracts the $\phi = 0$ isosurface of this `VdbGrid` as a guaranteed closed manifold
-    /// all-quad `GeoDetail` (`is_closed_manifold() == true`) using Dual Surface Nets with
-    /// checkerboard saddle regularization.
-    pub fn to_polygons_cancellable(
+    fn to_polygons_cancellable(
         &self,
         memory_limit: usize,
         cancelled: &AtomicBool,
@@ -459,17 +325,17 @@ impl VdbGrid {
         if cancelled.load(Ordering::Acquire) {
             return Err(GeoError::Cancelled);
         }
-        if self.bricks.is_empty() {
+        if self.bricks().is_empty() {
             return Ok(GeoDetail::points(Vec::new()));
         }
 
         // Collect all inside voxel coordinates (phi < 0.0)
         let mut inside: BTreeSet<(i32, i32, i32)> = BTreeSet::new();
-        for (&(bx, by, bz), brick) in &*self.bricks {
+        for (&(bx, by, bz), brick) in self.bricks() {
             for lz in 0..BRICK_DIM {
                 for ly in 0..BRICK_DIM {
                     for lx in 0..BRICK_DIM {
-                        if brick.values[local_index(lx, ly, lz)].get() < 0.0 {
+                        if brick.values()[local_index(lx, ly, lz)].get() < 0.0 {
                             let vx = bx * (BRICK_DIM as i32) + (lx as i32);
                             let vy = by * (BRICK_DIM as i32) + (ly as i32);
                             let vz = bz * (BRICK_DIM as i32) + (lz as i32);
@@ -644,9 +510,7 @@ impl VdbGrid {
         }
     }
 
-    /// Serializes active narrow-band voxels of this `VdbGrid` into a `GeoDetail` point cloud
-    /// with point attributes `f@phi`, `i@vx`, `i@vy`, `i@vz` and detail attributes `f@vdb_voxel_size`, `f@vdb_background`.
-    pub fn to_voxel_geo_detail_cancellable(
+    fn to_voxel_geo_detail_cancellable(
         &self,
         memory_limit: usize,
         cancelled: &AtomicBool,
@@ -654,21 +518,21 @@ impl VdbGrid {
         if cancelled.load(Ordering::Acquire) {
             return Err(GeoError::Cancelled);
         }
-        let bg = self.background.get();
+        let bg = self.background();
         let mut points = Vec::new();
         let mut phi_vals = Vec::new();
         let mut vx_vals = Vec::new();
         let mut vy_vals = Vec::new();
         let mut vz_vals = Vec::new();
 
-        for (&(bx, by, bz), brick) in &*self.bricks {
+        for (&(bx, by, bz), brick) in self.bricks() {
             if cancelled.load(Ordering::Acquire) {
                 return Err(GeoError::Cancelled);
             }
             for lz in 0..BRICK_DIM {
                 for ly in 0..BRICK_DIM {
                     for lx in 0..BRICK_DIM {
-                        let phi = brick.values[local_index(lx, ly, lz)].get();
+                        let phi = brick.values()[local_index(lx, ly, lz)].get();
                         if phi < bg {
                             let vx = bx * (BRICK_DIM as i32) + (lx as i32);
                             let vy = by * (BRICK_DIM as i32) + (ly as i32);
@@ -699,84 +563,13 @@ impl VdbGrid {
             .with_domain_attribute(
                 AttrDomain::Detail,
                 "vdb_voxel_size",
-                AttributeColumn::f32_checked(vec![self.voxel_size.get()])?,
+                AttributeColumn::f32_checked(vec![self.voxel_size()])?,
             )?
             .with_domain_attribute(
                 AttrDomain::Detail,
                 "vdb_background",
                 AttributeColumn::f32_checked(vec![bg])?,
             )
-    }
-
-    /// Reconstructs a `VdbGrid` from a voxel `GeoDetail` produced by `to_voxel_geo_detail_cancellable`.
-    pub fn from_voxel_geo_detail_cancellable(
-        geo: &GeoDetail,
-        memory_limit: usize,
-        cancelled: &AtomicBool,
-    ) -> Result<Self, GeoError> {
-        if cancelled.load(Ordering::Acquire) {
-            return Err(GeoError::Cancelled);
-        }
-        let vs = geo
-            .domain_attribute(AttrDomain::Detail, "vdb_voxel_size")
-            .and_then(AttributeColumn::as_f32)
-            .and_then(|c| c.get(0))
-            .ok_or(GeoError::AttributeNotFound)?;
-        let bg = geo
-            .domain_attribute(AttrDomain::Detail, "vdb_background")
-            .and_then(AttributeColumn::as_f32)
-            .and_then(|c| c.get(0))
-            .ok_or(GeoError::AttributeNotFound)?;
-        let phi_col = geo
-            .attribute("phi")
-            .and_then(AttributeColumn::as_f32)
-            .ok_or(GeoError::AttributeNotFound)?;
-        let vx_col = geo
-            .attribute("vx")
-            .and_then(AttributeColumn::as_i32)
-            .ok_or(GeoError::AttributeNotFound)?;
-        let vy_col = geo
-            .attribute("vy")
-            .and_then(AttributeColumn::as_i32)
-            .ok_or(GeoError::AttributeNotFound)?;
-        let vz_col = geo
-            .attribute("vz")
-            .and_then(AttributeColumn::as_i32)
-            .ok_or(GeoError::AttributeNotFound)?;
-
-        let mut brick_vecs: BTreeMap<(i32, i32, i32), Vec<FiniteF32>> = BTreeMap::new();
-        for i in 0..geo.len() {
-            if i.is_multiple_of(PAGE_LEN) && cancelled.load(Ordering::Acquire) {
-                return Err(GeoError::Cancelled);
-            }
-            let phi = phi_col.get(i).ok_or(GeoError::IndexOutOfBounds)?;
-            let vx = vx_col.get(i).ok_or(GeoError::IndexOutOfBounds)?;
-            let vy = vy_col.get(i).ok_or(GeoError::IndexOutOfBounds)?;
-            let vz = vz_col.get(i).ok_or(GeoError::IndexOutOfBounds)?;
-            let (bx, lx) = split_coord(vx);
-            let (by, ly) = split_coord(vy);
-            let (bz, lz) = split_coord(vz);
-            let entry = brick_vecs
-                .entry((bx, by, bz))
-                .or_insert_with(|| vec![bg; BRICK_LEN]);
-            entry[local_index(lx, ly, lz)] = phi;
-        }
-        let bytes = brick_vecs
-            .len()
-            .checked_mul(BRICK_LEN * std::mem::size_of::<FiniteF32>())
-            .ok_or(GeoError::LimitExceeded)?;
-        if bytes > memory_limit {
-            return Err(GeoError::LimitExceeded);
-        }
-        let mut bricks = BTreeMap::new();
-        for (coord, vals) in brick_vecs {
-            bricks.insert(coord, Brick8x8x8::from_vec(vals)?);
-        }
-        Ok(Self {
-            voxel_size: vs,
-            background: bg,
-            bricks: Arc::new(bricks),
-        })
     }
 }
 
@@ -1335,6 +1128,15 @@ mod tests {
             "the same height off-axis is outside"
         );
         assert!(phi_at(0.0, -1.0, -1.0) > 0.0, "below the base is outside");
+        Ok(())
+    }
+
+    #[test]
+    fn a_voxel_exactly_on_the_surface_is_not_inside_it() -> Result<(), GeoError> {
+        let flag = AtomicBool::new(false);
+        let grid = VdbGrid::new(1.0, 3.0)?.with_voxel(0, 0, 0, 0.0)?;
+        let surface = grid.to_polygons_cancellable(1 << 20, &flag)?;
+        assert_eq!(surface.prim_count(), 0);
         Ok(())
     }
 }

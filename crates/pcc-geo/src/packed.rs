@@ -32,6 +32,10 @@ pub struct PackedPrototype {
 
 impl PackedPrototype {
     pub fn new(geo: Arc<GeoDetail>) -> Result<Self, GeoError> {
+        // Unpacking moves points, and moving a volume's point would not move its voxels.
+        if geo.volume_count() > 0 {
+            return Err(GeoError::InvalidTopology);
+        }
         let depth = geo.packed.as_ref().map_or(0, |table| {
             table.prototypes.iter().map(|p| p.depth).max().unwrap_or(0)
         }) + 1;
@@ -412,6 +416,8 @@ impl GeoDetail {
             .collect::<Result<Vec<_>, _>>()?;
         let vertices = vertices.into_iter().map(|p| remap[p as usize]).collect();
         let mut out = Self::points(positions).with_runs(runs, vertices)?;
+        // These keep their order among the primitives that remain, so the table still fits.
+        out.volumes.clone_from(&self.volumes);
         let domains = [
             (AttrDomain::Point, &kept_points),
             (AttrDomain::Vertex, &kept_vertices),

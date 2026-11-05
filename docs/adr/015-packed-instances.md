@@ -34,6 +34,6 @@ Because only the mutated crate's tests run, a test in another crate does not cou
 
 ## Limits
 
-- **Volumes are not primitives yet.** `VdbGrid` still passes between nodes as a point cloud, and tets do not exist, so M0.2's primitive list is unfinished.
+- **Volumes are not primitives yet.** `VdbGrid` still passes between nodes as a point cloud, and tets do not exist, so M0.2's primitive list is unfinished. [ADR 016](016-volume-and-tetrahedron-primitives.md) resolves this.
 - Most operators refuse instances rather than handle them. `blast`, `normal`, and `measure` are the obvious next ones.
 - Groups on prototypes do not survive `unpack`, and instances have no per-instance attributes beyond their points.

@@ -2,9 +2,13 @@
 //! Page starts are logical 16,384-element boundaries (`PAGE_LEN`).
 
 mod packed;
+mod tets;
+mod volume;
 
 use packed::PackedTable;
 pub use packed::{MAX_PACKED_DEPTH, PackedInstance, PackedPrototype};
+use volume::VolumeEntry;
+pub use volume::{BRICK_DIM, BRICK_LEN, Brick8x8x8, VdbGrid, local_index, split_coord};
 
 use pcc_math::{MathError, Vec3};
 use std::{
@@ -72,6 +76,10 @@ pub enum PrimKind {
     Polyline,
     /// An instance of a shared prototype. Arity one: its vertex is the instance's point.
     Packed,
+    /// A solid element with exactly four corners. See the `tets` module for its orientation.
+    Tetrahedron,
+    /// A sparse grid of voxels. Arity one: its vertex is the point that anchors it.
+    Volume,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -160,6 +168,7 @@ pub struct GeoDetail {
     point_groups: Arc<BTreeMap<String, ElementGroup>>,
     prim_groups: Arc<BTreeMap<String, ElementGroup>>,
     packed: Option<Arc<PackedTable>>,
+    volumes: Option<Arc<[VolumeEntry]>>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -551,6 +560,7 @@ impl GeoDetail {
             point_groups: Arc::new(BTreeMap::new()),
             prim_groups: Arc::new(BTreeMap::new()),
             packed: None,
+            volumes: None,
         }
     }
 
@@ -642,14 +652,18 @@ impl GeoDetail {
         runs: Vec<PrimRun>,
         vertex_points: Vec<u32>,
     ) -> Result<Self, GeoError> {
-        // A packed primitive needs table entries, which only the packed API supplies.
-        if runs.iter().any(|run| run.kind == PrimKind::Packed) {
+        // These need table entries, which only the packed and volume APIs supply.
+        if runs
+            .iter()
+            .any(|run| matches!(run.kind, PrimKind::Packed | PrimKind::Volume))
+        {
             return Err(GeoError::InvalidTopology);
         }
         self.with_runs(runs, vertex_points)
     }
 
-    /// Attaches topology of any kind, without packed data. Callers supply that separately.
+    /// Attaches topology of any kind, without packed or volume data. Callers supply that
+    /// separately.
     pub fn with_runs(&self, runs: Vec<PrimRun>, vertex_points: Vec<u32>) -> Result<Self, GeoError> {
         let mut expected_vertices = 0usize;
         let mut total_prims = 0usize;
@@ -660,9 +674,14 @@ impl GeoDetail {
             let min_arity = match run.kind {
                 PrimKind::Polygon => 3,
                 PrimKind::Polyline => 2,
-                PrimKind::Packed => 1,
+                PrimKind::Packed | PrimKind::Volume => 1,
+                PrimKind::Tetrahedron => 4,
             };
-            if run.arity < min_arity || (run.kind == PrimKind::Packed && run.arity != 1) {
+            let exact = matches!(
+                run.kind,
+                PrimKind::Packed | PrimKind::Tetrahedron | PrimKind::Volume
+            );
+            if run.arity < min_arity || (exact && run.arity != min_arity) {
                 return Err(GeoError::InvalidTopology);
             }
             let run_verts = (run.arity as usize)
@@ -692,6 +711,7 @@ impl GeoDetail {
         next.prim_attributes = Arc::new(BTreeMap::new());
         next.prim_groups = Arc::new(BTreeMap::new());
         next.packed = None;
+        next.volumes = None;
         Ok(next)
     }
 
@@ -973,6 +993,7 @@ impl GeoDetail {
         self.detail_attributes = Arc::new(detail);
         self.packed =
             PackedTable::merged(first.packed.as_deref(), second.packed.as_deref()).map(Arc::new);
+        self.volumes = Self::merged_volumes(first, second);
         let groups = |left: &BTreeMap<String, ElementGroup>,
                       right: &BTreeMap<String, ElementGroup>,
                       left_len: usize,
@@ -2182,8 +2203,9 @@ impl GeoDetail {
         Ok(next)
     }
 
-    /// Reverses the vertex order of every polygon, flipping surface orientation. Vertex attributes
-    /// travel with their vertices; point and primitive data are shared. Polylines are unchanged.
+    /// Reverses the vertex order of every polygon, flipping surface orientation, and inverts every
+    /// tetrahedron. Vertex attributes travel with their vertices; point and primitive data are
+    /// shared. Polylines are unchanged.
     pub fn with_reversed_winding(&self) -> Result<Self, GeoError> {
         let mut order = Vec::with_capacity(self.vertex_count());
         let mut cursor = 0usize;
@@ -2192,7 +2214,13 @@ impl GeoDetail {
             for _ in 0..run.prim_count {
                 match run.kind {
                     PrimKind::Polygon => order.extend((cursor..cursor + arity).rev()),
-                    PrimKind::Polyline | PrimKind::Packed => order.extend(cursor..cursor + arity),
+                    PrimKind::Polyline | PrimKind::Packed | PrimKind::Volume => {
+                        order.extend(cursor..cursor + arity);
+                    }
+                    // One swap inverts an element; reversing all four corners would not.
+                    PrimKind::Tetrahedron => {
+                        order.extend([cursor, cursor + 2, cursor + 1, cursor + 3]);
+                    }
                 }
                 cursor += arity;
             }
@@ -2249,6 +2277,8 @@ impl GeoDetail {
                     PrimKind::Polygon => 1,
                     PrimKind::Polyline => 2,
                     PrimKind::Packed => 3,
+                    PrimKind::Tetrahedron => 4,
+                    PrimKind::Volume => 5,
                 };
                 h.update(&[kind_tag]);
                 h.update(&run.arity.to_le_bytes());
@@ -2285,6 +2315,13 @@ impl GeoDetail {
                 }
             }
         }
+        if let Some(entries) = &self.volumes {
+            h.update(b"volumes-v1");
+            h.update(&(entries.len() as u64).to_le_bytes());
+            for entry in &**entries {
+                h.update(entry.grid.hash().as_bytes());
+            }
+        }
         if let Some(table) = &self.packed {
             table.update_hash(&mut h);
         }
@@ -2307,7 +2344,11 @@ impl GeoDetail {
             }
         }
         // Instances reach past their points, by as much as their prototypes extend.
-        if let Some((low, high)) = self.packed_bounds() {
+        // Volumes likewise reach past theirs, by as far as their voxels go.
+        for (low, high) in [self.packed_bounds(), self.volume_bounds()]
+            .into_iter()
+            .flatten()
+        {
             lo = Vec3 {
                 x: lo.x.min(low.x),
                 y: lo.y.min(low.y),
@@ -2516,6 +2557,8 @@ impl TopologyIndex {
                 PrimKind::Polygon => 1,
                 PrimKind::Polyline => 2,
                 PrimKind::Packed => 3,
+                PrimKind::Tetrahedron => 4,
+                PrimKind::Volume => 5,
             };
             h.update(&[kind_tag]);
             h.update(&run.arity.to_le_bytes());
@@ -2573,8 +2616,12 @@ impl TopologyIndex {
                                 }
                             }
                         }
-                        // A packed primitive has one vertex, and so no edges at all.
-                        PrimKind::Polyline | PrimKind::Packed => {
+                        // A packed primitive has one vertex, and so no edges at all. A tetrahedron's
+                        // edges are not surface edges, so they must not affect manifold checks.
+                        PrimKind::Polyline
+                        | PrimKind::Packed
+                        | PrimKind::Tetrahedron
+                        | PrimKind::Volume => {
                             if k + 1 < arity
                                 && let Some(slot) = next_he.get_mut(he)
                             {

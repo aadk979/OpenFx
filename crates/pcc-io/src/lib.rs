@@ -5,11 +5,11 @@
 mod stl;
 
 use pcc_geo::{
-    AttrDomain, AttributeColumn, GeoDetail, GeoError, GroupDomain, MAX_PACKED_DEPTH,
-    PackedInstance, PrimKind, PrimRun,
+    AttrDomain, AttributeColumn, BRICK_DIM, BRICK_LEN, Brick8x8x8, FiniteF32, GeoDetail, GeoError,
+    GroupDomain, MAX_PACKED_DEPTH, PackedInstance, PrimKind, PrimRun, VdbGrid,
 };
 use pcc_math::Vec3;
-use std::sync::Arc;
+use std::{collections::BTreeMap, sync::Arc};
 
 pub use stl::{from_stl_bytes, to_stl_bytes};
 
@@ -61,6 +61,7 @@ pub fn to_ofxg_bytes(geo: &GeoDetail) -> Vec<u8> {
             PrimKind::Polyline => 2,
             PrimKind::Packed => 3,
             PrimKind::Tetrahedron => 4,
+            PrimKind::Volume => 5,
         };
         payload.push(kind_tag);
         write_u32(&mut payload, run.arity);
@@ -128,7 +129,17 @@ pub fn to_ofxg_bytes(geo: &GeoDetail) -> Vec<u8> {
         }
     }
 
-    // 6. Append 32-byte BLAKE3 payload integrity digest
+    // 6. Volumes, only when present, for the same reason.
+    if geo.volume_count() > 0 {
+        write_u64(&mut payload, geo.volume_count() as u64);
+        for index in 0..geo.volume_count() {
+            if let Some(grid) = geo.volume(index) {
+                write_volume_grid(&mut payload, grid);
+            }
+        }
+    }
+
+    // 7. Append 32-byte BLAKE3 payload integrity digest
     let checksum = blake3::hash(&payload);
     payload.extend_from_slice(checksum.as_bytes());
     payload
@@ -190,6 +201,7 @@ fn read_ofxg(bytes: &[u8], max_elements: usize, depth: u32) -> Result<GeoDetail,
             2 => PrimKind::Polyline,
             3 => PrimKind::Packed,
             4 => PrimKind::Tetrahedron,
+            5 => PrimKind::Volume,
             _ => return Err(IoFormatError::InvalidTypeTag),
         };
         let arity = read_u32(body, &mut cursor)?;
@@ -270,6 +282,22 @@ fn read_ofxg(bytes: &[u8], max_elements: usize, depth: u32) -> Result<GeoDetail,
         geo = geo.with_packed_parts(prototypes, &instances)?;
     }
 
+    // 6. Volumes, which likewise only exist in files of geometry that has them.
+    let volumes_expected: usize = geo
+        .prim_runs()
+        .iter()
+        .filter(|run| run.kind == PrimKind::Volume)
+        .map(|run| run.prim_count)
+        .sum();
+    if volumes_expected > 0 {
+        let grid_count = read_bounded_len(body, &mut cursor, max_elements)?;
+        let mut grids = Vec::with_capacity(grid_count);
+        for _ in 0..grid_count {
+            grids.push(Arc::new(read_volume_grid(body, &mut cursor, max_elements)?));
+        }
+        geo = geo.with_volume_grids(grids)?;
+    }
+
     if cursor != body.len() {
         return Err(IoFormatError::TrailingBytes);
     }
@@ -309,7 +337,7 @@ pub fn to_obj(geo: &GeoDetail) -> String {
             PrimKind::Polygon => "f",
             PrimKind::Polyline => "l",
             // OBJ has neither of these. Callers that must not lose them refuse to get here.
-            PrimKind::Packed | PrimKind::Tetrahedron => {
+            PrimKind::Packed | PrimKind::Tetrahedron | PrimKind::Volume => {
                 vtx_cursor += arity * run.prim_count;
                 continue;
             }
@@ -475,6 +503,59 @@ fn parse_f32_obj(token: Option<&str>) -> Result<f32, IoFormatError> {
     } else {
         Err(IoFormatError::Geo(GeoError::NonFinite))
     }
+}
+
+fn write_volume_grid(buf: &mut Vec<u8>, grid: &VdbGrid) {
+    write_f32(buf, grid.voxel_size());
+    write_f32(buf, grid.background());
+    write_u64(buf, grid.active_brick_count() as u64);
+    for (&(x, y, z), brick) in grid.bricks() {
+        for coordinate in [x, y, z] {
+            buf.extend_from_slice(&coordinate.to_le_bytes());
+        }
+        for value in brick.values() {
+            write_f32(buf, value.get());
+        }
+    }
+}
+
+/// Brick coordinates beyond this could overflow a voxel index, in `i32`, once multiplied out.
+const MAX_BRICK_COORDINATE: i32 = i32::MAX / (BRICK_DIM as i32) - 1;
+
+/// Reads a grid, refusing anything `write_volume_grid` could not have written: bricks must be in
+/// strictly ascending order, because two files for one grid would otherwise differ in hash.
+fn read_volume_grid(
+    bytes: &[u8],
+    cursor: &mut usize,
+    max_elements: usize,
+) -> Result<VdbGrid, IoFormatError> {
+    let voxel_size = FiniteF32::checked(read_f32(bytes, cursor)?).map_err(IoFormatError::Geo)?;
+    let background = FiniteF32::checked(read_f32(bytes, cursor)?).map_err(IoFormatError::Geo)?;
+    let brick_count = read_bounded_len(bytes, cursor, max_elements)?;
+    let mut bricks = BTreeMap::new();
+    let mut previous = None;
+    for _ in 0..brick_count {
+        let coordinate = (
+            read_i32(bytes, cursor)?,
+            read_i32(bytes, cursor)?,
+            read_i32(bytes, cursor)?,
+        );
+        let (x, y, z) = coordinate;
+        if [x, y, z]
+            .iter()
+            .any(|c| c.unsigned_abs() > MAX_BRICK_COORDINATE.unsigned_abs())
+            || previous.is_some_and(|last| coordinate <= last)
+        {
+            return Err(IoFormatError::Geo(GeoError::InvalidTopology));
+        }
+        previous = Some(coordinate);
+        let mut values = Vec::with_capacity(BRICK_LEN);
+        for _ in 0..BRICK_LEN {
+            values.push(FiniteF32::checked(read_f32(bytes, cursor)?).map_err(IoFormatError::Geo)?);
+        }
+        bricks.insert(coordinate, Brick8x8x8::from_vec(values)?);
+    }
+    Ok(VdbGrid::from_parts(voxel_size, background, bricks)?)
 }
 
 fn write_u32(buf: &mut Vec<u8>, value: u32) {
@@ -911,6 +992,87 @@ l "
             bad[at] ^= 0xFF;
             assert!(from_ofxg_bytes(&bad).is_err(), "byte {at}");
         }
+        Ok(())
+    }
+
+    fn sample_grid() -> Result<VdbGrid, GeoError> {
+        VdbGrid::new(0.5, 2.0)?
+            .with_voxel(1, 1, 1, -0.5)?
+            .with_voxel(-20, 3, 40, -0.25)
+    }
+
+    #[test]
+    fn volumes_round_trip_exactly() -> Result<(), IoFormatError> {
+        let grid = sample_grid()?;
+        let geo = GeoDetail::from_volumes(vec![Arc::new(grid.clone()), Arc::new(grid)])?;
+        let back = from_ofxg_bytes(&to_ofxg_bytes(&geo))?;
+        assert_eq!(back.hash(), geo.hash());
+        assert_eq!(back.volume_count(), 2);
+        assert_eq!(back.bounds(), geo.bounds());
+        let voxel = back.volume(1).map(|g| g.get(-20, 3, 40));
+        assert_eq!(voxel, Some(-0.25));
+        // OBJ cannot hold them, so writing one leaves the anchors and no primitives.
+        let text = to_obj(&geo);
+        assert_eq!(text.lines().filter(|l| l.starts_with("v ")).count(), 2);
+        assert!(
+            !text
+                .lines()
+                .any(|l| l.starts_with("f ") || l.starts_with("l "))
+        );
+        Ok(())
+    }
+
+    /// A grid's bytes, written by hand so that they can say what the writer never would.
+    fn grid_bytes(voxel_size: f32, background: f32, bricks: &[((i32, i32, i32), f32)]) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        write_f32(&mut bytes, voxel_size);
+        write_f32(&mut bytes, background);
+        write_u64(&mut bytes, bricks.len() as u64);
+        for &((x, y, z), fill) in bricks {
+            for coordinate in [x, y, z] {
+                bytes.extend_from_slice(&coordinate.to_le_bytes());
+            }
+            for _ in 0..BRICK_LEN {
+                write_f32(&mut bytes, fill);
+            }
+        }
+        bytes
+    }
+
+    fn read_grid(bytes: &[u8]) -> Result<VdbGrid, IoFormatError> {
+        let mut cursor = 0;
+        let grid = read_volume_grid(bytes, &mut cursor, 1 << 20)?;
+        assert_eq!(cursor, bytes.len());
+        Ok(grid)
+    }
+
+    #[test]
+    fn a_hostile_grid_is_refused() -> Result<(), IoFormatError> {
+        let origin = (0, 0, 0);
+        let good = grid_bytes(0.5, 2.0, &[(origin, -1.0), ((0, 0, 1), -1.0)]);
+        assert_eq!(read_grid(&good)?.active_brick_count(), 2);
+        let refused = |bytes: &[u8]| assert!(read_grid(bytes).is_err(), "{}", bytes.len());
+        // Settings that no grid could have been made with.
+        refused(&grid_bytes(0.0, 2.0, &[]));
+        refused(&grid_bytes(-1.0, 2.0, &[]));
+        refused(&grid_bytes(0.5, 0.0, &[]));
+        refused(&grid_bytes(f32::NAN, 2.0, &[]));
+        refused(&grid_bytes(0.5, f32::INFINITY, &[]));
+        refused(&grid_bytes(0.5, 2.0, &[(origin, f32::NAN)]));
+        // Two spellings of one grid would hash differently, so order and uniqueness are required.
+        refused(&grid_bytes(0.5, 2.0, &[((0, 0, 1), -1.0), (origin, -1.0)]));
+        refused(&grid_bytes(0.5, 2.0, &[(origin, -1.0), (origin, -1.0)]));
+        // Coordinates at the edge are accepted, and just beyond it would overflow a voxel index.
+        let edge = MAX_BRICK_COORDINATE;
+        assert!(read_grid(&grid_bytes(0.5, 2.0, &[((edge, 0, 0), -1.0)])).is_ok());
+        refused(&grid_bytes(0.5, 2.0, &[((edge + 1, 0, 0), -1.0)]));
+        refused(&grid_bytes(0.5, 2.0, &[((0, -edge - 1, 0), -1.0)]));
+        refused(&grid_bytes(0.5, 2.0, &[((0, 0, i32::MIN), -1.0)]));
+        // Truncated, and claiming more bricks than the file holds.
+        refused(&good[..good.len() - 1]);
+        let mut lying = grid_bytes(0.5, 2.0, &[]);
+        lying.splice(8..16, u64::MAX.to_le_bytes());
+        refused(&lying);
         Ok(())
     }
 }

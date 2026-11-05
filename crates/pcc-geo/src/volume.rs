@@ -1,7 +1,11 @@
-//! Storage for sparse $8^3$ Copy-on-Write brick volumes. It lives here so that geometry can
-//! hold a grid; `pcc-vdb` holds the algorithms that work on one.
+//! Storage for sparse $8^3$ Copy-on-Write brick volumes, and the volume primitive that holds one.
+//! It lives here so that geometry can hold a grid; `pcc-vdb` holds the algorithms that work on one.
+//!
+//! A volume primitive has one vertex, like a packed instance, and its grid sits in a side table in
+//! primitive order. Its point only anchors the primitive: the grid's own coordinates say where its
+//! voxels are, so moving the point would not move them, and operators that move points refuse it.
 
-use crate::{FiniteF32, GeoError};
+use crate::{FiniteF32, GeoDetail, GeoError, PrimKind, PrimRun};
 use pcc_math::Vec3;
 use std::{collections::BTreeMap, sync::Arc};
 
@@ -208,9 +212,377 @@ impl VdbGrid {
         }
     }
 
+    /// How many voxels differ from the background.
+    #[must_use]
+    pub fn active_voxel_count(&self) -> usize {
+        let background = self.background.get();
+        self.bricks
+            .values()
+            .map(|brick| brick.values.iter().filter(|v| v.get() < background).count())
+            .sum()
+    }
+
+    /// World-space bounds of the voxels that differ from the background, or `None` if there are no
+    /// such voxels. Fails if a voxel lies beyond what a finite position can express.
+    pub fn active_bounds(&self) -> Result<Option<(Vec3, Vec3)>, GeoError> {
+        let background = self.background.get();
+        let mut range: Option<([i64; 3], [i64; 3])> = None;
+        for (&(bx, by, bz), brick) in &*self.bricks {
+            for (index, value) in brick.values.iter().enumerate() {
+                if value.get() >= background {
+                    continue;
+                }
+                let dim = BRICK_DIM as i64;
+                let local = index as i64;
+                let voxel = [
+                    i64::from(bx) * dim + local % dim,
+                    i64::from(by) * dim + (local / dim) % dim,
+                    i64::from(bz) * dim + local / (dim * dim),
+                ];
+                let (low, high) = range.get_or_insert((voxel, voxel));
+                for axis in 0..3 {
+                    low[axis] = low[axis].min(voxel[axis]);
+                    high[axis] = high[axis].max(voxel[axis]);
+                }
+            }
+        }
+        let Some((low, high)) = range else {
+            return Ok(None);
+        };
+        // A voxel fills the cell from its index to the next one.
+        let size = f64::from(self.voxel_size.get());
+        let at = |[x, y, z]: [i64; 3], offset: i64| {
+            let world = |v: i64| ((v + offset) as f64 * size) as f32;
+            Vec3::checked(world(x), world(y), world(z))
+        };
+        Ok(Some((at(low, 0)?, at(high, 1)?)))
+    }
+
     /// Every allocated brick, keyed by brick coordinate.
     #[must_use]
     pub fn bricks(&self) -> &BTreeMap<(i32, i32, i32), Brick8x8x8> {
         &self.bricks
+    }
+}
+
+/// A grid held by a volume primitive, with facts about it that would take a full scan to find.
+#[derive(Clone, Debug)]
+pub(crate) struct VolumeEntry {
+    pub(crate) grid: Arc<VdbGrid>,
+    pub(crate) bounds: Option<(Vec3, Vec3)>,
+}
+
+impl VolumeEntry {
+    fn new(grid: Arc<VdbGrid>) -> Result<Self, GeoError> {
+        Ok(Self {
+            bounds: grid.active_bounds()?,
+            grid,
+        })
+    }
+}
+
+impl GeoDetail {
+    /// One volume primitive per grid, each anchored at the centre of its active voxels.
+    pub fn from_volumes(grids: Vec<Arc<VdbGrid>>) -> Result<Self, GeoError> {
+        let entries = grids
+            .into_iter()
+            .map(VolumeEntry::new)
+            .collect::<Result<Vec<_>, _>>()?;
+        let anchors = entries
+            .iter()
+            .map(|entry| {
+                entry.bounds.map_or(Ok(Vec3::ZERO), |(low, high)| {
+                    let middle = |a: f32, b: f32| (f64::from(a) + f64::from(b)) / 2.0;
+                    Vec3::checked(
+                        middle(low.x, high.x) as f32,
+                        middle(low.y, high.y) as f32,
+                        middle(low.z, high.z) as f32,
+                    )
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let count = entries.len();
+        let runs = if count == 0 {
+            Vec::new()
+        } else {
+            vec![PrimRun {
+                kind: PrimKind::Volume,
+                arity: 1,
+                prim_count: count,
+            }]
+        };
+        let vertices = (0..count)
+            .map(|at| u32::try_from(at).map_err(|_| GeoError::LimitExceeded))
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut geo = Self::points(anchors).with_runs(runs, vertices)?;
+        geo.volumes = (count > 0).then(|| Arc::from(entries));
+        Ok(geo)
+    }
+
+    /// How many volume primitives this geometry holds.
+    #[must_use]
+    pub fn volume_count(&self) -> usize {
+        self.volumes.as_ref().map_or(0, |entries| entries.len())
+    }
+
+    /// One grid, by its ordinal among the volume primitives.
+    #[must_use]
+    pub fn volume(&self, index: usize) -> Option<&Arc<VdbGrid>> {
+        self.volumes.as_ref()?.get(index).map(|entry| &entry.grid)
+    }
+
+    /// Replaces every grid, keeping points and attributes. Also how a file's grids are attached,
+    /// so there must be exactly one for each volume primitive.
+    pub fn with_volume_grids(&self, grids: Vec<Arc<VdbGrid>>) -> Result<Self, GeoError> {
+        let expected: usize = self
+            .prim_runs
+            .iter()
+            .filter(|run| run.kind == PrimKind::Volume)
+            .map(|run| run.prim_count)
+            .sum();
+        if grids.len() != expected {
+            return Err(GeoError::InvalidTopology);
+        }
+        let entries = grids
+            .into_iter()
+            .map(VolumeEntry::new)
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut next = self.clone();
+        next.volumes = (expected > 0).then(|| Arc::from(entries));
+        Ok(next)
+    }
+
+    /// Bounds that contain every volume's active voxels, without scanning any grid.
+    pub(crate) fn volume_bounds(&self) -> Option<(Vec3, Vec3)> {
+        let mut bounds: Option<(Vec3, Vec3)> = None;
+        for entry in self.volumes.as_deref().unwrap_or(&[]) {
+            let Some((low, high)) = entry.bounds else {
+                continue;
+            };
+            bounds = Some(bounds.map_or((low, high), |(lo, hi)| {
+                (
+                    Vec3 {
+                        x: lo.x.min(low.x),
+                        y: lo.y.min(low.y),
+                        z: lo.z.min(low.z),
+                    },
+                    Vec3 {
+                        x: hi.x.max(high.x),
+                        y: hi.y.max(high.y),
+                        z: hi.z.max(high.z),
+                    },
+                )
+            }));
+        }
+        bounds
+    }
+
+    /// The grids of two geometries, in the order that merging places their primitives.
+    pub(crate) fn merged_volumes(first: &Self, second: &Self) -> Option<Arc<[VolumeEntry]>> {
+        let entries: Vec<VolumeEntry> = first
+            .volumes
+            .iter()
+            .chain(second.volumes.iter())
+            .flat_map(|entries| entries.iter().cloned())
+            .collect();
+        (!entries.is_empty()).then(|| Arc::from(entries))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{AttrDomain, AttributeColumn, PackedPrototype};
+
+    fn v(x: f32, y: f32, z: f32) -> Vec3 {
+        Vec3 { x, y, z }
+    }
+
+    /// Active voxels at (1, 1, 1) and (10, 2, 3), a brick apart, with voxels 0.5 wide.
+    fn grid() -> Result<Arc<VdbGrid>, GeoError> {
+        Ok(Arc::new(
+            VdbGrid::new(0.5, 2.0)?
+                .with_voxel(1, 1, 1, -0.5)?
+                .with_voxel(10, 2, 3, -0.25)?,
+        ))
+    }
+
+    #[test]
+    fn active_voxels_are_counted_and_bounded_exactly() -> Result<(), GeoError> {
+        let two = grid()?;
+        assert_eq!(two.active_voxel_count(), 2);
+        // Each voxel fills a cell from its index to the next, so the far corner is index + 1.
+        assert_eq!(
+            two.active_bounds()?,
+            Some((v(0.5, 0.5, 0.5), v(5.5, 1.5, 2.0)))
+        );
+        // Across negative coordinates, where a brick's voxels run the other way from zero.
+        let negative = VdbGrid::new(1.0, 2.0)?.with_voxel(-1, -9, 16, -1.0)?;
+        assert_eq!(
+            negative.active_bounds()?,
+            Some((v(-1.0, -9.0, 16.0), v(0.0, -8.0, 17.0)))
+        );
+        // Voxels at or above the background do not count, even in an allocated brick.
+        let inactive = VdbGrid::new(1.0, 2.0)?.with_voxel(0, 0, 0, 2.0)?;
+        assert_eq!(inactive.active_brick_count(), 1);
+        assert_eq!(inactive.active_voxel_count(), 0);
+        assert_eq!(inactive.active_bounds()?, None);
+        assert_eq!(VdbGrid::new(1.0, 2.0)?.active_bounds()?, None);
+        // Beyond what a finite position can express.
+        let vast = VdbGrid::new(1e38, 2.0)?.with_voxel(1 << 20, 0, 0, -1.0)?;
+        assert_eq!(vast.active_bounds().err(), Some(GeoError::NonFinite));
+        assert_eq!(
+            GeoDetail::from_volumes(vec![Arc::new(vast)]).err(),
+            Some(GeoError::NonFinite)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_volume_is_a_primitive_anchored_at_its_voxels() -> Result<(), GeoError> {
+        let geo = GeoDetail::from_volumes(vec![grid()?])?;
+        assert_eq!((geo.len(), geo.prim_count(), geo.volume_count()), (1, 1, 1));
+        assert_eq!(geo.prim_runs()[0].kind, PrimKind::Volume);
+        assert_eq!(geo.point(0), Some(v(3.0, 1.0, 1.25)));
+        assert!(geo.volume(0).is_some_and(|g| g.active_voxel_count() == 2));
+        assert!(geo.volume(1).is_none());
+        // Reaches past its single point, as far as its voxels go.
+        assert_eq!(geo.bounds(), Some((v(0.5, 0.5, 0.5), v(5.5, 1.5, 2.0))));
+        // Nothing at all is not an error, and an empty grid still anchors at the origin.
+        assert_eq!(GeoDetail::from_volumes(Vec::new())?.prim_count(), 0);
+        let empty = GeoDetail::from_volumes(vec![Arc::new(VdbGrid::new(1.0, 2.0)?)])?;
+        assert_eq!(empty.point(0), Some(Vec3::ZERO));
+        assert_eq!(empty.bounds(), Some((Vec3::ZERO, Vec3::ZERO)));
+        Ok(())
+    }
+
+    #[test]
+    fn volumes_only_come_from_the_volume_api() -> Result<(), GeoError> {
+        let run = |arity| PrimRun {
+            kind: PrimKind::Volume,
+            arity,
+            prim_count: 1,
+        };
+        let cloud = GeoDetail::points(vec![Vec3::ZERO; 2]);
+        // A volume primitive needs a grid, which plain topology cannot supply.
+        assert_eq!(
+            cloud.with_primitives(vec![run(1)], vec![0]).err(),
+            Some(GeoError::InvalidTopology)
+        );
+        assert_eq!(
+            cloud.with_runs(vec![run(2)], vec![0, 1]).err(),
+            Some(GeoError::InvalidTopology)
+        );
+        // A file's grids must match its primitives exactly.
+        let shell = cloud.with_runs(vec![run(1)], vec![0])?;
+        assert_eq!(
+            shell.with_volume_grids(Vec::new()).err(),
+            Some(GeoError::InvalidTopology)
+        );
+        assert_eq!(
+            shell.with_volume_grids(vec![grid()?, grid()?]).err(),
+            Some(GeoError::InvalidTopology)
+        );
+        let filled = shell.with_volume_grids(vec![grid()?])?;
+        assert_eq!(filled.volume_count(), 1);
+        // Replacing topology removes the grids along with the primitives that held them.
+        assert_eq!(
+            filled
+                .with_primitives(Vec::new(), Vec::new())?
+                .volume_count(),
+            0
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn replacing_grids_keeps_points_and_attributes() -> Result<(), GeoError> {
+        let geo = GeoDetail::from_volumes(vec![grid()?])?.with_domain_attribute(
+            AttrDomain::Prim,
+            "tag",
+            AttributeColumn::i32_values(vec![7]),
+        )?;
+        let other = Arc::new(VdbGrid::new(1.0, 2.0)?.with_voxel(0, 0, 0, -1.0)?);
+        let next = geo.with_volume_grids(vec![Arc::clone(&other)])?;
+        assert!(next.volume(0).is_some_and(|g| Arc::ptr_eq(g, &other)));
+        assert_eq!(next.point(0), geo.point(0));
+        assert!(next.domain_attribute(AttrDomain::Prim, "tag").is_some());
+        // Bounds follow the grid held now, not the one held before.
+        assert_eq!(next.volume_bounds(), Some((Vec3::ZERO, v(1.0, 1.0, 1.0))));
+        Ok(())
+    }
+
+    #[test]
+    fn hashes_follow_the_grids() -> Result<(), GeoError> {
+        let geo = GeoDetail::from_volumes(vec![grid()?])?;
+        assert_eq!(geo.hash(), GeoDetail::from_volumes(vec![grid()?])?.hash());
+        // Same anchor and the same topology: only the grid differs.
+        let changed = (*grid()?).with_voxel(1, 1, 1, -0.75)?;
+        let other = geo.with_volume_grids(vec![Arc::new(changed)])?;
+        assert_eq!(other.point(0), geo.point(0));
+        assert_ne!(geo.hash(), other.hash());
+        // A volume is not a packed instance or a point with the same shape.
+        let plain = GeoDetail::points(vec![v(3.0, 1.0, 1.25)]);
+        assert_ne!(geo.hash(), plain.hash());
+        Ok(())
+    }
+
+    #[test]
+    fn merging_keeps_each_grid_with_its_primitive() -> Result<(), GeoError> {
+        let first = GeoDetail::from_volumes(vec![grid()?])?;
+        let far = Arc::new(VdbGrid::new(1.0, 2.0)?.with_voxel(100, 0, 0, -1.0)?);
+        let second = GeoDetail::from_volumes(vec![Arc::clone(&far)])?;
+        let merged = first.merged(&second, usize::MAX)?;
+        assert_eq!((merged.volume_count(), merged.prim_count()), (2, 2));
+        assert_eq!(merged.prim_runs().len(), 1);
+        assert!(merged.volume(1).is_some_and(|g| Arc::ptr_eq(g, &far)));
+        // Both grids set the bounds, including the second's far side.
+        assert_eq!(
+            merged.bounds(),
+            Some((v(0.5, 0.0, 0.0), v(101.0, 1.5, 2.0)))
+        );
+        // Volumes beside surfaces keep their place among the primitives.
+        let triangle = GeoDetail::points(vec![Vec3::ZERO, v(1.0, 0.0, 0.0), v(0.0, 1.0, 0.0)])
+            .with_primitives(
+                vec![PrimRun {
+                    kind: PrimKind::Polygon,
+                    arity: 3,
+                    prim_count: 1,
+                }],
+                vec![0, 1, 2],
+            )?;
+        let mixed = triangle.merged(&first, usize::MAX)?;
+        assert_eq!((mixed.volume_count(), mixed.prim_count()), (1, 2));
+        // And merging without any leaves no table behind.
+        assert_eq!(triangle.merged(&triangle, usize::MAX)?.volume_count(), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn volumes_survive_unpacking_and_cannot_be_instanced_yet() -> Result<(), GeoError> {
+        let geo = GeoDetail::from_volumes(vec![grid()?])?;
+        assert_eq!(
+            PackedPrototype::new(Arc::new(geo.clone())).err(),
+            Some(GeoError::InvalidTopology)
+        );
+        // Instances beside a volume: unpacking them must not lose the volume.
+        let triangle = GeoDetail::points(vec![Vec3::ZERO, v(1.0, 0.0, 0.0), v(0.0, 1.0, 0.0)])
+            .with_primitives(
+                vec![PrimRun {
+                    kind: PrimKind::Polygon,
+                    arity: 3,
+                    prim_count: 1,
+                }],
+                vec![0, 1, 2],
+            )?;
+        let packed = GeoDetail::packed_whole(Arc::new(triangle))?;
+        let flat = geo
+            .merged(&packed, usize::MAX)?
+            .unpacked_cancellable(1 << 20, &std::sync::atomic::AtomicBool::new(false))?;
+        assert_eq!(flat.packed_count(), 0);
+        assert_eq!(flat.volume_count(), 1);
+        // Winding means nothing to a volume, so reversal leaves it alone.
+        assert_eq!(geo.with_reversed_winding()?.volume_count(), 1);
+        Ok(())
     }
 }

@@ -53,6 +53,10 @@ pub struct GeoProbe {
     /// Packed instances, which area and volume do not count until they are unpacked.
     pub packed_count: usize,
     pub packed_prototype_count: usize,
+    /// Solid elements, which area and volume do not count: `tet_surface` gives their surface.
+    pub tet_count: usize,
+    /// Sparse voxel grids, which area and volume do not count: `convert_vdb` gives their surface.
+    pub volume_count: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
@@ -246,6 +250,8 @@ pub fn geo_probe(revision: RevisionId, geo: &GeoDetail) -> GeoProbe {
         bounds: geo.bounds(),
         packed_count: geo.packed_count(),
         packed_prototype_count: geo.packed_prototypes().len(),
+        tet_count: geo.tet_count(),
+        volume_count: geo.volume_count(),
     }
 }
 
@@ -323,7 +329,8 @@ impl McpError {
                     FileError::AlreadyExists => plain(ToolErrorCode::FileAlreadyExists, message),
                     FileError::UnsupportedFormat
                     | FileError::PackedNeedsUnpack
-                    | FileError::TetsNeedSurface => {
+                    | FileError::TetsNeedSurface
+                    | FileError::VolumesNeedConversion => {
                         plain(ToolErrorCode::UnsupportedFileFormat, message)
                     }
                     FileError::Parse(_) => plain(ToolErrorCode::MeshParseFailed, message),

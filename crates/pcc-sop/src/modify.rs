@@ -232,7 +232,7 @@ pub fn fuse_points(
                 3
             }
             PrimKind::Polyline => 2,
-            PrimKind::Packed => 1,
+            PrimKind::Packed | PrimKind::Volume => 1,
             PrimKind::Tetrahedron => 4,
         };
         if mapped.len() >= minimum {
@@ -271,7 +271,10 @@ pub fn measure(geo: &GeoDetail, ctx: &SopContext<'_>) -> Result<GeoDetail, GeoEr
         let segments = prim.points.len()
             - match prim.kind {
                 PrimKind::Polygon => 0,
-                PrimKind::Polyline | PrimKind::Packed | PrimKind::Tetrahedron => 1,
+                PrimKind::Polyline
+                | PrimKind::Packed
+                | PrimKind::Tetrahedron
+                | PrimKind::Volume => 1,
             };
         let mut perimeter = 0.0;
         for k in 0..segments {
@@ -290,7 +293,7 @@ pub fn measure(geo: &GeoDetail, ctx: &SopContext<'_>) -> Result<GeoDetail, GeoEr
                 let order: Vec<u32> = (0..shifted.len() as u32).collect();
                 dot_len(polygon_area_vector(&shifted, &order)) * 0.5
             }
-            PrimKind::Polyline | PrimKind::Packed | PrimKind::Tetrahedron => 0.0,
+            PrimKind::Polyline | PrimKind::Packed | PrimKind::Tetrahedron | PrimKind::Volume => 0.0,
         };
         total_area += area;
         areas.push(FiniteF32::checked(area as f32)?);

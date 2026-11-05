@@ -211,6 +211,8 @@ async fn stdio_transport_initialize_discover_probe_replace_and_conflict() {
                 bounds: None,
                 packed_count: 0,
                 packed_prototype_count: 0,
+                tet_count: 0,
+                volume_count: 0,
             })
         );
     }

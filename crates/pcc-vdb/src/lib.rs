@@ -64,20 +64,13 @@ pub trait VdbOps: Sized {
         cancelled: &AtomicBool,
     ) -> Result<GeoDetail, GeoError>;
 
-    /// Serializes active narrow-band voxels of this `VdbGrid` into a `GeoDetail` point cloud
+    /// Lists active narrow-band voxels of this `VdbGrid` as a `GeoDetail` point cloud, to inspect them,
     /// with point attributes `f@phi`, `i@vx`, `i@vy`, `i@vz` and detail attributes `f@vdb_voxel_size`, `f@vdb_background`.
     fn to_voxel_geo_detail_cancellable(
         &self,
         memory_limit: usize,
         cancelled: &AtomicBool,
     ) -> Result<GeoDetail, GeoError>;
-
-    /// Reconstructs a `VdbGrid` from a voxel `GeoDetail` produced by `to_voxel_geo_detail_cancellable`.
-    fn from_voxel_geo_detail_cancellable(
-        geo: &GeoDetail,
-        memory_limit: usize,
-        cancelled: &AtomicBool,
-    ) -> Result<Self, GeoError>;
 }
 
 impl VdbOps for VdbGrid {
@@ -577,72 +570,6 @@ impl VdbOps for VdbGrid {
                 "vdb_background",
                 AttributeColumn::f32_checked(vec![bg])?,
             )
-    }
-
-    fn from_voxel_geo_detail_cancellable(
-        geo: &GeoDetail,
-        memory_limit: usize,
-        cancelled: &AtomicBool,
-    ) -> Result<Self, GeoError> {
-        if cancelled.load(Ordering::Acquire) {
-            return Err(GeoError::Cancelled);
-        }
-        let vs = geo
-            .domain_attribute(AttrDomain::Detail, "vdb_voxel_size")
-            .and_then(AttributeColumn::as_f32)
-            .and_then(|c| c.get(0))
-            .ok_or(GeoError::AttributeNotFound)?;
-        let bg = geo
-            .domain_attribute(AttrDomain::Detail, "vdb_background")
-            .and_then(AttributeColumn::as_f32)
-            .and_then(|c| c.get(0))
-            .ok_or(GeoError::AttributeNotFound)?;
-        let phi_col = geo
-            .attribute("phi")
-            .and_then(AttributeColumn::as_f32)
-            .ok_or(GeoError::AttributeNotFound)?;
-        let vx_col = geo
-            .attribute("vx")
-            .and_then(AttributeColumn::as_i32)
-            .ok_or(GeoError::AttributeNotFound)?;
-        let vy_col = geo
-            .attribute("vy")
-            .and_then(AttributeColumn::as_i32)
-            .ok_or(GeoError::AttributeNotFound)?;
-        let vz_col = geo
-            .attribute("vz")
-            .and_then(AttributeColumn::as_i32)
-            .ok_or(GeoError::AttributeNotFound)?;
-
-        let mut brick_vecs: BTreeMap<(i32, i32, i32), Vec<FiniteF32>> = BTreeMap::new();
-        for i in 0..geo.len() {
-            if i.is_multiple_of(PAGE_LEN) && cancelled.load(Ordering::Acquire) {
-                return Err(GeoError::Cancelled);
-            }
-            let phi = phi_col.get(i).ok_or(GeoError::IndexOutOfBounds)?;
-            let vx = vx_col.get(i).ok_or(GeoError::IndexOutOfBounds)?;
-            let vy = vy_col.get(i).ok_or(GeoError::IndexOutOfBounds)?;
-            let vz = vz_col.get(i).ok_or(GeoError::IndexOutOfBounds)?;
-            let (bx, lx) = split_coord(vx);
-            let (by, ly) = split_coord(vy);
-            let (bz, lz) = split_coord(vz);
-            let entry = brick_vecs
-                .entry((bx, by, bz))
-                .or_insert_with(|| vec![bg; BRICK_LEN]);
-            entry[local_index(lx, ly, lz)] = phi;
-        }
-        let bytes = brick_vecs
-            .len()
-            .checked_mul(BRICK_LEN * std::mem::size_of::<FiniteF32>())
-            .ok_or(GeoError::LimitExceeded)?;
-        if bytes > memory_limit {
-            return Err(GeoError::LimitExceeded);
-        }
-        let mut bricks = BTreeMap::new();
-        for (coord, vals) in brick_vecs {
-            bricks.insert(coord, Brick8x8x8::from_vec(vals)?);
-        }
-        Self::from_parts(vs, bg, bricks)
     }
 }
 

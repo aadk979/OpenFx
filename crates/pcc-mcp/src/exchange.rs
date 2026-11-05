@@ -42,6 +42,7 @@ pub enum FileError {
     /// `.obj` and `.stl` have no instances, and exporting must not expand them unasked.
     PackedNeedsUnpack,
     TetsNeedSurface,
+    VolumesNeedConversion,
     TooLarge,
     Parse(IoFormatError),
     Io(io::ErrorKind),
@@ -65,6 +66,9 @@ impl FileError {
             }
             Self::TetsNeedSurface => {
                 "this format has no tetrahedra: use `tet_surface` first, or export .ofxg".to_owned()
+            }
+            Self::VolumesNeedConversion => {
+                "this format has no volumes: use `convert_vdb` first, or export .ofxg".to_owned()
             }
             Self::TooLarge => "the file exceeds the memory budget".to_owned(),
             Self::Parse(error) => format!("could not parse the file: {error:?}"),
@@ -335,6 +339,9 @@ impl AssetStore {
         if format != MeshFormat::Ofxg && geo.tet_count() > 0 {
             return Err(FileError::TetsNeedSurface);
         }
+        if format != MeshFormat::Ofxg && geo.volume_count() > 0 {
+            return Err(FileError::VolumesNeedConversion);
+        }
         let cancelled = AtomicBool::new(false);
         let ctx = SopContext::new(self.memory_limit, &cancelled);
         let bytes = encode_mesh(geo, format, &ctx)?;
@@ -376,7 +383,7 @@ impl AssetResolver for AssetStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pcc_geo::{PrimKind, PrimRun};
+    use pcc_geo::{PrimKind, PrimRun, VdbGrid};
     use pcc_math::Vec3;
 
     /// A fresh directory for one test, under the build's temporary area.
@@ -720,6 +727,27 @@ mod tests {
         }
         store.export(&solid, "a.ofxg", false)?;
         assert_eq!(store.import("a.ofxg")?.1.hash(), solid.hash());
+        Ok(())
+    }
+
+    #[test]
+    fn volumes_export_losslessly_or_not_at_all() -> Result<(), FileError> {
+        let root = scratch("volumes").map_err(FileError::from)?;
+        let store = AssetStore::new(Some(Workspace::open(&root)?), 1 << 20);
+        let geo_error = |e| FileError::Parse(IoFormatError::Geo(e));
+        let grid = VdbGrid::new(0.5, 2.0)
+            .and_then(|grid| grid.with_voxel(1, 1, 1, -0.5))
+            .map_err(geo_error)?;
+        let volume = GeoDetail::from_volumes(vec![Arc::new(grid)]).map_err(geo_error)?;
+        for path in ["a.obj", "a.stl"] {
+            assert_eq!(
+                store.export(&volume, path, false).err(),
+                Some(FileError::VolumesNeedConversion)
+            );
+            assert!(!root.join(path).exists());
+        }
+        store.export(&volume, "a.ofxg", false)?;
+        assert_eq!(store.import("a.ofxg")?.1.hash(), volume.hash());
         Ok(())
     }
 }

@@ -188,6 +188,8 @@ pub struct NodeDef {
     /// The operator handles tetrahedra properly. Any other refuses them, because operators that
     /// only know surfaces would otherwise skip them and silently drop a solid.
     pub accepts_tets: bool,
+    /// The operator handles volumes properly. Any other refuses them, for the same reason.
+    pub accepts_volumes: bool,
     /// A constraint spanning several parameters.
     pub rule: Option<NodeRule>,
 }
@@ -211,6 +213,7 @@ impl NodeDef {
             time_dependent: false,
             accepts_packed: false,
             accepts_tets: false,
+            accepts_volumes: false,
             rule: None,
         }
     }
@@ -230,6 +233,12 @@ impl NodeDef {
     #[must_use]
     pub const fn accepts_tets(mut self) -> Self {
         self.accepts_tets = true;
+        self
+    }
+
+    #[must_use]
+    pub const fn accepts_volumes(mut self) -> Self {
+        self.accepts_volumes = true;
         self
     }
 
@@ -1329,14 +1338,24 @@ static BUILTIN_NODES: &[NodeDef] = &[
                 "Number of 6-neighbor Laplacian smoothing passes (0..=50).",
             ),
         ],
-    ),
+    )
+    .accepts_volumes(),
+    NodeDef::new(
+        "vdb_to_points",
+        "vdb",
+        "Lists every active voxel as a point with `phi`, `vx`, `vy`, and `vz` attributes, to inspect or sample a volume.",
+        &[input("in", "Upstream volume.")],
+        &[],
+    )
+    .accepts_volumes(),
     NodeDef::new(
         "convert_vdb",
         "vdb",
         "Extracts the zero-isosurface of a VDB signed distance field as a guaranteed closed manifold all-quad mesh via Dual Surface Nets.",
         &[input("in", "Upstream VDB signed distance field.")],
         &[],
-    ),
+    )
+    .accepts_volumes(),
     NodeDef::new(
         "boolean",
         "modeling",
@@ -1405,7 +1424,8 @@ static BUILTIN_NODES: &[NodeDef] = &[
         &[],
     )
     .accepts_packed()
-    .accepts_tets(),
+    .accepts_tets()
+    .accepts_volumes(),
     NodeDef::new(
         "asset",
         "generator",

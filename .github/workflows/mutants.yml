@@ -24,8 +24,9 @@ jobs:
     name: Mutants in changed code
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
-    # Sharded because a mutant costs a rebuild plus the workspace tests, about 38 s on 22 cores, so
-    # one job cannot get through a large diff. A shard with nothing to test exits at once.
+    # A mutant costs a rebuild plus its own crate's tests, so a test in another crate does not count
+    # and a survivor can be a false alarm. Sharded so that a large diff can finish; a shard with
+    # nothing to test exits at once.
     timeout-minutes: 240
     strategy:
       fail-fast: false

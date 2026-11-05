@@ -18,7 +18,9 @@
 
 `.github/workflows/mutants.yml` runs `cargo-mutants` on the changed lines of each pull request, where a survivor fails the job, and over everything weekly, where survivors are only reported. It has not run on GitHub yet.
 
-Both jobs use 8 shards. A mutant costs a rebuild plus the workspace tests, about 38 s on 22 cores, so a single 120-minute job could not finish the 1,849 mutants in the pull request that introduces this workflow. A shard with nothing to test exits at once, and a new push replaces a pull request's run in progress.
+Both jobs use 8 shards, because the pull request that introduces this workflow holds 1,849 mutants. A mutant costs a rebuild plus its own crate's tests: 529 mutants took 10 minutes with 6 jobs on 22 cores, about 7 s of job time each. GitHub's 4-core runners will be slower by an amount not yet measured. A shard with nothing to test exits at once, and a new push replaces a pull request's run in progress.
+
+Because only the mutated crate's tests run, a test in another crate does not count, and a survivor can be a false alarm. So a crate's logic needs tests in that crate. An attempt with `--test-workspace=true` still ran only `pcc-geo`'s tests in its baseline, and the cause has not been investigated.
 
 ## Verification
 
@@ -26,7 +28,9 @@ Both jobs use 8 shards. A mutant costs a rebuild plus the workspace tests, about
 
 - A million instances cook, transform, and report correct bounds under a 120 MB budget that refuses their 192 MB expansion.
 - Transforming then unpacking matches unpacking then transforming, point for point and in winding, across rotation, non-uniform scale, and mirroring.
-- `cargo-mutants` on `pcc-expr` found 18 survivors after hand-picked mutations had all been caught. Tests were added for those gaps, but the tool has not been rerun to confirm the count. **The packed code has not been mutation-tested.**
+- `cargo-mutants` on `pcc-expr` found 18 survivors after hand-picked mutations had all been caught. Tests were added, and a rerun left 1 survivor and 5 timeouts, where the mutation makes the parser loop forever.
+- `cargo-mutants` on `pcc-geo/src/packed.rs` tested 243 mutants and left 91 survivors. `determinant` and `multiply` were false alarms, caught only by tests in `pcc-eval`. The real gaps were normals under any non-diagonal matrix, and instances beside plain geometry. After new tests, a serial replay of those 91 and the `pcc-expr` survivor caught all 92. That replay reused the tool's list rather than rerunning the tool, because a full rerun was stopped by low system memory.
+- **The other crates have not been through `cargo-mutants`.**
 
 ## Limits
 

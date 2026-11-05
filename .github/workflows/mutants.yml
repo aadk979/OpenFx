@@ -14,12 +14,23 @@ on:
 permissions:
   contents: read
 
+# A run can take hours, so a new push to a pull request replaces the run in progress.
+concurrency:
+  group: mutants-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   changed-code:
     name: Mutants in changed code
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
-    timeout-minutes: 120
+    # Sharded because a mutant costs a rebuild plus the workspace tests, about 38 s on 22 cores, so
+    # one job cannot get through a large diff. A shard with nothing to test exits at once.
+    timeout-minutes: 240
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3, 4, 5, 6, 7]
     steps:
       # v4.2.2
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
@@ -28,12 +39,12 @@ jobs:
       - run: rustup toolchain install
       - run: cargo install cargo-mutants --version 27.1.0 --locked
       - run: git diff "origin/${{ github.base_ref }}...HEAD" > changes.diff
-      - run: cargo mutants --in-diff changes.diff --timeout 120 --jobs 4 --no-shuffle
+      - run: cargo mutants --in-diff changes.diff --shard ${{ matrix.shard }}/8 --timeout 120 --jobs 4 --no-shuffle
       # v4.6.2
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         if: always()
         with:
-          name: mutants-changed
+          name: mutants-changed-${{ matrix.shard }}
           path: mutants.out/*.txt
 
   everything:

@@ -15,9 +15,9 @@ use pcc_id::{NodeId, RevisionId};
 use pcc_math::{Philox4x32, Vec3};
 use pcc_sop::{
     RemeshParams, SopContext, SurfaceScatter, Trs, attrib_transfer, clip_halfspace, create_line,
-    create_sphere, create_torus, create_tube, fuse_points, measure, poly_bevel, poly_reduce,
-    remesh, resample_curves, reverse_winding, scatter_surface, sweep_curves, transform_trs,
-    triangulate, uv_flatten, uv_layout, voronoi_fracture,
+    create_sphere, create_tet_box, create_torus, create_tube, fuse_points, measure, poly_bevel,
+    poly_reduce, remesh, resample_curves, reverse_winding, scatter_surface, sweep_curves,
+    transform_trs, triangulate, uv_flatten, uv_layout, voronoi_fracture,
 };
 use pcc_terrain::{HeightField, HfErodeParams, HfNoiseParams};
 use pcc_vdb::{VdbCombineOp, VdbGrid, VdbOps, boolean_meshes_cancellable};
@@ -816,6 +816,22 @@ fn eval_single_node(
             finish_sop(
                 PackedPrototype::new(Arc::clone(source))
                     .and_then(|prototype| target.with_instances_on_points(prototype, &scale_of)),
+                ctx,
+            )
+        }
+        "tetbox" => {
+            let size = param_vec3(node, "size")?;
+            let divisions = param_u32(node, "divisions")?;
+            check_element_estimate(divisions.saturating_add(1).saturating_pow(3), ctx)?;
+            let sop = SopContext::new(ctx.budget.max_memory_bytes, ctx.cancelled);
+            finish_sop(create_tet_box(size, divisions, &sop), ctx)
+        }
+        "tet_surface" => {
+            let input_geo = outputs
+                .get(&input_slot(node, 0)?)
+                .ok_or(EvalError::InvalidGraph)?;
+            finish_sop(
+                input_geo.tet_surface_cancellable(ctx.budget.max_memory_bytes, ctx.cancelled),
                 ctx,
             )
         }
@@ -1669,6 +1685,21 @@ impl Pass<'_> {
                         param: "input".to_owned(),
                         message: format!(
                             "`{}` does not accept packed instances: use `unpack` first",
+                            node.op
+                        ),
+                    });
+                }
+            }
+        }
+        // Likewise tetrahedra, which an operator that only knows surfaces would silently skip.
+        if !node_def(&node.op).is_some_and(|def| def.accepts_tets) {
+            for id in &node.inputs {
+                if outputs.get(id).is_some_and(|geo| geo.tet_count() > 0) {
+                    return Err(EvalError::Param {
+                        node: node.id,
+                        param: "input".to_owned(),
+                        message: format!(
+                            "`{}` does not accept tetrahedra: use `tet_surface` first",
                             node.op
                         ),
                     });

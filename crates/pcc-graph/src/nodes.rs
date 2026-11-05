@@ -185,6 +185,9 @@ pub struct NodeDef {
     /// The operator handles packed instances properly. Any other refuses them, so that nothing
     /// expands or drops instances without being asked to.
     pub accepts_packed: bool,
+    /// The operator handles tetrahedra properly. Any other refuses them, because operators that
+    /// only know surfaces would otherwise skip them and silently drop a solid.
+    pub accepts_tets: bool,
     /// A constraint spanning several parameters.
     pub rule: Option<NodeRule>,
 }
@@ -207,6 +210,7 @@ impl NodeDef {
             seeded_by_node_id: false,
             time_dependent: false,
             accepts_packed: false,
+            accepts_tets: false,
             rule: None,
         }
     }
@@ -220,6 +224,12 @@ impl NodeDef {
     #[must_use]
     pub const fn accepts_packed(mut self) -> Self {
         self.accepts_packed = true;
+        self
+    }
+
+    #[must_use]
+    pub const fn accepts_tets(mut self) -> Self {
+        self.accepts_tets = true;
         self
     }
 
@@ -1024,6 +1034,34 @@ static BUILTIN_NODES: &[NodeDef] = &[
         )],
     ),
     NodeDef::new(
+        "tetbox",
+        "generator",
+        "Generates a solid box of tetrahedra, centred on the origin, for soft-body simulation.",
+        &[],
+        &[
+            param(
+                "size",
+                ParamKind::Vec3,
+                Check::VecPositive,
+                "Positive finite (x, y, z) dimensions in metres.",
+            ),
+            param(
+                "divisions",
+                ParamKind::U32,
+                Check::UintAtLeast(1),
+                "Cells along each axis (>= 1). Each cell holds six tetrahedra.",
+            ),
+        ],
+    ),
+    NodeDef::new(
+        "tet_surface",
+        "solids",
+        "Extracts the outer triangle surface of a tetrahedral mesh, dropping interior points. Refuses other primitives, inverted elements, and elements that overlap.",
+        &[input("input", "Tetrahedral mesh.")],
+        &[],
+    )
+    .accepts_tets(),
+    NodeDef::new(
         "transform",
         "modifier",
         "Translates all input points by a finite 3D offset in metres.",
@@ -1035,7 +1073,8 @@ static BUILTIN_NODES: &[NodeDef] = &[
             "Finite (x, y, z) translation offset in metres.",
         )],
     )
-    .accepts_packed(),
+    .accepts_packed()
+    .accepts_tets(),
     NodeDef::new(
         "normal",
         "modifier",
@@ -1365,7 +1404,8 @@ static BUILTIN_NODES: &[NodeDef] = &[
         ],
         &[],
     )
-    .accepts_packed(),
+    .accepts_packed()
+    .accepts_tets(),
     NodeDef::new(
         "asset",
         "generator",
@@ -1511,7 +1551,8 @@ static BUILTIN_NODES: &[NodeDef] = &[
             ),
         ],
     )
-    .accepts_packed(),
+    .accepts_packed()
+    .accepts_tets(),
     NodeDef::new(
         "reverse",
         "modeling",

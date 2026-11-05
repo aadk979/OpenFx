@@ -60,6 +60,7 @@ pub fn to_ofxg_bytes(geo: &GeoDetail) -> Vec<u8> {
             PrimKind::Polygon => 1,
             PrimKind::Polyline => 2,
             PrimKind::Packed => 3,
+            PrimKind::Tetrahedron => 4,
         };
         payload.push(kind_tag);
         write_u32(&mut payload, run.arity);
@@ -188,6 +189,7 @@ fn read_ofxg(bytes: &[u8], max_elements: usize, depth: u32) -> Result<GeoDetail,
             1 => PrimKind::Polygon,
             2 => PrimKind::Polyline,
             3 => PrimKind::Packed,
+            4 => PrimKind::Tetrahedron,
             _ => return Err(IoFormatError::InvalidTypeTag),
         };
         let arity = read_u32(body, &mut cursor)?;
@@ -306,8 +308,8 @@ pub fn to_obj(geo: &GeoDetail) -> String {
         let prefix = match run.kind {
             PrimKind::Polygon => "f",
             PrimKind::Polyline => "l",
-            // OBJ has no instances. Callers that must not lose them refuse to get here.
-            PrimKind::Packed => {
+            // OBJ has neither of these. Callers that must not lose them refuse to get here.
+            PrimKind::Packed | PrimKind::Tetrahedron => {
                 vtx_cursor += arity * run.prim_count;
                 continue;
             }
@@ -847,6 +849,41 @@ mod tests {
         assert_eq!(back.hash(), geo.hash());
         let partial = from_obj("v 0 0 0\nv 1 0 0\nv 0 1 0\nvt 0 0\nf 1/1 2 3\n")?;
         assert!(partial.domain_attribute(AttrDomain::Vertex, "uv").is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn tetrahedra_round_trip_and_obj_writes_no_faces_for_them() -> Result<(), IoFormatError> {
+        let corners = [
+            (0.0, 0.0, 0.0),
+            (1.0, 0.0, 0.0),
+            (0.0, 1.0, 0.0),
+            (0.0, 0.0, 1.0),
+        ];
+        let solid = GeoDetail::points(corners.map(|(x, y, z)| Vec3 { x, y, z }).to_vec())
+            .with_primitives(
+                vec![PrimRun {
+                    kind: PrimKind::Tetrahedron,
+                    arity: 4,
+                    prim_count: 1,
+                }],
+                vec![0, 1, 2, 3],
+            )?;
+        let back = from_ofxg_bytes(&to_ofxg_bytes(&solid))?;
+        assert_eq!(back.hash(), solid.hash());
+        assert_eq!(back.tet_count(), 1);
+        // OBJ cannot hold them, so writing one leaves the points and no faces.
+        let text = to_obj(&solid);
+        assert!(
+            !text.contains(
+                "
+f "
+            ) && !text.contains(
+                "
+l "
+            ),
+            "{text}"
+        );
         Ok(())
     }
 

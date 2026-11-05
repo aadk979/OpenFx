@@ -2,6 +2,7 @@
 //! Page starts are logical 16,384-element boundaries (`PAGE_LEN`).
 
 mod packed;
+mod tets;
 mod volume;
 
 use packed::PackedTable;
@@ -74,6 +75,8 @@ pub enum PrimKind {
     Polyline,
     /// An instance of a shared prototype. Arity one: its vertex is the instance's point.
     Packed,
+    /// A solid element with exactly four corners. See the `tets` module for its orientation.
+    Tetrahedron,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -663,8 +666,10 @@ impl GeoDetail {
                 PrimKind::Polygon => 3,
                 PrimKind::Polyline => 2,
                 PrimKind::Packed => 1,
+                PrimKind::Tetrahedron => 4,
             };
-            if run.arity < min_arity || (run.kind == PrimKind::Packed && run.arity != 1) {
+            let exact = matches!(run.kind, PrimKind::Packed | PrimKind::Tetrahedron);
+            if run.arity < min_arity || (exact && run.arity != min_arity) {
                 return Err(GeoError::InvalidTopology);
             }
             let run_verts = (run.arity as usize)
@@ -2184,8 +2189,9 @@ impl GeoDetail {
         Ok(next)
     }
 
-    /// Reverses the vertex order of every polygon, flipping surface orientation. Vertex attributes
-    /// travel with their vertices; point and primitive data are shared. Polylines are unchanged.
+    /// Reverses the vertex order of every polygon, flipping surface orientation, and inverts every
+    /// tetrahedron. Vertex attributes travel with their vertices; point and primitive data are
+    /// shared. Polylines are unchanged.
     pub fn with_reversed_winding(&self) -> Result<Self, GeoError> {
         let mut order = Vec::with_capacity(self.vertex_count());
         let mut cursor = 0usize;
@@ -2195,6 +2201,10 @@ impl GeoDetail {
                 match run.kind {
                     PrimKind::Polygon => order.extend((cursor..cursor + arity).rev()),
                     PrimKind::Polyline | PrimKind::Packed => order.extend(cursor..cursor + arity),
+                    // One swap inverts an element; reversing all four corners would not.
+                    PrimKind::Tetrahedron => {
+                        order.extend([cursor, cursor + 2, cursor + 1, cursor + 3]);
+                    }
                 }
                 cursor += arity;
             }
@@ -2251,6 +2261,7 @@ impl GeoDetail {
                     PrimKind::Polygon => 1,
                     PrimKind::Polyline => 2,
                     PrimKind::Packed => 3,
+                    PrimKind::Tetrahedron => 4,
                 };
                 h.update(&[kind_tag]);
                 h.update(&run.arity.to_le_bytes());
@@ -2518,6 +2529,7 @@ impl TopologyIndex {
                 PrimKind::Polygon => 1,
                 PrimKind::Polyline => 2,
                 PrimKind::Packed => 3,
+                PrimKind::Tetrahedron => 4,
             };
             h.update(&[kind_tag]);
             h.update(&run.arity.to_le_bytes());
@@ -2575,8 +2587,9 @@ impl TopologyIndex {
                                 }
                             }
                         }
-                        // A packed primitive has one vertex, and so no edges at all.
-                        PrimKind::Polyline | PrimKind::Packed => {
+                        // A packed primitive has one vertex, and so no edges at all. A tetrahedron's
+                        // edges are not surface edges, so they must not affect manifold checks.
+                        PrimKind::Polyline | PrimKind::Packed | PrimKind::Tetrahedron => {
                             if k + 1 < arity
                                 && let Some(slot) = next_he.get_mut(he)
                             {

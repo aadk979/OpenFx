@@ -321,7 +321,9 @@ impl McpError {
                     FileError::PathRejected(_) => plain(ToolErrorCode::PathRejected, message),
                     FileError::NotFound => plain(ToolErrorCode::FileNotFound, message),
                     FileError::AlreadyExists => plain(ToolErrorCode::FileAlreadyExists, message),
-                    FileError::UnsupportedFormat | FileError::PackedNeedsUnpack => {
+                    FileError::UnsupportedFormat
+                    | FileError::PackedNeedsUnpack
+                    | FileError::TetsNeedSurface => {
                         plain(ToolErrorCode::UnsupportedFileFormat, message)
                     }
                     FileError::Parse(_) => plain(ToolErrorCode::MeshParseFailed, message),

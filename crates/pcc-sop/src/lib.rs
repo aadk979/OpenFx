@@ -25,7 +25,7 @@ pub use clip::{clip_halfspace, voronoi_fracture};
 pub use common::{SopContext, has_repeated_faces, signed_volume};
 pub use curves::{resample_curves, sweep_curves};
 pub use modify::{Trs, fuse_points, measure, reverse_winding, transform_trs, triangulate};
-pub use primitives::{create_line, create_sphere, create_torus, create_tube};
+pub use primitives::{create_line, create_sphere, create_tet_box, create_torus, create_tube};
 pub use reduce::poly_reduce;
 pub use remesh::{RemeshParams, remesh};
 pub use sampling::{SurfaceScatter, attrib_transfer, scatter_surface};

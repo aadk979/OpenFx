@@ -931,4 +931,209 @@ mod tests {
         assert!(shell.with_packed_parts(vec![prototype()?], &[good]).is_ok());
         Ok(())
     }
+
+    /// No entry is zero or one, so that every term of a formula shows in its result. Its
+    /// determinant is exactly 0.25.
+    fn general() -> [Vec3; 3] {
+        [v(2.0, -1.5, 3.0), v(0.5, 4.0, -2.0), v(3.0, -3.0, 5.0)]
+    }
+
+    fn cross(a: Vec3, b: Vec3) -> Vec3 {
+        v(
+            a.y * b.z - a.z * b.y,
+            a.z * b.x - a.x * b.z,
+            a.x * b.y - a.y * b.x,
+        )
+    }
+
+    fn assert_close(actual: Vec3, expected: Vec3) {
+        let far = (actual.x - expected.x).abs()
+            + (actual.y - expected.y).abs()
+            + (actual.z - expected.z).abs();
+        assert!(far < 1e-4, "{actual:?} is not {expected:?}");
+    }
+
+    #[test]
+    fn matrix_helpers_match_worked_examples() -> Result<(), GeoError> {
+        let m = general();
+        assert_eq!(determinant(&m), 0.25);
+        assert_eq!(determinant(&[m[1], m[0], m[2]]), -0.25);
+        let a = [v(1.0, 2.0, 3.0), v(4.0, 5.0, 6.0), v(7.0, 8.0, 10.0)];
+        let b = [v(2.0, 0.0, 1.0), v(1.0, 3.0, 0.0), v(0.0, 1.0, 4.0)];
+        assert_eq!(
+            multiply(&a, &b)?,
+            [v(4.0, 9.0, 13.0), v(13.0, 21.0, 28.0), v(22.0, 34.0, 47.0)]
+        );
+        Ok(())
+    }
+
+    /// The cofactor matrix satisfies `cof(M)(a x b) = Ma x Mb`, which needs no inverse to check: a
+    /// mapped normal must be the normal of the mapped tangents, whatever the transform.
+    #[test]
+    fn normals_stay_perpendicular_under_a_general_transform() -> Result<(), GeoError> {
+        let m = general();
+        let mirrored = [m[1], m[0], m[2]];
+        let pairs = [
+            (v(1.0, 2.0, -1.0), v(3.0, -1.0, 2.0)),
+            (v(-2.0, 0.5, 3.0), v(1.0, 4.0, 1.5)),
+        ];
+        let image = |rows: &[Vec3; 3], p: Vec3| {
+            let [x, y, z] = apply(rows, p);
+            v(x as f32, y as f32, z as f32)
+        };
+        for rows in [m, mirrored] {
+            for (first, second) in pairs {
+                let normal = cross(first, second);
+                let expected = cross(image(&rows, first), image(&rows, second));
+                assert_close(map_normal(&rows, normal)?, expected.normalized_or_up());
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn each_unpacked_normal_follows_its_own_instance() -> Result<(), GeoError> {
+        let cancelled = AtomicBool::new(false);
+        let normals = [v(1.0, 2.0, 3.0), v(-3.0, 1.0, 2.0)];
+        let proto = cloud(&[v(1.0, 0.0, 0.0), v(0.0, 1.0, 0.0)])
+            .with_attribute("N", AttributeColumn::vec3_values(normals.to_vec()))?;
+        let whole = GeoDetail::packed_whole(Arc::new(proto))?;
+        let m = general();
+        let turn = [v(0.0, -1.0, 0.0), v(1.0, 0.0, 0.0), v(0.0, 0.0, 1.0)];
+        let flat = whole
+            .with_packed_linear(&m)?
+            .merged(&whole.with_packed_linear(&turn)?, usize::MAX)?
+            .unpacked_cancellable(1 << 20, &cancelled)?;
+        let column = flat
+            .attribute("N")
+            .and_then(AttributeColumn::as_vec3)
+            .ok_or(GeoError::AttributeNotFound)?;
+        let expected = [(0, &m, 0), (1, &m, 1), (2, &turn, 0), (3, &turn, 1)];
+        for (index, rows, normal) in expected {
+            let found = column.get(index).ok_or(GeoError::IndexOutOfBounds)?;
+            assert_close(found, map_normal(rows, normals[normal])?);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn only_a_truly_mirroring_transform_reverses_winding() -> Result<(), GeoError> {
+        let cancelled = AtomicBool::new(false);
+        let proto = prototype()?;
+        let order = |geo: &GeoDetail| -> Vec<Option<u32>> {
+            (0..geo.vertex_count())
+                .map(|vertex| geo.vertex_point(vertex))
+                .collect()
+        };
+        let unpack_with = |rows: &[Vec3; 3]| {
+            GeoDetail::packed_whole(Arc::clone(&proto))?
+                .with_packed_linear(rows)?
+                .unpacked_cancellable(1 << 20, &cancelled)
+        };
+        let kept = order(&proto);
+        // A flattening transform has a determinant of exactly zero, and mirrors nothing.
+        let flatten = [v(1.0, 0.0, 0.0), v(0.0, 1.0, 0.0), v(0.0, 0.0, 0.0)];
+        assert_eq!(order(&unpack_with(&flatten)?), kept);
+        let turn = [v(0.0, -1.0, 0.0), v(1.0, 0.0, 0.0), v(0.0, 0.0, 1.0)];
+        assert_eq!(order(&unpack_with(&turn)?), kept);
+        let mirror = [v(-1.0, 0.0, 0.0), v(0.0, 1.0, 0.0), v(0.0, 0.0, 1.0)];
+        let reflected = unpack_with(&mirror)?;
+        assert_ne!(order(&reflected), kept);
+        assert!(reflected.enclosed_volume() > 0.0);
+        Ok(())
+    }
+
+    #[test]
+    fn bounds_read_each_instance_past_plain_geometry() -> Result<(), GeoError> {
+        // A box that neither contains the origin nor has a corner at one.
+        let proto = Arc::new(cloud(&[v(0.5, 0.5, 0.5), v(2.0, 2.0, 2.0)]));
+        let plain = (*prototype()?).clone();
+        let scale = |i: usize| if i == 0 { 1.0 } else { 3.0 };
+        let placed = cloud(&[v(50.0, 0.0, 0.0), v(-40.0, 10.0, 0.0)])
+            .with_instances_on_points(PackedPrototype::new(proto)?, &scale)?;
+        let mixed = plain.merged(&placed, usize::MAX)?;
+        // First instance: x reaches 50 + 2. Second, at scale 3: y reaches 10 + 6, and z 0 + 6.
+        // Points set the rest: x from -40 at the second instancing point, y and z from 0.
+        assert_eq!(
+            mixed.bounds(),
+            Some((v(-40.0, 0.0, 0.0), v(52.0, 16.0, 6.0)))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn plain_geometry_after_instances_keeps_its_own_attributes() -> Result<(), GeoError> {
+        let cancelled = AtomicBool::new(false);
+        let plain = GeoDetail::points(vec![
+            v(0.0, 0.0, 0.0),
+            v(1.0, 0.0, 0.0),
+            v(0.0, 1.0, 0.0),
+            v(0.0, 0.0, 1.0),
+        ])
+        .with_primitives(
+            vec![PrimRun {
+                kind: PrimKind::Polygon,
+                arity: 3,
+                prim_count: 2,
+            }],
+            vec![0, 2, 1, 1, 2, 3],
+        )?
+        .with_domain_attribute(
+            AttrDomain::Prim,
+            "tag",
+            AttributeColumn::i32_values(vec![1, 2]),
+        )?;
+        let placed = cloud(&[v(50.0, 0.0, 0.0), v(60.0, 0.0, 0.0)]).with_instances_on_points(
+            PackedPrototype::new(Arc::new(cloud(&[v(1.0, 1.0, 1.0)])))?,
+            &|_| 1.0,
+        )?;
+        let flat = placed
+            .merged(&plain, usize::MAX)?
+            .unpacked_cancellable(1 << 20, &cancelled)?;
+        // The plain part goes in front, with only its own points, its winding, and its tags.
+        assert_eq!(flat.point(3), Some(v(0.0, 0.0, 1.0)));
+        assert_eq!((flat.len(), flat.prim_count()), (6, 2));
+        let order: Vec<_> = (0..flat.vertex_count())
+            .map(|vertex| flat.vertex_point(vertex))
+            .collect();
+        let expected: Vec<_> = [0, 2, 1, 1, 2, 3].map(Some).to_vec();
+        assert_eq!(order, expected);
+        let tag = flat
+            .domain_attribute(AttrDomain::Prim, "tag")
+            .and_then(AttributeColumn::as_i32)
+            .ok_or(GeoError::AttributeNotFound)?;
+        assert_eq!((tag.get(0), tag.get(1)), (Some(1), Some(2)));
+        Ok(())
+    }
+
+    #[test]
+    fn unpacking_joins_equal_runs_and_keeps_unlike_ones_apart() -> Result<(), GeoError> {
+        let cancelled = AtomicBool::new(false);
+        let triangles = |count| PrimRun {
+            kind: PrimKind::Polygon,
+            arity: 3,
+            prim_count: count,
+        };
+        let polyline = PrimRun {
+            kind: PrimKind::Polyline,
+            arity: 3,
+            prim_count: 1,
+        };
+        let shape = || cloud(&[v(0.0, 0.0, 0.0), v(1.0, 0.0, 0.0), v(0.0, 1.0, 0.0)]);
+        let twice = |proto: GeoDetail| -> Result<GeoDetail, GeoError> {
+            cloud(&[v(5.0, 0.0, 0.0), v(9.0, 0.0, 0.0)])
+                .with_instances_on_points(PackedPrototype::new(Arc::new(proto))?, &|_| 1.0)?
+                .unpacked_cancellable(1 << 20, &cancelled)
+        };
+        let uniform = twice(shape().with_primitives(vec![triangles(1)], vec![0, 1, 2])?)?;
+        assert_eq!(uniform.prim_runs(), &[triangles(2)]);
+        // Same arity, different kinds: joining them would turn a polyline into a polygon.
+        let unlike =
+            twice(shape().with_primitives(vec![triangles(1), polyline], vec![0, 1, 2, 0, 1, 2])?)?;
+        assert_eq!(
+            unlike.prim_runs(),
+            &[triangles(1), polyline, triangles(1), polyline]
+        );
+        Ok(())
+    }
 }

@@ -1060,6 +1060,11 @@ mod tests {
         }
         assert_eq!(Expr::compile("1 + $X").map_err(|e| e.position), Err(6));
         assert_eq!(Expr::compile("(1 2").map_err(|e| e.position), Err(3));
+        // A stray symbol is not a function with a missing name.
+        assert_eq!(
+            Expr::compile("1 + #").map_err(|e| e.message),
+            Err("expected a value".to_owned())
+        );
     }
 
     #[test]

@@ -16,9 +16,13 @@
 
 ### 2. Mutation testing in CI
 
-`.github/workflows/mutants.yml` runs `cargo-mutants` on the changed lines of each pull request, and over everything weekly, without failing on known survivors. It has not run on GitHub yet.
+`.github/workflows/mutants.yml` runs `cargo-mutants` on the changed lines of each pull request, where a survivor fails the job, and over everything weekly, where survivors are only reported. It has not run on GitHub yet.
+
+Both jobs use 8 shards. A mutant costs a rebuild plus the workspace tests, about 38 s on 22 cores, so a single 120-minute job could not finish the 1,849 mutants in the pull request that introduces this workflow. A shard with nothing to test exits at once, and a new push replaces a pull request's run in progress.
 
 ## Verification
+
+- The Thingi10K corpus was rerun after these changes: 2,800 runs with 0 failures. Compared with the run recorded in [ADR 010](010-thingi10k-torture-harness.md), 2,799 geometry hashes are identical. The other is `uvflatten` on model 461110, which sits at the 60 s limit and finished this time instead of timing out.
 
 - A million instances cook, transform, and report correct bounds under a 120 MB budget that refuses their 192 MB expansion.
 - Transforming then unpacking matches unpacking then transforming, point for point and in winding, across rotation, non-uniform scale, and mirroring.

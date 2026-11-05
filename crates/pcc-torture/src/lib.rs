@@ -10,7 +10,7 @@ use pcc_sop::{
     poly_bevel, poly_reduce, remesh, scatter_surface, signed_volume, transform_trs, triangulate,
     uv_flatten, voronoi_fracture,
 };
-use pcc_vdb::{VdbCombineOp, VdbGrid, boolean_meshes_cancellable};
+use pcc_vdb::{VdbCombineOp, VdbGrid, VdbOps, boolean_meshes_cancellable};
 use std::sync::atomic::AtomicBool;
 
 /// Every mesh is rescaled to this bounding-box diagonal, so absolute parameters mean the same thing

@@ -20,7 +20,7 @@ use pcc_sop::{
     triangulate, uv_flatten, uv_layout, voronoi_fracture,
 };
 use pcc_terrain::{HeightField, HfErodeParams, HfNoiseParams};
-use pcc_vdb::{VdbCombineOp, VdbGrid, boolean_meshes_cancellable};
+use pcc_vdb::{VdbCombineOp, VdbGrid, VdbOps, boolean_meshes_cancellable};
 use pcc_vex::{DEFAULT_MAX_FUEL_PER_POINT, VexError, compile_vex};
 use std::{
     collections::BTreeMap,

@@ -2,9 +2,11 @@
 //! Page starts are logical 16,384-element boundaries (`PAGE_LEN`).
 
 mod packed;
+mod volume;
 
 use packed::PackedTable;
 pub use packed::{MAX_PACKED_DEPTH, PackedInstance, PackedPrototype};
+pub use volume::{BRICK_DIM, BRICK_LEN, Brick8x8x8, VdbGrid, local_index, split_coord};
 
 use pcc_math::{MathError, Vec3};
 use std::{

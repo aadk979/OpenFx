@@ -49,7 +49,7 @@ Everything here gets more expensive with each operator added, so it comes before
 
 | # | Work | Exit evidence |
 |---|---|---|
-| A1 | Memoized Merkle hashing; `P` as an ordinary column; lazy page hashes | Re-cooking a 10 M-point chain after a downstream parameter change performs zero upstream hash computations, by counter |
+| A1 | **Done ([ADR 019](adr/019-memoized-merkle-hashing.md)).** Memoized Merkle hashing; `P` as an ordinary column; lazy constant pages; `.ofxg` v2 | 10 M-point re-cook performs 0 page/column/detail hashes (`1,092 ms -> 0.017 ms`) |
 | A2 | `Operator` trait and single registry; remove the dispatch `match` | Built-in and runtime-registered operators share one path; golden scene still cooks to identical hashes, apart from the documented A1 change |
 | A3 | Pull evaluation; explicit output flag; lift the two-node and first/last scene rules | A test shows a node outside the target's ancestry is never cooked; empty and single-node scenes are valid |
 | A4 | Scene format v2: named sparse parameters, defaults, operator versions, scene settings, node names; v1 migration | Every existing v1 golden file migrates and cooks to the same hashes; adding a defaulted parameter to an operator leaves old files valid |
@@ -152,4 +152,4 @@ The enforced gates and the ones still missing are listed in [`ARCHITECTURE.md` Â
 
 ## 7. Next step
 
-Start Phase A at A1.
+Continue Phase A at A2 (`Operator` trait and single registry).

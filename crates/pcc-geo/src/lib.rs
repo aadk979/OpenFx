@@ -12,14 +12,78 @@ pub use volume::{BRICK_DIM, BRICK_LEN, Brick8x8x8, VdbGrid, local_index, split_c
 
 use pcc_math::{MathError, Vec3};
 use std::{
+    cell::Cell,
     collections::BTreeMap,
     sync::{
-        Arc,
+        Arc, LazyLock, OnceLock,
         atomic::{AtomicBool, Ordering},
     },
 };
 
 pub const PAGE_LEN: usize = 16_384;
+
+/// Counts of actual hash computations performed on the current thread (cache misses only).
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct HashStats {
+    pub page_hashes: u64,
+    pub column_hashes: u64,
+    pub detail_hashes: u64,
+}
+
+impl HashStats {
+    /// Returns the number of hash computations performed between `earlier` and `self`.
+    #[must_use]
+    pub const fn delta(self, earlier: Self) -> Self {
+        Self {
+            page_hashes: self.page_hashes.saturating_sub(earlier.page_hashes),
+            column_hashes: self.column_hashes.saturating_sub(earlier.column_hashes),
+            detail_hashes: self.detail_hashes.saturating_sub(earlier.detail_hashes),
+        }
+    }
+}
+
+thread_local! {
+    static THREAD_HASH_STATS: Cell<HashStats> = const {
+        Cell::new(HashStats {
+            page_hashes: 0,
+            column_hashes: 0,
+            detail_hashes: 0,
+        })
+    };
+}
+
+/// Returns cumulative cache-miss hash counts on the current thread.
+#[must_use]
+pub fn hash_stats() -> HashStats {
+    THREAD_HASH_STATS.with(Cell::get)
+}
+
+fn record_page_hash() {
+    THREAD_HASH_STATS.with(|stats| {
+        let mut current = stats.get();
+        current.page_hashes = current.page_hashes.saturating_add(1);
+        stats.set(current);
+    });
+}
+
+fn record_column_hash() {
+    THREAD_HASH_STATS.with(|stats| {
+        let mut current = stats.get();
+        current.column_hashes = current.column_hashes.saturating_add(1);
+        stats.set(current);
+    });
+}
+
+fn record_detail_hash() {
+    THREAD_HASH_STATS.with(|stats| {
+        let mut current = stats.get();
+        current.detail_hashes = current.detail_hashes.saturating_add(1);
+        stats.set(current);
+    });
+}
+
+static EMPTY_POSITIONS: LazyLock<PagedColumn<Vec3>> =
+    LazyLock::new(|| PagedColumn::from_vec(Vec::new()));
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct FiniteF32(f32);
@@ -41,16 +105,49 @@ impl FiniteF32 {
     }
 }
 
-#[derive(Clone, Debug)]
-pub struct Page<T> {
-    values: Arc<[T]>,
-    hash: blake3::Hash,
+#[derive(Debug)]
+enum PageData<T> {
+    Values(Arc<[T]>),
+    Constant { value: T, len: usize },
 }
 
-#[derive(Clone, Debug)]
-pub struct PagedColumn<T> {
+#[derive(Debug)]
+struct PageInner<T> {
+    data: PageData<T>,
+    hash: OnceLock<blake3::Hash>,
+}
+
+#[derive(Debug)]
+pub struct Page<T> {
+    inner: Arc<PageInner<T>>,
+}
+
+impl<T> Clone for Page<T> {
+    fn clone(&self) -> Self {
+        Self {
+            inner: Arc::clone(&self.inner),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct ColumnInner<T> {
     pages: Arc<[Page<T>]>,
     len: usize,
+    hash: OnceLock<blake3::Hash>,
+}
+
+#[derive(Debug)]
+pub struct PagedColumn<T> {
+    inner: Arc<ColumnInner<T>>,
+}
+
+impl<T> Clone for PagedColumn<T> {
+    fn clone(&self) -> Self {
+        Self {
+            inner: Arc::clone(&self.inner),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -121,7 +218,7 @@ pub struct ElementGroup {
 
 impl ElementGroup {
     #[must_use]
-    pub const fn len(&self) -> usize {
+    pub fn len(&self) -> usize {
         self.mask.len()
     }
 
@@ -155,9 +252,9 @@ pub enum AttributeColumn {
     Vec3(PagedColumn<Vec3>),
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct GeoDetail {
-    positions: PagedColumn<Vec3>,
+    point_count: usize,
     vertex_points: PagedColumn<u32>,
     prim_runs: Arc<[PrimRun]>,
     prim_count: usize,
@@ -169,6 +266,31 @@ pub struct GeoDetail {
     prim_groups: Arc<BTreeMap<String, ElementGroup>>,
     packed: Option<Arc<PackedTable>>,
     volumes: Option<Arc<[VolumeEntry]>>,
+    cached_hash: OnceLock<blake3::Hash>,
+}
+
+impl Clone for GeoDetail {
+    fn clone(&self) -> Self {
+        let cached_hash = OnceLock::new();
+        if let Some(&digest) = self.cached_hash.get() {
+            let _ = cached_hash.set(digest);
+        }
+        Self {
+            point_count: self.point_count,
+            vertex_points: self.vertex_points.clone(),
+            prim_runs: Arc::clone(&self.prim_runs),
+            prim_count: self.prim_count,
+            point_attributes: Arc::clone(&self.point_attributes),
+            vertex_attributes: Arc::clone(&self.vertex_attributes),
+            prim_attributes: Arc::clone(&self.prim_attributes),
+            detail_attributes: Arc::clone(&self.detail_attributes),
+            point_groups: Arc::clone(&self.point_groups),
+            prim_groups: Arc::clone(&self.prim_groups),
+            packed: self.packed.clone(),
+            volumes: self.volumes.clone(),
+            cached_hash,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -193,80 +315,233 @@ impl From<MathError> for GeoError {
 
 pub trait HashableValue: Copy {
     const TYPE_TAG: u8;
-    fn update_hash(&self, hasher: &mut blake3::Hasher);
+    const ELEMENT_BYTES: usize;
+
+    fn write_le_bytes(self, dst: &mut [u8]);
+    fn same_bits(self, other: Self) -> bool;
+
+    fn hash_slice(values: &[Self], hasher: &mut blake3::Hasher) {
+        const CHUNK_BYTES: usize = 4096;
+        let per_chunk = CHUNK_BYTES / Self::ELEMENT_BYTES;
+        let mut buf = [0u8; CHUNK_BYTES];
+        for chunk in values.chunks(per_chunk) {
+            let mut offset = 0usize;
+            for &value in chunk {
+                value.write_le_bytes(&mut buf[offset..offset + Self::ELEMENT_BYTES]);
+                offset += Self::ELEMENT_BYTES;
+            }
+            hasher.update(&buf[..offset]);
+        }
+    }
+
+    fn hash_constant(value: Self, len: usize, hasher: &mut blake3::Hasher) {
+        if len == 0 {
+            return;
+        }
+        const CHUNK_BYTES: usize = 4096;
+        let per_chunk = CHUNK_BYTES / Self::ELEMENT_BYTES;
+        let mut buf = [0u8; CHUNK_BYTES];
+        let fill_count = len.min(per_chunk);
+        for index in 0..fill_count {
+            let start = index * Self::ELEMENT_BYTES;
+            value.write_le_bytes(&mut buf[start..start + Self::ELEMENT_BYTES]);
+        }
+        let mut remaining = len;
+        while remaining > 0 {
+            let take = remaining.min(fill_count);
+            hasher.update(&buf[..take * Self::ELEMENT_BYTES]);
+            remaining -= take;
+        }
+    }
 }
 
 impl HashableValue for FiniteF32 {
     const TYPE_TAG: u8 = 1;
-    fn update_hash(&self, hasher: &mut blake3::Hasher) {
-        hasher.update(&self.0.to_bits().to_le_bytes());
+    const ELEMENT_BYTES: usize = 4;
+
+    fn write_le_bytes(self, dst: &mut [u8]) {
+        dst.copy_from_slice(&self.0.to_bits().to_le_bytes());
+    }
+
+    fn same_bits(self, other: Self) -> bool {
+        self.0.to_bits() == other.0.to_bits()
     }
 }
 
 impl HashableValue for i32 {
     const TYPE_TAG: u8 = 2;
-    fn update_hash(&self, hasher: &mut blake3::Hasher) {
-        hasher.update(&self.to_le_bytes());
+    const ELEMENT_BYTES: usize = 4;
+
+    fn write_le_bytes(self, dst: &mut [u8]) {
+        dst.copy_from_slice(&self.to_le_bytes());
+    }
+
+    fn same_bits(self, other: Self) -> bool {
+        self == other
     }
 }
 
 impl HashableValue for u32 {
     const TYPE_TAG: u8 = 3;
-    fn update_hash(&self, hasher: &mut blake3::Hasher) {
-        hasher.update(&self.to_le_bytes());
+    const ELEMENT_BYTES: usize = 4;
+
+    fn write_le_bytes(self, dst: &mut [u8]) {
+        dst.copy_from_slice(&self.to_le_bytes());
+    }
+
+    fn same_bits(self, other: Self) -> bool {
+        self == other
     }
 }
 
 impl HashableValue for bool {
     const TYPE_TAG: u8 = 4;
-    fn update_hash(&self, hasher: &mut blake3::Hasher) {
-        hasher.update(&[u8::from(*self)]);
+    const ELEMENT_BYTES: usize = 1;
+
+    fn write_le_bytes(self, dst: &mut [u8]) {
+        dst[0] = u8::from(self);
+    }
+
+    fn same_bits(self, other: Self) -> bool {
+        self == other
     }
 }
 
 impl HashableValue for Vec3 {
     const TYPE_TAG: u8 = 5;
-    fn update_hash(&self, hasher: &mut blake3::Hasher) {
-        for component in [self.x, self.y, self.z] {
-            hasher.update(&component.to_bits().to_le_bytes());
-        }
+    const ELEMENT_BYTES: usize = 12;
+
+    fn write_le_bytes(self, dst: &mut [u8]) {
+        dst[0..4].copy_from_slice(&self.x.to_bits().to_le_bytes());
+        dst[4..8].copy_from_slice(&self.y.to_bits().to_le_bytes());
+        dst[8..12].copy_from_slice(&self.z.to_bits().to_le_bytes());
+    }
+
+    fn same_bits(self, other: Self) -> bool {
+        self.x.to_bits() == other.x.to_bits()
+            && self.y.to_bits() == other.y.to_bits()
+            && self.z.to_bits() == other.z.to_bits()
     }
 }
 
 impl<T: HashableValue> Page<T> {
     fn from_slice(values: &[T]) -> Self {
-        let mut hasher = blake3::Hasher::new();
-        hasher.update(&[T::TYPE_TAG]);
-        hasher.update(&(values.len() as u64).to_le_bytes());
-        for value in values {
-            value.update_hash(&mut hasher);
-        }
+        let data = if let Some(&first) = values.first()
+            && values[1..].iter().all(|&v| v.same_bits(first))
+        {
+            PageData::Constant {
+                value: first,
+                len: values.len(),
+            }
+        } else {
+            PageData::Values(Arc::from(values))
+        };
         Self {
-            values: Arc::from(values),
-            hash: hasher.finalize(),
+            inner: Arc::new(PageInner {
+                data,
+                hash: OnceLock::new(),
+            }),
         }
     }
 
     fn from_vec(values: Vec<T>) -> Self {
-        let mut hasher = blake3::Hasher::new();
-        hasher.update(&[T::TYPE_TAG]);
-        hasher.update(&(values.len() as u64).to_le_bytes());
-        for value in &values {
-            value.update_hash(&mut hasher);
-        }
+        let data = if let Some(&first) = values.first()
+            && values[1..].iter().all(|&v| v.same_bits(first))
+        {
+            PageData::Constant {
+                value: first,
+                len: values.len(),
+            }
+        } else {
+            PageData::Values(Arc::from(values))
+        };
         Self {
-            values: Arc::from(values),
-            hash: hasher.finalize(),
+            inner: Arc::new(PageInner {
+                data,
+                hash: OnceLock::new(),
+            }),
+        }
+    }
+
+    fn constant(value: T, len: usize) -> Self {
+        Self {
+            inner: Arc::new(PageInner {
+                data: PageData::Constant { value, len },
+                hash: OnceLock::new(),
+            }),
         }
     }
 
     #[must_use]
-    pub const fn hash(&self) -> blake3::Hash {
-        self.hash
+    pub fn len(&self) -> usize {
+        match &self.inner.data {
+            PageData::Values(values) => values.len(),
+            PageData::Constant { len, .. } => *len,
+        }
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    #[must_use]
+    pub fn is_constant(&self) -> bool {
+        matches!(self.inner.data, PageData::Constant { .. })
+    }
+
+    #[must_use]
+    pub fn get(&self, index: usize) -> Option<T> {
+        match &self.inner.data {
+            PageData::Values(values) => values.get(index).copied(),
+            PageData::Constant { value, len } => (index < *len).then_some(*value),
+        }
+    }
+
+    fn to_vec(&self) -> Vec<T> {
+        match &self.inner.data {
+            PageData::Values(values) => values.to_vec(),
+            PageData::Constant { value, len } => vec![*value; *len],
+        }
+    }
+
+    fn extend_into(&self, dst: &mut Vec<T>) {
+        match &self.inner.data {
+            PageData::Values(values) => dst.extend_from_slice(values),
+            PageData::Constant { value, len } => {
+                dst.extend(std::iter::repeat_n(*value, *len));
+            }
+        }
+    }
+
+    /// Computes and memoizes the page's content digest on first use.
+    #[must_use]
+    pub fn hash(&self) -> blake3::Hash {
+        *self.inner.hash.get_or_init(|| {
+            record_page_hash();
+            let mut hasher = blake3::Hasher::new();
+            hasher.update(&[T::TYPE_TAG]);
+            hasher.update(&(self.len() as u64).to_le_bytes());
+            match &self.inner.data {
+                PageData::Values(values) => T::hash_slice(values, &mut hasher),
+                PageData::Constant { value, len } => T::hash_constant(*value, *len, &mut hasher),
+            }
+            hasher.finalize()
+        })
     }
 }
 
 impl<T: HashableValue> PagedColumn<T> {
+    fn from_pages(pages: Vec<Page<T>>, len: usize) -> Self {
+        Self {
+            inner: Arc::new(ColumnInner {
+                pages: Arc::from(pages),
+                len,
+                hash: OnceLock::new(),
+            }),
+        }
+    }
+
     #[must_use]
     pub fn from_vec(values: Vec<T>) -> Self {
         let len = values.len();
@@ -274,67 +549,92 @@ impl<T: HashableValue> PagedColumn<T> {
             .chunks(PAGE_LEN)
             .map(Page::from_slice)
             .collect::<Vec<_>>();
-        Self {
-            pages: Arc::from(pages),
-            len,
+        Self::from_pages(pages, len)
+    }
+
+    /// Constructs a column of `len` copies of `value`, storing each page as a single constant.
+    #[must_use]
+    pub fn constant(value: T, len: usize) -> Self {
+        if len == 0 {
+            return Self::from_pages(Vec::new(), 0);
         }
+        let full_count = len / PAGE_LEN;
+        let remainder = len % PAGE_LEN;
+        let mut pages = Vec::with_capacity(full_count + usize::from(remainder > 0));
+        if full_count > 0 {
+            let full_page = Page::constant(value, PAGE_LEN);
+            for _ in 0..full_count {
+                pages.push(full_page.clone());
+            }
+        }
+        if remainder > 0 {
+            pages.push(Page::constant(value, remainder));
+        }
+        Self::from_pages(pages, len)
     }
 
     #[must_use]
-    pub const fn len(&self) -> usize {
-        self.len
+    pub fn len(&self) -> usize {
+        self.inner.len
     }
 
     #[must_use]
-    pub const fn is_empty(&self) -> bool {
-        self.len == 0
+    pub fn is_empty(&self) -> bool {
+        self.inner.len == 0
     }
 
     #[must_use]
     pub fn page_count(&self) -> usize {
-        self.pages.len()
+        self.inner.pages.len()
+    }
+
+    #[must_use]
+    pub fn is_constant_page(&self, page: usize) -> bool {
+        self.inner.pages.get(page).is_some_and(Page::is_constant)
     }
 
     #[must_use]
     pub fn get(&self, index: usize) -> Option<T> {
-        let page = self.pages.get(index / PAGE_LEN)?;
-        page.values.get(index % PAGE_LEN).copied()
+        let page = self.inner.pages.get(index / PAGE_LEN)?;
+        page.get(index % PAGE_LEN)
     }
 
     /// Produces a new column while copying only the 16K page containing `index`.
     pub fn with_element(&self, index: usize, value: T) -> Result<Self, GeoError> {
-        if index >= self.len {
+        if index >= self.inner.len {
             return Err(GeoError::IndexOutOfBounds);
         }
         let page_index = index / PAGE_LEN;
-        let mut pages = self.pages.to_vec();
-        let mut values = pages[page_index].values.to_vec();
+        let mut pages = self.inner.pages.to_vec();
+        let mut values = pages[page_index].to_vec();
         values[index % PAGE_LEN] = value;
         pages[page_index] = Page::from_vec(values);
-        Ok(Self {
-            pages: Arc::from(pages),
-            len: self.len,
+        Ok(Self::from_pages(pages, self.inner.len))
+    }
+
+    /// Computes and memoizes the column's Merkle digest over its page hashes.
+    #[must_use]
+    pub fn hash(&self) -> blake3::Hash {
+        *self.inner.hash.get_or_init(|| {
+            record_column_hash();
+            let mut hasher = blake3::Hasher::new();
+            hasher.update(&[T::TYPE_TAG]);
+            hasher.update(&(self.inner.len as u64).to_le_bytes());
+            for page in &*self.inner.pages {
+                hasher.update(page.hash().as_bytes());
+            }
+            hasher.finalize()
         })
     }
 
     #[must_use]
-    pub fn hash(&self) -> blake3::Hash {
-        let mut hasher = blake3::Hasher::new();
-        hasher.update(&[T::TYPE_TAG]);
-        hasher.update(&(self.len as u64).to_le_bytes());
-        for page in &*self.pages {
-            hasher.update(page.hash.as_bytes());
-        }
-        hasher.finalize()
-    }
-
-    #[must_use]
     pub fn page_shared_with(&self, other: &Self, page: usize) -> bool {
-        self.pages.get(page).is_some_and(|a| {
+        self.inner.pages.get(page).is_some_and(|a| {
             other
+                .inner
                 .pages
                 .get(page)
-                .is_some_and(|b| Arc::ptr_eq(&a.values, &b.values))
+                .is_some_and(|b| Arc::ptr_eq(&a.inner, &b.inner))
         })
     }
 }
@@ -380,7 +680,7 @@ impl AttributeColumn {
     }
 
     #[must_use]
-    pub const fn len(&self) -> usize {
+    pub fn len(&self) -> usize {
         match self {
             Self::F32(col) => col.len(),
             Self::I32(col) => col.len(),
@@ -391,7 +691,7 @@ impl AttributeColumn {
     }
 
     #[must_use]
-    pub const fn is_empty(&self) -> bool {
+    pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
 
@@ -525,12 +825,9 @@ impl AttributeColumn {
     }
 }
 
-fn validate_attr_name(name: &str) -> Result<(), GeoError> {
+fn validate_identifier_name(name: &str) -> Result<(), GeoError> {
     if name.is_empty() {
         return Err(GeoError::InvalidAttributeName);
-    }
-    if name == "P" {
-        return Err(GeoError::ReservedAttributeName);
     }
     let mut chars = name.chars();
     if !chars
@@ -545,15 +842,45 @@ fn validate_attr_name(name: &str) -> Result<(), GeoError> {
     Ok(())
 }
 
+fn validate_non_position_name(name: &str) -> Result<(), GeoError> {
+    validate_identifier_name(name)?;
+    if name == "P" {
+        return Err(GeoError::ReservedAttributeName);
+    }
+    Ok(())
+}
+
 impl GeoDetail {
+    /// Clones every shared handle while resetting the memoized detail hash for a mutation.
+    pub(crate) fn fork(&self) -> Self {
+        Self {
+            point_count: self.point_count,
+            vertex_points: self.vertex_points.clone(),
+            prim_runs: Arc::clone(&self.prim_runs),
+            prim_count: self.prim_count,
+            point_attributes: Arc::clone(&self.point_attributes),
+            vertex_attributes: Arc::clone(&self.vertex_attributes),
+            prim_attributes: Arc::clone(&self.prim_attributes),
+            detail_attributes: Arc::clone(&self.detail_attributes),
+            point_groups: Arc::clone(&self.point_groups),
+            prim_groups: Arc::clone(&self.prim_groups),
+            packed: self.packed.clone(),
+            volumes: self.volumes.clone(),
+            cached_hash: OnceLock::new(),
+        }
+    }
+
     #[must_use]
     pub fn points(points: Vec<Vec3>) -> Self {
+        let point_count = points.len();
+        let mut point_attributes = BTreeMap::new();
+        point_attributes.insert("P".to_owned(), AttributeColumn::vec3_values(points));
         Self {
-            positions: PagedColumn::from_vec(points),
+            point_count,
             vertex_points: PagedColumn::from_vec(Vec::new()),
             prim_runs: Arc::from([]),
             prim_count: 0,
-            point_attributes: Arc::new(BTreeMap::new()),
+            point_attributes: Arc::new(point_attributes),
             vertex_attributes: Arc::new(BTreeMap::new()),
             prim_attributes: Arc::new(BTreeMap::new()),
             detail_attributes: Arc::new(BTreeMap::new()),
@@ -561,21 +888,22 @@ impl GeoDetail {
             prim_groups: Arc::new(BTreeMap::new()),
             packed: None,
             volumes: None,
+            cached_hash: OnceLock::new(),
         }
     }
 
     #[must_use]
     pub const fn len(&self) -> usize {
-        self.positions.len()
+        self.point_count
     }
 
     #[must_use]
     pub const fn is_empty(&self) -> bool {
-        self.positions.is_empty()
+        self.point_count == 0
     }
 
     #[must_use]
-    pub const fn vertex_count(&self) -> usize {
+    pub fn vertex_count(&self) -> usize {
         self.vertex_points.len()
     }
 
@@ -596,16 +924,19 @@ impl GeoDetail {
 
     #[must_use]
     pub fn point(&self, index: usize) -> Option<Vec3> {
-        self.positions.get(index)
+        self.positions().get(index)
     }
 
     #[must_use]
-    pub const fn positions(&self) -> &PagedColumn<Vec3> {
-        &self.positions
+    pub fn positions(&self) -> &PagedColumn<Vec3> {
+        match self.point_attributes.get("P") {
+            Some(AttributeColumn::Vec3(col)) => col,
+            _ => &EMPTY_POSITIONS,
+        }
     }
 
     #[must_use]
-    pub const fn domain_len(&self, domain: AttrDomain) -> usize {
+    pub fn domain_len(&self, domain: AttrDomain) -> usize {
         match domain {
             AttrDomain::Point => self.len(),
             AttrDomain::Vertex => self.vertex_count(),
@@ -703,7 +1034,7 @@ impl GeoDetail {
                 return Err(GeoError::IndexOutOfBounds);
             }
         }
-        let mut next = self.clone();
+        let mut next = self.fork();
         next.vertex_points = PagedColumn::from_vec(vertex_points);
         next.prim_runs = Arc::from(runs);
         next.prim_count = total_prims;
@@ -733,7 +1064,15 @@ impl GeoDetail {
         column: AttributeColumn,
     ) -> Result<Self, GeoError> {
         let name = name.into();
-        validate_attr_name(&name)?;
+        validate_identifier_name(&name)?;
+        if name == "P" {
+            if domain != AttrDomain::Point {
+                return Err(GeoError::ReservedAttributeName);
+            }
+            if column.attr_type() != AttrType::Vec3 {
+                return Err(GeoError::AttributeTypeMismatch);
+            }
+        }
         let expected = self.domain_len(domain);
         if column.len() != expected {
             return Err(GeoError::AttributeLengthMismatch {
@@ -741,7 +1080,7 @@ impl GeoDetail {
                 actual: column.len(),
             });
         }
-        let mut next = self.clone();
+        let mut next = self.fork();
         match domain {
             AttrDomain::Point => {
                 let mut attrs = (*self.point_attributes).clone();
@@ -791,7 +1130,7 @@ impl GeoDetail {
         selected_indices: &[usize],
     ) -> Result<Self, GeoError> {
         let name = name.into();
-        validate_attr_name(&name)?;
+        validate_non_position_name(&name)?;
         let len = match domain {
             GroupDomain::Point => self.len(),
             GroupDomain::Prim => self.prim_count(),
@@ -809,7 +1148,7 @@ impl GeoDetail {
             mask: PagedColumn::from_vec(mask),
             selected_count,
         };
-        let mut next = self.clone();
+        let mut next = self.fork();
         match domain {
             GroupDomain::Point => {
                 let mut groups = (*self.point_groups).clone();
@@ -842,7 +1181,7 @@ impl GeoDetail {
         let updated_col = col.with_element(index, checked)?;
         let mut attrs = (*self.point_attributes).clone();
         attrs.insert(name.to_owned(), AttributeColumn::F32(updated_col));
-        let mut next = self.clone();
+        let mut next = self.fork();
         next.point_attributes = Arc::new(attrs);
         Ok(next)
     }
@@ -863,7 +1202,7 @@ impl GeoDetail {
         let updated_col = col.with_element(index, value)?;
         let mut attrs = (*self.point_attributes).clone();
         attrs.insert(name.to_owned(), AttributeColumn::Vec3(updated_col));
-        let mut next = self.clone();
+        let mut next = self.fork();
         next.point_attributes = Arc::new(attrs);
         Ok(next)
     }
@@ -895,17 +1234,17 @@ impl GeoDetail {
             return Err(GeoError::LimitExceeded);
         }
         let mut points = Vec::with_capacity(total_len);
-        for page in &*self.positions.pages {
+        for page in &*self.positions().inner.pages {
             if cancelled.load(Ordering::Acquire) {
                 return Err(GeoError::Cancelled);
             }
-            points.extend_from_slice(&page.values);
+            page.extend_into(&mut points);
         }
-        for page in &*other.positions.pages {
+        for page in &*other.positions().inner.pages {
             if cancelled.load(Ordering::Acquire) {
                 return Err(GeoError::Cancelled);
             }
-            points.extend_from_slice(&page.values);
+            page.extend_into(&mut points);
         }
         let base = Self::points(points);
         if self.prim_runs.is_empty() && other.prim_runs.is_empty() {
@@ -931,14 +1270,24 @@ impl GeoDetail {
             .checked_add(other.vertex_count())
             .ok_or(GeoError::LimitExceeded)?;
         let mut vertex_points = Vec::with_capacity(total_vtx);
-        for page in &*self.vertex_points.pages {
-            vertex_points.extend_from_slice(&page.values);
+        for page in &*self.vertex_points.inner.pages {
+            page.extend_into(&mut vertex_points);
         }
         let pt_offset = u32::try_from(self_len).map_err(|_| GeoError::LimitExceeded)?;
-        for page in &*other.vertex_points.pages {
-            for &pt in &*page.values {
-                let shifted = pt.checked_add(pt_offset).ok_or(GeoError::LimitExceeded)?;
-                vertex_points.push(shifted);
+        for page in &*other.vertex_points.inner.pages {
+            match &page.inner.data {
+                PageData::Values(values) => {
+                    for &pt in &**values {
+                        let shifted = pt.checked_add(pt_offset).ok_or(GeoError::LimitExceeded)?;
+                        vertex_points.push(shifted);
+                    }
+                }
+                PageData::Constant { value, len } => {
+                    let shifted = value
+                        .checked_add(pt_offset)
+                        .ok_or(GeoError::LimitExceeded)?;
+                    vertex_points.extend(std::iter::repeat_n(shifted, *len));
+                }
             }
         }
         base.with_runs(runs, vertex_points)?
@@ -952,40 +1301,50 @@ impl GeoDetail {
         let columns = |left: &BTreeMap<String, AttributeColumn>,
                        right: &BTreeMap<String, AttributeColumn>,
                        left_len: usize,
-                       right_len: usize|
+                       right_len: usize,
+                       skip_position: bool|
          -> Result<BTreeMap<String, AttributeColumn>, GeoError> {
             let mut merged = BTreeMap::new();
             for name in left.keys().chain(right.keys()) {
-                if !merged.contains_key(name) {
-                    let column = AttributeColumn::concatenated(
-                        left.get(name),
-                        left_len,
-                        right.get(name),
-                        right_len,
-                    )?;
-                    merged.insert(name.clone(), column);
+                if (skip_position && name == "P") || merged.contains_key(name) {
+                    continue;
                 }
+                let column = AttributeColumn::concatenated(
+                    left.get(name),
+                    left_len,
+                    right.get(name),
+                    right_len,
+                )?;
+                merged.insert(name.clone(), column);
             }
             Ok(merged)
         };
-        self.point_attributes = Arc::new(columns(
+        let mut point_attrs = columns(
             &first.point_attributes,
             &second.point_attributes,
             first.len(),
             second.len(),
-        )?);
+            true,
+        )?;
+        if let Some(p_col) = self.point_attributes.get("P") {
+            point_attrs.insert("P".to_owned(), p_col.clone());
+        }
+        self.point_attributes = Arc::new(point_attrs);
         self.vertex_attributes = Arc::new(columns(
             &first.vertex_attributes,
             &second.vertex_attributes,
             first.vertex_count(),
             second.vertex_count(),
+            false,
         )?);
         self.prim_attributes = Arc::new(columns(
             &first.prim_attributes,
             &second.prim_attributes,
             first.prim_count(),
             second.prim_count(),
+            false,
         )?);
+        self.cached_hash = OnceLock::new();
         let mut detail = (*first.detail_attributes).clone();
         for (name, column) in &*second.detail_attributes {
             detail.entry(name.clone()).or_insert_with(|| column.clone());
@@ -1545,8 +1904,8 @@ impl GeoDetail {
         }
 
         let mut points = Vec::with_capacity(new_pt_count);
-        for page in &*self.positions.pages {
-            points.extend_from_slice(&page.values);
+        for page in &*self.positions().inner.pages {
+            page.extend_into(&mut points);
         }
         let mut runs: Vec<PrimRun> = Vec::new();
         let mut vertex_points: Vec<u32> = Vec::with_capacity(total_out_vtx);
@@ -1645,7 +2004,7 @@ impl GeoDetail {
         to_domain: AttrDomain,
         mode: PromoteMode,
     ) -> Result<Self, GeoError> {
-        validate_attr_name(name)?;
+        validate_non_position_name(name)?;
         let src_col = self
             .domain_attribute(from_domain, name)
             .ok_or(GeoError::AttributeNotFound)?;
@@ -1921,7 +2280,7 @@ impl GeoDetail {
         if cancelled.load(Ordering::Acquire) {
             return Err(GeoError::Cancelled);
         }
-        validate_attr_name(group_name)?;
+        validate_non_position_name(group_name)?;
         if let Some(prim_group) = self.group(GroupDomain::Prim, group_name) {
             let keep_prim: Vec<bool> = (0..self.prim_count())
                 .map(|i| {
@@ -2118,6 +2477,9 @@ impl GeoDetail {
             out = out.with_primitives(new_runs, new_vertex_points)?;
         }
         for (name, col) in &*self.point_attributes {
+            if name == "P" {
+                continue;
+            }
             let filtered = filter_attribute_column(col, keep_pt)?;
             out = out.with_domain_attribute(AttrDomain::Point, name.clone(), filtered)?;
         }
@@ -2253,38 +2615,36 @@ impl GeoDetail {
         if bytes > memory_limit {
             return Err(GeoError::LimitExceeded);
         }
-        let mut pages = Vec::with_capacity(self.positions.pages.len());
-        for page in &*self.positions.pages {
+        let pos_col = self.positions();
+        let mut pages = Vec::with_capacity(pos_col.inner.pages.len());
+        for page in &*pos_col.inner.pages {
             if cancelled.load(Ordering::Acquire) {
                 return Err(GeoError::Cancelled);
             }
-            let values = page
-                .values
-                .iter()
-                .copied()
-                .map(|p| p.add_checked(offset).map_err(GeoError::from))
-                .collect::<Result<Vec<_>, _>>()?;
-            pages.push(Page::from_vec(values));
+            let next_page = match &page.inner.data {
+                PageData::Values(values) => {
+                    let shifted = values
+                        .iter()
+                        .copied()
+                        .map(|p| p.add_checked(offset).map_err(GeoError::from))
+                        .collect::<Result<Vec<_>, _>>()?;
+                    Page::from_vec(shifted)
+                }
+                PageData::Constant { value, len } => {
+                    Page::constant(value.add_checked(offset).map_err(GeoError::from)?, *len)
+                }
+            };
+            pages.push(next_page);
         }
-        let mut next = self.clone();
-        next.positions = PagedColumn {
-            pages: Arc::from(pages),
-            len: self.len(),
-        };
-        Ok(next)
+        self.with_attribute(
+            "P",
+            AttributeColumn::Vec3(PagedColumn::from_pages(pages, self.len())),
+        )
     }
 
     /// Replaces every point position while sharing topology, attributes, and groups.
     pub fn with_positions(&self, positions: Vec<Vec3>) -> Result<Self, GeoError> {
-        if positions.len() != self.len() {
-            return Err(GeoError::AttributeLengthMismatch {
-                expected: self.len(),
-                actual: positions.len(),
-            });
-        }
-        let mut next = self.clone();
-        next.positions = PagedColumn::from_vec(positions);
-        Ok(next)
+        self.with_attribute("P", AttributeColumn::vec3_values(positions))
     }
 
     /// Reverses the vertex order of every polygon, flipping surface orientation, and inverts every
@@ -2320,7 +2680,7 @@ impl GeoDetail {
         for (name, column) in &*self.vertex_attributes {
             vertex_attributes.insert(name.clone(), column.selected(&order)?);
         }
-        let mut next = self.clone();
+        let mut next = self.fork();
         next.vertex_points = PagedColumn::from_vec(vertex_points);
         next.vertex_attributes = Arc::new(vertex_attributes);
         Ok(next)
@@ -2329,87 +2689,85 @@ impl GeoDetail {
     /// Produces a new detail while copying only the position page containing `index`.
     /// All non-position attribute columns, topology, and groups remain shared via `Arc`.
     pub fn with_point(&self, index: usize, point: Vec3) -> Result<Self, GeoError> {
-        let mut next = self.clone();
-        next.positions = self.positions.with_element(index, point)?;
-        Ok(next)
+        self.with_vec3_attribute_element("P", index, point)
     }
 
+    /// Computes and memoizes the detail's Merkle root over its column, topology, group, volume,
+    /// and packed-instance digests.
     #[must_use]
     pub fn hash(&self) -> blake3::Hash {
-        let mut h = blake3::Hasher::new();
-        h.update(&(self.len() as u64).to_le_bytes());
-        for page in &*self.positions.pages {
-            for p in &*page.values {
-                for v in [p.x, p.y, p.z] {
-                    h.update(&v.to_bits().to_le_bytes());
-                }
-            }
-        }
-        if !self.point_attributes.is_empty() {
-            h.update(&(self.point_attributes.len() as u64).to_le_bytes());
-            for (name, column) in &*self.point_attributes {
-                h.update(&(name.len() as u64).to_le_bytes());
-                h.update(name.as_bytes());
-                h.update(column.hash().as_bytes());
-            }
-        }
-        if !self.prim_runs.is_empty() {
-            h.update(b"topology-v1");
-            h.update(&(self.prim_runs.len() as u64).to_le_bytes());
-            for run in &*self.prim_runs {
-                let kind_tag: u8 = match run.kind {
-                    PrimKind::Polygon => 1,
-                    PrimKind::Polyline => 2,
-                    PrimKind::Packed => 3,
-                    PrimKind::Tetrahedron => 4,
-                    PrimKind::Volume => 5,
-                };
-                h.update(&[kind_tag]);
-                h.update(&run.arity.to_le_bytes());
-                h.update(&(run.prim_count as u64).to_le_bytes());
-            }
-            h.update(self.vertex_points.hash().as_bytes());
-        }
-        for (tag, map) in [
-            (b"vertex-attrs" as &[u8], &self.vertex_attributes),
-            (b"prim-attrs", &self.prim_attributes),
-            (b"detail-attrs", &self.detail_attributes),
-        ] {
-            if !map.is_empty() {
-                h.update(tag);
-                h.update(&(map.len() as u64).to_le_bytes());
-                for (name, column) in &**map {
+        *self.cached_hash.get_or_init(|| {
+            record_detail_hash();
+            let mut h = blake3::Hasher::new();
+            h.update(b"geodetail-v2");
+            h.update(&(self.point_count as u64).to_le_bytes());
+            if !self.point_attributes.is_empty() {
+                h.update(b"point-attrs");
+                h.update(&(self.point_attributes.len() as u64).to_le_bytes());
+                for (name, column) in &*self.point_attributes {
                     h.update(&(name.len() as u64).to_le_bytes());
                     h.update(name.as_bytes());
                     h.update(column.hash().as_bytes());
                 }
             }
-        }
-        for (tag, groups) in [
-            (b"point-groups" as &[u8], &self.point_groups),
-            (b"prim-groups", &self.prim_groups),
-        ] {
-            if !groups.is_empty() {
-                h.update(tag);
-                h.update(&(groups.len() as u64).to_le_bytes());
-                for (name, group) in &**groups {
-                    h.update(&(name.len() as u64).to_le_bytes());
-                    h.update(name.as_bytes());
-                    h.update(group.hash().as_bytes());
+            if !self.prim_runs.is_empty() {
+                h.update(b"topology-v1");
+                h.update(&(self.prim_runs.len() as u64).to_le_bytes());
+                for run in &*self.prim_runs {
+                    let kind_tag: u8 = match run.kind {
+                        PrimKind::Polygon => 1,
+                        PrimKind::Polyline => 2,
+                        PrimKind::Packed => 3,
+                        PrimKind::Tetrahedron => 4,
+                        PrimKind::Volume => 5,
+                    };
+                    h.update(&[kind_tag]);
+                    h.update(&run.arity.to_le_bytes());
+                    h.update(&(run.prim_count as u64).to_le_bytes());
+                }
+                h.update(self.vertex_points.hash().as_bytes());
+            }
+            for (tag, map) in [
+                (b"vertex-attrs" as &[u8], &self.vertex_attributes),
+                (b"prim-attrs", &self.prim_attributes),
+                (b"detail-attrs", &self.detail_attributes),
+            ] {
+                if !map.is_empty() {
+                    h.update(tag);
+                    h.update(&(map.len() as u64).to_le_bytes());
+                    for (name, column) in &**map {
+                        h.update(&(name.len() as u64).to_le_bytes());
+                        h.update(name.as_bytes());
+                        h.update(column.hash().as_bytes());
+                    }
                 }
             }
-        }
-        if let Some(entries) = &self.volumes {
-            h.update(b"volumes-v1");
-            h.update(&(entries.len() as u64).to_le_bytes());
-            for entry in &**entries {
-                h.update(entry.grid.hash().as_bytes());
+            for (tag, groups) in [
+                (b"point-groups" as &[u8], &self.point_groups),
+                (b"prim-groups", &self.prim_groups),
+            ] {
+                if !groups.is_empty() {
+                    h.update(tag);
+                    h.update(&(groups.len() as u64).to_le_bytes());
+                    for (name, group) in &**groups {
+                        h.update(&(name.len() as u64).to_le_bytes());
+                        h.update(name.as_bytes());
+                        h.update(group.hash().as_bytes());
+                    }
+                }
             }
-        }
-        if let Some(table) = &self.packed {
-            table.update_hash(&mut h);
-        }
-        h.finalize()
+            if let Some(entries) = &self.volumes {
+                h.update(b"volumes-v1");
+                h.update(&(entries.len() as u64).to_le_bytes());
+                for entry in &**entries {
+                    h.update(entry.grid.hash().as_bytes());
+                }
+            }
+            if let Some(table) = &self.packed {
+                table.update_hash(&mut h);
+            }
+            h.finalize()
+        })
     }
 
     #[must_use]
@@ -2417,14 +2775,26 @@ impl GeoDetail {
         let first = self.point(0)?;
         let mut lo = first;
         let mut hi = first;
-        for page in &*self.positions.pages {
-            for p in &*page.values {
-                lo.x = lo.x.min(p.x);
-                lo.y = lo.y.min(p.y);
-                lo.z = lo.z.min(p.z);
-                hi.x = hi.x.max(p.x);
-                hi.y = hi.y.max(p.y);
-                hi.z = hi.z.max(p.z);
+        let mut include = |p: Vec3| {
+            lo.x = lo.x.min(p.x);
+            lo.y = lo.y.min(p.y);
+            lo.z = lo.z.min(p.z);
+            hi.x = hi.x.max(p.x);
+            hi.y = hi.y.max(p.y);
+            hi.z = hi.z.max(p.z);
+        };
+        for page in &*self.positions().inner.pages {
+            match &page.inner.data {
+                PageData::Values(values) => {
+                    for &p in &**values {
+                        include(p);
+                    }
+                }
+                PageData::Constant { value, len } => {
+                    if *len > 0 {
+                        include(*value);
+                    }
+                }
             }
         }
         // Instances reach past their points, by as much as their prototypes extend.
@@ -2449,7 +2819,7 @@ impl GeoDetail {
 
     #[must_use]
     pub fn page_shared_with(&self, other: &Self, page: usize) -> bool {
-        self.positions.page_shared_with(&other.positions, page)
+        self.positions().page_shared_with(other.positions(), page)
     }
 
     #[must_use]
@@ -2930,10 +3300,19 @@ mod tests {
             Some(GeoError::NonFinite)
         );
 
-        // Reject reserved "P" or invalid identifier names and length mismatches
+        // "P" is an ordinary Vec3 point column: wrong type on Point or any non-Point domain fails
         let valid_short = AttributeColumn::i32_values(vec![1; 4]);
         assert_eq!(
             base.with_attribute("P", valid_short.clone()).err(),
+            Some(GeoError::AttributeTypeMismatch)
+        );
+        assert_eq!(
+            base.with_domain_attribute(
+                AttrDomain::Detail,
+                "P",
+                AttributeColumn::vec3_values(vec![Vec3::ZERO])
+            )
+            .err(),
             Some(GeoError::ReservedAttributeName)
         );
         assert_eq!(
@@ -2947,6 +3326,8 @@ mod tests {
                 actual: 4
             })
         );
+        assert!(base.attribute("P").is_some());
+        assert_eq!(base.attribute_names(), vec!["P"]);
 
         // Attach pscale (f32) and id (i32) attributes
         let pscale_col = AttributeColumn::f32_checked(vec![1.0; count]);

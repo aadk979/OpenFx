@@ -322,6 +322,9 @@ pub fn fuse_points(
         .collect::<Result<Vec<_>, _>>()?;
     let mut out = GeoDetail::points(positions);
     for name in geo.domain_attribute_names(AttrDomain::Point) {
+        if name == "P" {
+            continue;
+        }
         if let Some(column) = geo.domain_attribute(AttrDomain::Point, name) {
             out = out.with_attribute(name, column.selected(&kept)?)?;
         }

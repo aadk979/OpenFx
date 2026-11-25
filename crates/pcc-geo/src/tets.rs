@@ -185,6 +185,9 @@ impl GeoDetail {
         let vertices = vertices.into_iter().map(|p| remap[p as usize]).collect();
         let mut surface = Self::points(positions).with_primitives(runs, vertices)?;
         for name in self.domain_attribute_names(AttrDomain::Point) {
+            if name == "P" {
+                continue;
+            }
             if let Some(column) = self.domain_attribute(AttrDomain::Point, name) {
                 surface = surface.with_domain_attribute(
                     AttrDomain::Point,

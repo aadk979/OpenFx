@@ -280,7 +280,7 @@ impl GeoDetail {
                 rows: multiply(map, &instance.rows)?,
             });
         }
-        let mut next = self.clone();
+        let mut next = self.fork();
         next.packed = Some(Arc::new(PackedTable::new(
             table.prototypes.to_vec(),
             &instances,
@@ -313,7 +313,7 @@ impl GeoDetail {
             .into_iter()
             .map(PackedPrototype::new)
             .collect::<Result<Vec<_>, _>>()?;
-        let mut next = self.clone();
+        let mut next = self.fork();
         next.packed = Some(Arc::new(PackedTable::new(prototypes, instances)));
         Ok(next)
     }
@@ -425,6 +425,9 @@ impl GeoDetail {
         ];
         for (domain, kept) in domains {
             for name in self.domain_attribute_names(domain) {
+                if domain == AttrDomain::Point && name == "P" {
+                    continue;
+                }
                 if let Some(column) = self.domain_attribute(domain, name) {
                     out = out.with_domain_attribute(domain, name, column.selected(kept)?)?;
                 }
@@ -541,6 +544,9 @@ impl GeoDetail {
                 .flat_map(|(geo, _, _)| geo.domain_attribute_names(domain))
                 .collect();
             for name in names {
+                if domain == AttrDomain::Point && name == "P" {
+                    continue;
+                }
                 let parts: Vec<(Option<&AttributeColumn>, usize)> = placed
                     .iter()
                     .map(|(geo, _, _)| (geo.domain_attribute(domain, name), geo.domain_len(domain)))

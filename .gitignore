@@ -16,3 +16,6 @@ Thumbs.db
 
 # Mutation testing output
 mutants.out*/
+
+# Flat scratch copies of repo files
+/experiments/

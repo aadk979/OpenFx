@@ -847,8 +847,30 @@ impl HeightField {
             }
         };
 
-        if rows.checked_mul(cols) != Some(pt_count) {
+        if rows < 2 || cols < 2 || rows.checked_mul(cols) != Some(pt_count) {
             return Err(GeoError::InvalidTopology);
+        }
+        // Any mesh whose point count divides evenly used to pass as a terrain: a box became a
+        // four-by-two grid. A terrain is exactly the quads of its grid, wound as `grid` winds them.
+        let quads = (rows - 1) * (cols - 1);
+        let one_quad_run = matches!(
+            geo.prim_runs(),
+            [run] if run.kind == PrimKind::Polygon && run.arity == 4 && run.prim_count == quads
+        );
+        if !one_quad_run {
+            return Err(GeoError::InvalidTopology);
+        }
+        for quad in 0..quads {
+            if quad.is_multiple_of(PAGE_LEN) && cancelled.load(Ordering::Acquire) {
+                return Err(GeoError::Cancelled);
+            }
+            let corner = (quad / (cols - 1)) * cols + quad % (cols - 1);
+            let expected = [corner, corner + 1, corner + cols + 1, corner + cols];
+            for (k, want) in expected.into_iter().enumerate() {
+                if geo.vertex_point(quad * 4 + k).map(|point| point as usize) != Some(want) {
+                    return Err(GeoError::InvalidTopology);
+                }
+            }
         }
 
         let (bmin, bmax) = geo.bounds().ok_or(GeoError::InvalidTopology)?;

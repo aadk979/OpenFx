@@ -7,8 +7,8 @@ use pcc_geo::{AttrDomain, AttributeColumn, GeoDetail, GeoError, TopologyIndex};
 use pcc_math::Vec3;
 use pcc_sop::{
     RemeshParams, SopContext, SurfaceScatter, Trs, clip_halfspace, fuse_points, has_repeated_faces,
-    poly_bevel, poly_reduce, remesh, scatter_surface, signed_volume, transform_trs, triangulate,
-    uv_flatten, voronoi_fracture,
+    mesh_repair, poly_bevel, poly_reduce, remesh, scatter_surface, signed_volume, transform_trs,
+    triangulate, uv_flatten, voronoi_fracture,
 };
 use pcc_vdb::{VdbCombineOp, VdbGrid, VdbOps, boolean_meshes_cancellable};
 use std::sync::atomic::AtomicBool;
@@ -39,7 +39,18 @@ pub const OPERATORS: &[&str] = &[
     "subdivide",
     "extrude",
     "normal",
+    "mesh_repair",
+    "repair+remesh",
+    "repair+polyreduce",
+    "repair+polybevel",
+    "repair+subdivide",
+    "repair+extrude",
+    "repair+voronoifracture",
+    "repair+clip",
 ];
+
+/// Largest hole filled before running another operator: the most that repair will fill.
+const REPAIR_HOLE_EDGES: usize = pcc_sop::MAX_FILLED_HOLE_EDGES;
 
 /// How one operator run ended.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
@@ -262,6 +273,59 @@ fn closure_kept(out: &GeoDetail, input: InputFacts) -> Option<String> {
     })
 }
 
+/// What repair must always deliver, without filling holes: a manifold with the input's points where
+/// they were, no more area than it had, and nothing further to do.
+fn repair_violation(
+    out: &GeoDetail,
+    input: &GeoDetail,
+    facts: InputFacts,
+    again: &GeoDetail,
+) -> Option<String> {
+    let topology = TopologyIndex::build(out);
+    let pinched = topology.non_manifold_vertex_count(out);
+    if !topology.is_manifold() || pinched != 0 {
+        return Some(format!(
+            "not manifold: {} edges, {pinched} points",
+            topology.non_manifold_edge_count()
+        ));
+    }
+    if has_repeated_faces(out) {
+        return Some("repeated faces remain".to_owned());
+    }
+    if (0..input.len()).any(|index| out.point(index) != input.point(index)) {
+        return Some("an input point moved".to_owned());
+    }
+    let (before, after) = (input.surface_area(), out.surface_area());
+    if after > before * (1.0 + 1e-3) {
+        return Some(format!("area grew from {before} to {after}"));
+    }
+    if facts.closed && !topology.is_closed_manifold() {
+        return Some("a closed input was opened".to_owned());
+    }
+    let clean = facts.closed && TopologyIndex::build(input).non_manifold_vertex_count(input) == 0;
+    if clean && out.hash() != input.hash() {
+        return Some("a clean input was changed".to_owned());
+    }
+    (again.hash() != out.hash()).then(|| "a second repair changed the result".to_owned())
+}
+
+/// The counts a repair reports, and the fraction of area it kept, for the run's records.
+fn repair_summary(out: &GeoDetail, input: &GeoDetail) -> String {
+    let mut parts = vec![format!(
+        "area_kept={:.6}",
+        f64::from(out.surface_area()) / f64::from(input.surface_area()).max(1e-12)
+    )];
+    for name in out.domain_attribute_names(AttrDomain::Detail) {
+        if let (Some(short), Some(AttributeColumn::I32(column))) = (
+            name.strip_prefix("repair_"),
+            out.domain_attribute(AttrDomain::Detail, name),
+        ) {
+            parts.push(format!("{short}={}", column.get(0).unwrap_or(-1)));
+        }
+    }
+    parts.join(" ")
+}
+
 /// The plan's acceptance test for voxel surfaces: output is empty, or a closed oriented manifold.
 fn watertight(out: &GeoDetail) -> Outcome {
     if out.prim_count() == 0 {
@@ -358,6 +422,12 @@ fn dispatch(
     ctx: &SopContext<'_>,
 ) -> Result<Outcome, GeoError> {
     let cancelled = ctx.cancelled;
+    if let Some(next) = operator.strip_prefix("repair+") {
+        let repaired = mesh_repair(input, REPAIR_HOLE_EDGES, ctx)?;
+        let mut repaired_facts = input_facts(&repaired);
+        repaired_facts.simple_solid = facts.simple_solid;
+        return dispatch(next, &repaired, repaired_facts, ctx);
+    }
     Ok(match operator {
         "boolean" => {
             let shifted = input.translated_cancellable(
@@ -517,6 +587,15 @@ fn dispatch(
             let out = input.compute_normals_cancellable(MEMORY_LIMIT, cancelled)?;
             finished(&out, None)
         }
+        "mesh_repair" => {
+            let out = mesh_repair(input, 0, ctx)?;
+            let again = mesh_repair(&out, 0, ctx)?;
+            let mut result = finished(&out, repair_violation(&out, input, facts, &again));
+            if result.status == Status::Ok {
+                result.detail = repair_summary(&out, input);
+            }
+            result
+        }
         other => outcome(Status::Rejected, format!("unknown operator {other}"), None),
     })
 }
@@ -669,5 +748,98 @@ mod tests {
         assert_eq!(failures.len(), 5);
         assert!(!Status::Rejected.is_failure() && !Status::TimedOut.is_failure());
         assert_eq!(Status::parse("nonsense"), None);
+    }
+
+    #[test]
+    fn repair_oracle_and_summary_catch_pinched_growth_and_report_counts() -> Result<(), GeoError> {
+        let closed = polygons(&CORNERS, &TETRAHEDRON)?;
+        let facts = input_facts(&closed);
+        assert_eq!(repair_violation(&closed, &closed, facts, &closed), None);
+        // Zero-area input (point cloud) must not trip the area-growth check (`0.0 > 0.0` is false).
+        let cloud = GeoDetail::points(vec![Vec3::ZERO]);
+        assert_eq!(
+            repair_violation(&cloud, &cloud, input_facts(&cloud), &cloud),
+            None
+        );
+
+        // Pinched vertex with manifold edges must be caught by `repair_violation`.
+        let mut points = CORNERS.to_vec();
+        points.extend_from_slice(&[[-1., 0., 0.], [0., -1., 0.], [0., 0., -1.]]);
+        let pinched = polygons(
+            &points,
+            &[
+                [0, 2, 1],
+                [0, 1, 3],
+                [1, 2, 3],
+                [0, 3, 2],
+                [0, 5, 4],
+                [0, 4, 6],
+                [4, 5, 6],
+                [0, 6, 5],
+            ],
+        )?;
+        assert!(
+            repair_violation(&pinched, &pinched, input_facts(&pinched), &pinched)
+                .is_some_and(|msg| msg.contains("1 points"))
+        );
+
+        // Area growth above the 0.1% slack is rejected; equal area is accepted.
+        // Same vertex positions as `closed`, plus one extra small shell increasing total area.
+        let mut extra_pts = CORNERS.to_vec();
+        extra_pts.extend_from_slice(&[
+            [2.0, 0.0, 0.0],
+            [2.1, 0.0, 0.0],
+            [2.0, 0.1, 0.0],
+            [2.0, 0.0, 0.1],
+        ]);
+        let larger_same_prefix = polygons(
+            &extra_pts,
+            &[
+                [0, 2, 1],
+                [0, 1, 3],
+                [1, 2, 3],
+                [0, 3, 2],
+                [4, 6, 5],
+                [4, 5, 7],
+                [5, 6, 7],
+                [4, 7, 6],
+            ],
+        )?;
+        assert!(
+            repair_violation(&larger_same_prefix, &closed, facts, &larger_same_prefix)
+                .is_some_and(|msg| msg.contains("area grew"))
+        );
+
+        // A clean closed input must not be changed, while a pinched closed input is allowed to change.
+        let closed_reversed = closed.with_reversed_winding()?;
+        assert!(
+            repair_violation(&closed_reversed, &closed, facts, &closed_reversed)
+                .is_some_and(|msg| msg.contains("clean input was changed"))
+        );
+        let cancelled = AtomicBool::new(false);
+        let ctx = SopContext::new(MEMORY_LIMIT, &cancelled);
+        let repaired_pinched = mesh_repair(&pinched, 0, &ctx)?;
+        assert_eq!(
+            repair_violation(
+                &repaired_pinched,
+                &pinched,
+                input_facts(&pinched),
+                &repaired_pinched
+            ),
+            None
+        );
+
+        // Running `mesh_repair` through `dispatch` on a doubled tetrahedron succeeds and records
+        // `repair_summary` details.
+        let mut doubled_faces = TETRAHEDRON.to_vec();
+        doubled_faces.push(TETRAHEDRON[0]);
+        let doubled = polygons(&CORNERS, &doubled_faces)?;
+        let out = run_operator("mesh_repair", &doubled, input_facts(&doubled), &cancelled);
+        assert_eq!(out.status, Status::Ok);
+        assert!(out.detail.contains("area_kept="), "{}", out.detail);
+        assert!(out.detail.contains("duplicate_faces=1"), "{}", out.detail);
+        let summary = repair_summary(&closed, &closed);
+        assert!(summary.starts_with("area_kept=1.000000"), "{summary}");
+        Ok(())
     }
 }

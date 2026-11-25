@@ -36,7 +36,14 @@ impl PointGrid {
         for dx in -1..=1 {
             for dy in -1..=1 {
                 for dz in -1..=1 {
-                    if let Some(bucket) = self.buckets.get(&(cx + dx, cy + dy, cz + dz)) {
+                    // Coordinates far enough out saturate the cell index, which then has no
+                    // neighbour on that side.
+                    let (Some(x), Some(y), Some(z)) =
+                        (cx.checked_add(dx), cy.checked_add(dy), cz.checked_add(dz))
+                    else {
+                        continue;
+                    };
+                    if let Some(bucket) = self.buckets.get(&(x, y, z)) {
                         for &index in bucket {
                             visit(index);
                         }

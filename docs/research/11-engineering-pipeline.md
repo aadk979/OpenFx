@@ -1,5 +1,7 @@
 # 11 — Production Engineering Process, Anti-Slop Guardrails, and Build Pipeline
 
+> **Background, not a specification (2026-11-11).** The gates actually enforced, and the ones still missing, are listed in [`../ARCHITECTURE.md`](../ARCHITECTURE.md) §8. Of the ten Definition of Done checks below, four run today.
+
 > **Scope:** Designing a zero-compromise software engineering pipeline for a 50–100 crate Rust DCC codebase authored by AI coding agents—ensuring every module is mathematically verified, benchmarked, audited, and free of "AI slop" (stubs, hallucinated APIs, tautological tests, or silent regressions).
 
 ---

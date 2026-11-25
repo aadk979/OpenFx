@@ -166,6 +166,19 @@ pub(crate) fn load_prims(geo: &GeoDetail) -> Result<Vec<PrimView>, GeoError> {
     Ok(prims)
 }
 
+/// Refuses anything but polygons. An operator that rebuilds its output from polygons alone would
+/// otherwise drop curves beside them without saying so.
+pub(crate) fn require_only_polygons(geo: &GeoDetail) -> Result<(), GeoError> {
+    if geo
+        .prim_runs()
+        .iter()
+        .any(|run| run.kind != PrimKind::Polygon)
+    {
+        return Err(GeoError::InvalidTopology);
+    }
+    Ok(())
+}
+
 /// Point lists of the polygon primitives only.
 pub(crate) fn load_polygons(geo: &GeoDetail) -> Result<Vec<Vec<u32>>, GeoError> {
     Ok(load_prims(geo)?

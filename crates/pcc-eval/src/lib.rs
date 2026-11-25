@@ -15,9 +15,9 @@ use pcc_id::{NodeId, RevisionId};
 use pcc_math::{Philox4x32, Vec3};
 use pcc_sop::{
     RemeshParams, SopContext, SurfaceScatter, Trs, attrib_transfer, clip_halfspace, create_line,
-    create_sphere, create_tet_box, create_torus, create_tube, fuse_points, measure, poly_bevel,
-    poly_reduce, remesh, resample_curves, reverse_winding, scatter_surface, sweep_curves,
-    transform_trs, triangulate, uv_flatten, uv_layout, voronoi_fracture,
+    create_sphere, create_tet_box, create_torus, create_tube, fuse_points, measure, mesh_repair,
+    poly_bevel, poly_reduce, remesh, resample_curves, reverse_winding, scatter_surface,
+    sweep_curves, transform_trs, triangulate, uv_flatten, uv_layout, voronoi_fracture,
 };
 use pcc_terrain::{HeightField, HfErodeParams, HfNoiseParams};
 use pcc_vdb::{VdbCombineOp, VdbGrid, VdbOps, boolean_meshes_cancellable};
@@ -141,8 +141,15 @@ impl CookCache {
     #[must_use]
     pub fn key(snapshot: &GraphSnapshot, frame_numerator: i64, frame_denominator: u32) -> CacheKey {
         let mut hasher = blake3::Hasher::new();
-        hasher.update(b"pcc-eval-cache-v1");
-        hasher.update(snapshot.to_ofxs().as_bytes());
+        // The scene's content, not its revision: undoing to an earlier scene, or committing an
+        // edit that changes nothing, must find the result that scene already produced.
+        hasher.update(b"pcc-eval-cache-v2");
+        hasher.update(&(snapshot.nodes.len() as u64).to_le_bytes());
+        for node in &snapshot.nodes {
+            let line = node.canonical_line();
+            hasher.update(&(line.len() as u64).to_le_bytes());
+            hasher.update(line.as_bytes());
+        }
         hasher.update(&frame_numerator.to_le_bytes());
         hasher.update(&frame_denominator.to_le_bytes());
         CacheKey(*hasher.finalize().as_bytes())
@@ -269,12 +276,9 @@ impl CookCache {
         revision: RevisionId,
         value: Arc<GeoDetail>,
     ) -> bool {
-        let Ok(latest) = self.latest_revision.lock() else {
-            return false;
-        };
-        if revision < *latest {
-            return false;
-        }
+        // A node's key is its operator, its resolved values, and the content of its inputs, so an
+        // entry is right whichever revision computed it. Refusing results from an older revision
+        // only discarded work, and left every sandbox behind the live scene uncached.
         let Ok(mut entries) = self.node_entries.lock() else {
             return false;
         };
@@ -1518,6 +1522,14 @@ fn eval_single_node(
             let sop = SopContext::new(ctx.budget.max_memory_bytes, ctx.cancelled);
             finish_sop(fuse_points(input_geo, f64::from(*distance), &sop), ctx)
         }
+        "mesh_repair" => {
+            let input = &input_slot(node, 0)?;
+            let max_hole_edges = param_u32(node, "max_hole_edges")?;
+
+            let input_geo = outputs.get(input).ok_or(EvalError::InvalidGraph)?;
+            let sop = SopContext::new(ctx.budget.max_memory_bytes, ctx.cancelled);
+            finish_sop(mesh_repair(input_geo, max_hole_edges as usize, &sop), ctx)
+        }
         "resample" => {
             let input = &input_slot(node, 0)?;
             let segment_length = &param_f32(node, "segment_length")?;
@@ -1922,7 +1934,6 @@ impl Pass<'_> {
         outputs: &BTreeMap<NodeId, Arc<GeoDetail>>,
         resolved: &BTreeMap<NodeId, Node>,
     ) -> Result<Arc<GeoDetail>, EvalError> {
-        const PIECE_GROUP: &str = "pcc_foreach_piece";
         let name = param_text(node, "attribute")?;
         let input = outputs.get(&zone.source).ok_or(EvalError::InvalidGraph)?;
         let fail = |message: &str| EvalError::Param {
@@ -1961,11 +1972,14 @@ impl Pass<'_> {
         };
         let mut merged: Option<GeoDetail> = None;
         for (ordinal, prims) in pieces.values().enumerate() {
+            let mut keep = vec![false; input.prim_count()];
+            for &prim in prims {
+                if let Some(slot) = keep.get_mut(prim) {
+                    *slot = true;
+                }
+            }
             let piece = input
-                .with_group(GroupDomain::Prim, PIECE_GROUP, prims)
-                .and_then(|grouped| {
-                    grouped.blast_group_cancellable(PIECE_GROUP, true, memory, self.ctx.cancelled)
-                })
+                .with_only_prims_cancellable(&keep, memory, self.ctx.cancelled)
                 .map_err(resource)?;
             let result =
                 self.run_body(zone, &Arc::new(piece), ordinal as i64, outputs, resolved)?;

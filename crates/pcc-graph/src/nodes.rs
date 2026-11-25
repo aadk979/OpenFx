@@ -1600,6 +1600,18 @@ static BUILTIN_NODES: &[NodeDef] = &[
         )],
     ),
     NodeDef::new(
+        "mesh_repair",
+        "modeling",
+        "Makes polygons an oriented manifold without moving points: removes degenerate and repeated faces, unifies winding, splits non-manifold edges and points, and optionally fills holes. Run `fuse` first to weld. Self-intersections remain. Counts appear as `repair_*` detail attributes.",
+        &[input("input", "Upstream polygons.")],
+        &[param(
+            "max_hole_edges",
+            ParamKind::U32,
+            Check::UintAtLeast(0),
+            "Fill holes with up to this many edges; 0 fills none. Holes over 512 edges stay open.",
+        )],
+    ),
+    NodeDef::new(
         "group_bounds",
         "attributes",
         "Creates a named point or primitive group from an axis-aligned box, for use by `blast`.",

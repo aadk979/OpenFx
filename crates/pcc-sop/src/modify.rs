@@ -5,7 +5,7 @@ use crate::common::{
     load_prims, normalized, polygon_area_vector, signed_volume, sub, to_d3, to_vec3,
 };
 use crate::earclip::{P2, ear_clip};
-use pcc_geo::{AttrDomain, AttributeColumn, FiniteF32, GeoDetail, GeoError, PrimKind};
+use pcc_geo::{AttrDomain, AttributeColumn, FiniteF32, GeoDetail, GeoError, GroupDomain, PrimKind};
 use pcc_math::Vec3;
 use std::collections::HashMap;
 
@@ -99,12 +99,21 @@ pub fn reverse_winding(geo: &GeoDetail, ctx: &SopContext<'_>) -> Result<GeoDetai
 
 /// Triangulates one polygon in its best-fit plane, handling concave outlines.
 pub(crate) fn triangulate_polygon(points: &[D3], polygon: &[u32]) -> Vec<[u32; 3]> {
-    if let [a, b, c] = polygon {
-        return vec![[*a, *b, *c]];
+    triangulate_corners(points, polygon)
+        .into_iter()
+        .map(|t| [polygon[t[0]], polygon[t[1]], polygon[t[2]]])
+        .collect()
+}
+
+/// The same triangles, as positions within `polygon` rather than point indices, so that a
+/// caller can tell which corner of the polygon each triangle corner came from.
+fn triangulate_corners(points: &[D3], polygon: &[u32]) -> Vec<[usize; 3]> {
+    if polygon.len() == 3 {
+        return vec![[0, 1, 2]];
     }
     let Some(normal) = normalized(polygon_area_vector(points, polygon)) else {
-        return (1..polygon.len() - 1)
-            .map(|k| [polygon[0], polygon[k], polygon[k + 1]])
+        return (1..polygon.len().saturating_sub(1))
+            .map(|k| [0, k, k + 1])
             .collect();
     };
     let u = any_perpendicular(normal);
@@ -118,9 +127,42 @@ pub(crate) fn triangulate_polygon(points: &[D3], polygon: &[u32]) -> Vec<[u32; 3
         .collect();
     let corners: Vec<usize> = (0..polygon.len()).collect();
     ear_clip(&flat, &corners)
-        .into_iter()
-        .map(|t| [polygon[t[0]], polygon[t[1]], polygon[t[2]]])
-        .collect()
+}
+
+/// Carries vertex and primitive attributes and primitive groups from `geo` onto `out`, whose
+/// primitives and vertices each came from one of `geo`'s: `source_prims[i]` is where `out`'s
+/// primitive `i` came from, and `source_vertices` likewise for vertices.
+fn carry_prim_data(
+    geo: &GeoDetail,
+    mut out: GeoDetail,
+    source_prims: &[usize],
+    source_vertices: &[usize],
+) -> Result<GeoDetail, GeoError> {
+    if source_prims.is_empty() {
+        return Ok(out);
+    }
+    for (domain, sources) in [
+        (AttrDomain::Vertex, source_vertices),
+        (AttrDomain::Prim, source_prims),
+    ] {
+        for name in geo.domain_attribute_names(domain) {
+            if let Some(column) = geo.domain_attribute(domain, name) {
+                out = out.with_domain_attribute(domain, name, column.selected(sources)?)?;
+            }
+        }
+    }
+    for name in geo.group_names(GroupDomain::Prim) {
+        if let Some(group) = geo.group(GroupDomain::Prim, name) {
+            let members: Vec<usize> = source_prims
+                .iter()
+                .enumerate()
+                .filter(|&(_, &source)| group.contains(source))
+                .map(|(index, _)| index)
+                .collect();
+            out = out.with_group(GroupDomain::Prim, name, &members)?;
+        }
+    }
+    Ok(out)
 }
 
 /// Every polygon triangulated, in primitive order.
@@ -135,28 +177,46 @@ pub(crate) fn triangles_of(geo: &GeoDetail) -> Result<(Vec<D3>, Vec<[u32; 3]>), 
     Ok((points, triangles))
 }
 
-/// Splits all polygons into triangles, preserving point data and passing polylines through.
-/// Vertex and primitive attributes do not survive because the primitive set changes.
+/// Splits all polygons into triangles, passing polylines through. Point data is shared. Each
+/// triangle takes its polygon's primitive attributes and groups, and each of its corners takes
+/// the vertex attributes of the polygon corner it came from.
 pub fn triangulate(geo: &GeoDetail, ctx: &SopContext<'_>) -> Result<GeoDetail, GeoError> {
     let points = load_points(geo)?;
     let mut prims = Vec::with_capacity(geo.prim_count());
+    let mut source_prims = Vec::with_capacity(geo.prim_count());
+    let mut source_vertices = Vec::with_capacity(geo.vertex_count());
+    let mut first_vertex = 0usize;
     for (i, prim) in load_prims(geo)?.into_iter().enumerate() {
         ctx.poll_every(i)?;
+        let arity = prim.points.len();
         match prim.kind {
             PrimKind::Polygon => {
-                for t in triangulate_polygon(&points, &prim.points) {
-                    prims.push((PrimKind::Polygon, t.to_vec()));
+                for t in triangulate_corners(&points, &prim.points) {
+                    prims.push((PrimKind::Polygon, t.map(|k| prim.points[k]).to_vec()));
+                    source_prims.push(i);
+                    source_vertices.extend(t.map(|k| first_vertex + k));
                 }
             }
-            kind => prims.push((kind, prim.points)),
+            kind => {
+                prims.push((kind, prim.points));
+                source_prims.push(i);
+                source_vertices.extend(first_vertex..first_vertex + arity);
+            }
         }
+        first_vertex += arity;
     }
     ctx.check_output(geo.len(), prims.iter().map(|p| p.1.len()).sum())?;
-    attach_prims(geo, &prims)
+    carry_prim_data(
+        geo,
+        attach_prims(geo, &prims)?,
+        &source_prims,
+        &source_vertices,
+    )
 }
 
 /// Merges points closer than `max_distance`, keeping the lowest-indexed point of each cluster and
-/// its attributes. Collapsed primitives are removed; primitive attributes do not survive.
+/// its attributes and group memberships. Collapsed primitives are removed; the rest keep their
+/// primitive attributes and groups, and their remaining corners keep their vertex attributes.
 pub fn fuse_points(
     geo: &GeoDetail,
     max_distance: f64,
@@ -187,7 +247,14 @@ pub fn fuse_points(
         'search: for dx in -1..=1 {
             for dy in -1..=1 {
                 for dz in -1..=1 {
-                    let Some(bucket) = cells.get(&(cx + dx, cy + dy, cz + dz)) else {
+                    // A point far from the origin relative to the cell saturates its index, which
+                    // then has no neighbour on that side.
+                    let (Some(x), Some(y), Some(z)) =
+                        (cx.checked_add(dx), cy.checked_add(dy), cz.checked_add(dz))
+                    else {
+                        continue;
+                    };
+                    let Some(bucket) = cells.get(&(x, y, z)) else {
                         continue;
                     };
                     for &candidate in bucket {
@@ -216,18 +283,25 @@ pub fn fuse_points(
         remap.push(target);
     }
     let mut prims = Vec::with_capacity(geo.prim_count());
-    for prim in load_prims(geo)? {
+    let mut source_prims = Vec::with_capacity(geo.prim_count());
+    let mut source_vertices = Vec::with_capacity(geo.vertex_count());
+    let mut first_vertex = 0usize;
+    for (prim_index, prim) in load_prims(geo)?.into_iter().enumerate() {
         let mut mapped: Vec<u32> = Vec::with_capacity(prim.points.len());
-        for &point in &prim.points {
+        let mut corners: Vec<usize> = Vec::with_capacity(prim.points.len());
+        for (k, &point) in prim.points.iter().enumerate() {
             let target = remap[point as usize];
             if mapped.last() != Some(&target) {
                 mapped.push(target);
+                corners.push(first_vertex + k);
             }
         }
+        first_vertex += prim.points.len();
         let minimum = match prim.kind {
             PrimKind::Polygon => {
                 if mapped.len() > 1 && mapped.first() == mapped.last() {
                     mapped.pop();
+                    corners.pop();
                 }
                 3
             }
@@ -237,6 +311,8 @@ pub fn fuse_points(
         };
         if mapped.len() >= minimum {
             prims.push((prim.kind, mapped));
+            source_prims.push(prim_index);
+            source_vertices.extend(corners);
         }
     }
     ctx.check_output(kept.len(), prims.iter().map(|p| p.1.len()).sum())?;
@@ -255,7 +331,23 @@ pub fn fuse_points(
             out = out.with_domain_attribute(AttrDomain::Detail, name, column.clone())?;
         }
     }
-    attach_prims(&out, &prims)
+    for name in geo.group_names(GroupDomain::Point) {
+        if let Some(group) = geo.group(GroupDomain::Point, name) {
+            let members: Vec<usize> = kept
+                .iter()
+                .enumerate()
+                .filter(|&(_, &source)| group.contains(source))
+                .map(|(index, _)| index)
+                .collect();
+            out = out.with_group(GroupDomain::Point, name, &members)?;
+        }
+    }
+    carry_prim_data(
+        geo,
+        attach_prims(&out, &prims)?,
+        &source_prims,
+        &source_vertices,
+    )
 }
 
 /// Writes primitive `f@area` and `f@perimeter`, and detail `f@total_area` and `f@total_volume`.
@@ -575,5 +667,19 @@ mod tests {
             assert!(gap < 1e-5, "{input:?}: {actual:?}, off by {gap}");
         }
         Ok(())
+    }
+
+    #[test]
+    fn degenerate_quad_falls_back_to_fan_triangulation() {
+        let points = [
+            [0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [2.0, 0.0, 0.0],
+            [3.0, 0.0, 0.0],
+        ];
+        assert_eq!(
+            triangulate_corners(&points, &[0, 1, 2, 3]),
+            vec![[0, 1, 2], [0, 2, 3]]
+        );
     }
 }

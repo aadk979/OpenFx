@@ -96,12 +96,22 @@ impl VdbOps for VdbGrid {
         let bg = FiniteF32::checked(band)?;
         let vs = FiniteF32::checked(voxel_size)?;
 
-        let min_vx = ((bmin.x - band) / voxel_size).floor() as i32;
-        let min_vy = ((bmin.y - band) / voxel_size).floor() as i32;
-        let min_vz = ((bmin.z - band) / voxel_size).floor() as i32;
-        let max_vx = ((bmax.x + band) / voxel_size).ceil() as i32;
-        let max_vy = ((bmax.y + band) / voxel_size).ceil() as i32;
-        let max_vz = ((bmax.z + band) / voxel_size).ceil() as i32;
+        // A float-to-integer cast saturates, so geometry far enough out would land on the wrong
+        // voxels and its extent would overflow. Half the index range leaves room for neighbours.
+        let voxel_index = |value: f32, round: fn(f64) -> f64| -> Result<i32, GeoError> {
+            let index = round(f64::from(value) / f64::from(voxel_size));
+            if index.abs() < f64::from(1_i32 << 30) {
+                Ok(index as i32)
+            } else {
+                Err(GeoError::LimitExceeded)
+            }
+        };
+        let min_vx = voxel_index(bmin.x - band, f64::floor)?;
+        let min_vy = voxel_index(bmin.y - band, f64::floor)?;
+        let min_vz = voxel_index(bmin.z - band, f64::floor)?;
+        let max_vx = voxel_index(bmax.x + band, f64::ceil)?;
+        let max_vy = voxel_index(bmax.y + band, f64::ceil)?;
+        let max_vz = voxel_index(bmax.z + band, f64::ceil)?;
 
         let span_x =
             usize::try_from((max_vx - min_vx + 1).max(0)).map_err(|_| GeoError::LimitExceeded)?;

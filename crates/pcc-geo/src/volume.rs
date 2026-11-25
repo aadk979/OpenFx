@@ -347,7 +347,7 @@ impl GeoDetail {
             .into_iter()
             .map(VolumeEntry::new)
             .collect::<Result<Vec<_>, _>>()?;
-        let mut next = self.clone();
+        let mut next = self.fork();
         next.volumes = (expected > 0).then(|| Arc::from(entries));
         Ok(next)
     }

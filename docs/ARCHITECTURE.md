@@ -35,9 +35,9 @@ What is sound and stays:
 
 | Aspect | Today | Target |
 |---|---|---|
-| Page storage | `Arc<[T]>`, 16,384 elements, hash computed eagerly at construction, one `update` call per scalar | Same layout; hash computed lazily and memoized; one `update` over the page's bytes; constant pages stored as a single value |
-| Detail hash | `GeoDetail::hash()` walks every position value on every call and is not memoized; the evaluator calls it once per input per node | Merkle root over column hashes, memoized per detail; O(1) after first use |
-| Positions | A dedicated `positions` field, special-cased throughout | An ordinary `P` column in the point attribute map |
+| Page storage | `Arc<PageInner<T>>`, 16,384 elements, lazy memoized hash in 4 KiB chunks, constant pages stored as a single value (ADR 019) | Done (A1); optional `bytemuck` after `cargo-deny` (A9) |
+| Detail hash | Memoized Merkle root (`geodetail-v2`) over memoized column and page hashes; O(1) after first use (ADR 019) | Done (A1) |
+| Positions | An ordinary `"P"` `Vec3` column in `point_attributes` (ADR 019) | Done (A1) |
 | Attribute types | `F32`, `I32`, `U32`, `Bool`, `Vec3` | Add `String` (dictionary-encoded), `I64`, `Vec2`, `Vec4`, `Quat`, `Mat3`, `Mat4`; later per-element arrays |
 | Type semantics | None; `N` is recognised by name | A `TypeInfo` qualifier (point, vector, normal, colour, quaternion, matrix) that tells transforms how to treat a column |
 | Topology | Runs of `(kind, arity, count)`; a mesh alternating triangles and quads produces one run per primitive | Per-primitive vertex offsets, with the fixed-arity run kept as a fast path |

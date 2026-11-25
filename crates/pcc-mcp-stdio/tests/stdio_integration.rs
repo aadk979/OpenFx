@@ -203,7 +203,7 @@ async fn stdio_transport_initialize_discover_probe_replace_and_conflict() {
                 enclosed_volume: 0.0,
                 is_manifold: true,
                 is_closed_manifold: false,
-                point_attributes: Vec::new(),
+                point_attributes: vec!["P".to_owned()],
                 hash: pcc_geo::GeoDetail::points(Vec::new())
                     .hash()
                     .to_hex()
@@ -848,7 +848,7 @@ async fn stdio_transport_initialize_discover_probe_replace_and_conflict() {
             assert!(probe.is_closed_manifold);
             assert!(probe.surface_area > 10.0);
             assert!(probe.enclosed_volume > 2.0);
-            assert_eq!(probe.point_attributes, vec!["N".to_owned()]);
+            assert_eq!(probe.point_attributes, vec!["N".to_owned(), "P".to_owned()]);
         }
     }
 
@@ -942,6 +942,7 @@ async fn stdio_transport_initialize_discover_probe_replace_and_conflict() {
                 probe.point_attributes,
                 vec![
                     "N".to_owned(),
+                    "P".to_owned(),
                     "height".to_owned(),
                     "mask".to_owned(),
                     "sediment".to_owned(),

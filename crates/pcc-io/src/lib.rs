@@ -13,7 +13,7 @@ use std::{collections::BTreeMap, sync::Arc};
 
 pub use stl::{from_stl_bytes, to_stl_bytes};
 
-const OFXG_MAGIC: &[u8; 8] = b"OFXG\x01\x00\x00\x00";
+const OFXG_MAGIC: &[u8; 8] = b"OFXG\x02\x00\x00\x00";
 pub const DEFAULT_MAX_IO_ELEMENTS: usize = 10_000_000;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -36,7 +36,7 @@ impl From<GeoError> for IoFormatError {
     }
 }
 
-/// Serializes a `GeoDetail` into the canonical `.ofxg` v1 binary cache format.
+/// Serializes a `GeoDetail` into the canonical `.ofxg` v2 binary cache format.
 #[must_use]
 pub fn to_ofxg_bytes(geo: &GeoDetail) -> Vec<u8> {
     let mut payload = Vec::new();
@@ -73,14 +73,18 @@ pub fn to_ofxg_bytes(geo: &GeoDetail) -> Vec<u8> {
         write_u32(&mut payload, pt_idx);
     }
 
-    // 3. Attributes across all 4 domains
+    // 3. Attributes across all 4 domains (`P` is already written in section 1)
     for domain in [
         AttrDomain::Point,
         AttrDomain::Vertex,
         AttrDomain::Prim,
         AttrDomain::Detail,
     ] {
-        let names = geo.domain_attribute_names(domain);
+        let names: Vec<&str> = geo
+            .domain_attribute_names(domain)
+            .into_iter()
+            .filter(|&name| !(domain == AttrDomain::Point && name == "P"))
+            .collect();
         write_u64(&mut payload, names.len() as u64);
         for name in names {
             write_str(&mut payload, name);
@@ -145,12 +149,12 @@ pub fn to_ofxg_bytes(geo: &GeoDetail) -> Vec<u8> {
     payload
 }
 
-/// Deserializes and validates a `GeoDetail` from `.ofxg` v1 bytes using `DEFAULT_MAX_IO_ELEMENTS`.
+/// Deserializes and validates a `GeoDetail` from `.ofxg` v2 bytes using `DEFAULT_MAX_IO_ELEMENTS`.
 pub fn from_ofxg_bytes(bytes: &[u8]) -> Result<GeoDetail, IoFormatError> {
     from_ofxg_bytes_with_limit(bytes, DEFAULT_MAX_IO_ELEMENTS)
 }
 
-/// Deserializes and validates a `GeoDetail` from `.ofxg` v1 bytes with an explicit element limit.
+/// Deserializes and validates a `GeoDetail` from `.ofxg` v2 bytes with an explicit element limit.
 pub fn from_ofxg_bytes_with_limit(
     bytes: &[u8],
     max_elements: usize,

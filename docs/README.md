@@ -8,9 +8,11 @@ Goal: an open-source, production-grade (feature-film quality) procedural content
 
 | Path | Purpose |
 |---|---|
-| [`PLAN.md`](PLAN.md) | Master build plan: architecture, phases, milestones, acceptance criteria |
-| [`AUDIT_REPORT.md`](AUDIT_REPORT.md) | 2026-10 architecture, ecosystem, and implementation-risk audit |
-| [`research/`](research/) | Cited domain research that the plan is derived from |
+| [`ARCHITECTURE.md`](ARCHITECTURE.md) | Normative: what each subsystem does today and what it must become |
+| [`PLAN.md`](PLAN.md) | Current state, phases with exit evidence, and what is unscheduled |
+| [`adr/`](adr/) | Decision records. The source of truth for what was built and measured |
+| [`AUDIT_REPORT.md`](AUDIT_REPORT.md) | Audits of 2026-10-31 (plan, ecosystem) and 2026-11-11 (architecture, code) |
+| [`research/`](research/) | Background research. Not a specification: it uses the old `ofx-*` crate names, describes many things that are not built, and its external facts have not been re-verified |
 
 ## Research index
 
@@ -32,7 +34,6 @@ Goal: an open-source, production-grade (feature-film quality) procedural content
 
 ## Reading order for agents
 
-1. `PLAN.md` (always)
-2. `research/11-engineering-pipeline.md` (always — defines how work is accepted)
-3. `research/01-core-architecture.md` and `research/06-mcp-ai-native.md` (anyone touching the engine core)
-4. The domain document for the area being worked on
+1. `ARCHITECTURE.md` and `PLAN.md` (always)
+2. The latest ADRs touching the area being worked on
+3. The research document for that area, as background only. Where it conflicts with `ARCHITECTURE.md` or an ADR, it loses

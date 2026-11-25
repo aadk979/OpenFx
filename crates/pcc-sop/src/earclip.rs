@@ -1,5 +1,7 @@
 //! Ear-clipping triangulation of planar polygons, including holes through bridge edges.
 
+use std::collections::BTreeMap;
+
 pub(crate) type P2 = [f64; 2];
 
 fn orient(a: P2, b: P2, c: P2) -> f64 {
@@ -40,9 +42,47 @@ fn inside_triangle(a: P2, b: P2, c: P2, p: P2) -> bool {
     orient(a, b, p) >= 0.0 && orient(b, c, p) >= 0.0 && orient(c, a, p) >= 0.0
 }
 
+/// Rotates a triangle so its smallest vertex index comes first, preserving orientation.
+fn canonical_triangle([a, b, c]: [usize; 3]) -> [usize; 3] {
+    if a <= b && a <= c {
+        [a, b, c]
+    } else if b <= a && b <= c {
+        [b, c, a]
+    } else {
+        [c, a, b]
+    }
+}
+
+/// Drops degenerate triangles and cancels exact back-to-back opposite pairs. Removing an opposite
+/// pair changes neither the directed boundary nor the total signed area, and prevents folded
+/// fallback ears from leaving non-manifold edges in a cap.
+fn cancel_folded_triangles(triangles: Vec<[usize; 3]>) -> Vec<[usize; 3]> {
+    let mut keep = vec![true; triangles.len()];
+    let mut active: BTreeMap<[usize; 3], Vec<usize>> = BTreeMap::new();
+    for (index, &tri) in triangles.iter().enumerate() {
+        if tri[0] == tri[1] || tri[1] == tri[2] || tri[2] == tri[0] {
+            keep[index] = false;
+            continue;
+        }
+        let key = canonical_triangle(tri);
+        let opposite = [key[0], key[2], key[1]];
+        if let Some(mate) = active.get_mut(&opposite).and_then(Vec::pop) {
+            keep[mate] = false;
+            keep[index] = false;
+        } else {
+            active.entry(key).or_default().push(index);
+        }
+    }
+    triangles
+        .into_iter()
+        .zip(keep)
+        .filter_map(|(tri, kept)| kept.then_some(tri))
+        .collect()
+}
+
 /// Triangulates a counter-clockwise loop (duplicate coordinates from hole bridges are allowed).
-/// Every input corner is consumed, so a loop always yields `n - 2` triangles; on numerically
-/// degenerate input with no valid ear, the flattest corner is clipped to guarantee progress.
+/// On numerically degenerate input with no valid ear, the flattest corner is clipped to guarantee
+/// progress, and any degenerate or exact back-to-back triangle pairs are cancelled.
 pub(crate) fn ear_clip(points: &[P2], polygon: &[usize]) -> Vec<[usize; 3]> {
     let mut remaining = polygon.to_vec();
     let mut triangles = Vec::with_capacity(polygon.len().saturating_sub(2));
@@ -83,7 +123,7 @@ pub(crate) fn ear_clip(points: &[P2], polygon: &[usize]) -> Vec<[usize; 3]> {
     if let [a, b, c] = remaining[..] {
         triangles.push([a, b, c]);
     }
-    triangles
+    cancel_folded_triangles(triangles)
 }
 
 /// Splices clockwise `holes` into counter-clockwise `outer` through mutually visible bridges
@@ -235,5 +275,50 @@ mod tests {
         let polygon = [0, 1, 2, 3];
         assert!(contains_point(&points, &polygon, [1.0, 1.0]));
         assert!(!contains_point(&points, &polygon, [3.0, 1.0]));
+    }
+
+    #[test]
+    fn folded_and_degenerate_triangles_cancel_without_changing_boundary() {
+        // Cyclic rotations of the same triangle map to the same canonical triple.
+        assert_eq!(canonical_triangle([1, 4, 2]), [1, 4, 2]);
+        assert_eq!(canonical_triangle([4, 2, 1]), [1, 4, 2]);
+        assert_eq!(canonical_triangle([2, 1, 4]), [1, 4, 2]);
+
+        // An opposite pair in rotated form cancels; degenerates drop; unpaired triangles survive.
+        let cleaned = cancel_folded_triangles(vec![
+            [0, 1, 2],
+            [5, 3, 4],
+            [2, 2, 3],
+            [4, 3, 5],
+            [1, 3, 2],
+            [0, 4, 0],
+            [1, 2, 2],
+        ]);
+        assert_eq!(cleaned, vec![[0, 1, 2], [1, 3, 2]]);
+
+        // A self-folding bridged loop (where fallback emits a back-to-back fin) still yields
+        // net area equal to the loop's signed area with no opposite triangle pairs left behind.
+        let points = [
+            [0.0, 0.0],
+            [4.0, 0.0],
+            [4.0, 4.0],
+            [0.0, 4.0],
+            [2.0, 1.0],
+            [2.0, 3.0],
+        ];
+        // Spliced loop that visits 4 -> 5 -> 4 as a zero-width fin inside the square.
+        let polygon = [0, 1, 4, 5, 4, 2, 3];
+        let triangles = ear_clip(&points, &polygon);
+        let expected = signed_area(&points, &polygon);
+        assert!((triangle_area_sum(&points, &triangles) - expected).abs() < 1e-12);
+        for (i, a) in triangles.iter().enumerate() {
+            let ka = canonical_triangle(*a);
+            let opp = [ka[0], ka[2], ka[1]];
+            assert!(
+                triangles[i + 1..]
+                    .iter()
+                    .all(|b| canonical_triangle(*b) != opp)
+            );
+        }
     }
 }

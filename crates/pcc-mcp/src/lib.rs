@@ -1381,6 +1381,11 @@ impl RootService {
     /// Writes a complete new scene then atomically publishes it at an unused destination.
     pub fn save_new(&self, destination: &Path) -> Result<(), McpError> {
         let snapshot = self.store.snapshot().map_err(McpError::Store)?;
+        // A rename replaces whatever is at its target, so an existing scene would be overwritten
+        // without this. It is a check and then a write, not a lock against another process.
+        if destination.exists() {
+            return Err(McpError::Io(io::Error::from(io::ErrorKind::AlreadyExists)));
+        }
         let temporary = destination.with_extension("ofxs.tmp");
         let mut file = OpenOptions::new()
             .write(true)
@@ -1435,6 +1440,11 @@ mod tests {
         let path = std::env::temp_dir().join(format!("pcc-mcp-{}-scene.ofxs", std::process::id()));
         let _ = std::fs::remove_file(&path);
         assert!(service.save_new(&path).is_ok());
+        // A second save to the same place must not replace the first.
+        assert!(matches!(
+            service.save_new(&path),
+            Err(McpError::Io(error)) if error.kind() == io::ErrorKind::AlreadyExists
+        ));
         let loaded = RootService::load(&path, 1 << 20);
         let original = service.probe(0, 1);
         assert!(
@@ -1748,5 +1758,71 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn mesh_repair_mcp_round_trip() -> Result<(), McpError> {
+        use pcc_graph::Node;
+        let scene = GraphSnapshot {
+            revision: RevisionId(1),
+            nodes: vec![
+                Node::new("box", NodeId(1)).with_vec3(
+                    "size",
+                    Vec3 {
+                        x: 2.0,
+                        y: 2.0,
+                        z: 2.0,
+                    },
+                ),
+                Node::new("group_bounds", NodeId(2))
+                    .with_input(NodeId(1))
+                    .with_text("group_name", "top")
+                    .with_text("domain", "prim")
+                    .with_vec3(
+                        "min",
+                        Vec3 {
+                            x: -2.0,
+                            y: 0.9,
+                            z: -2.0,
+                        },
+                    )
+                    .with_vec3(
+                        "max",
+                        Vec3 {
+                            x: 2.0,
+                            y: 2.0,
+                            z: 2.0,
+                        },
+                    ),
+                Node::new("blast", NodeId(3))
+                    .with_input(NodeId(2))
+                    .with_text("group_name", "top")
+                    .with_bool("negate", false),
+                Node::new("mesh_repair", NodeId(4))
+                    .with_input(NodeId(3))
+                    .with_u32("max_hole_edges", 8),
+            ],
+        };
+        let service = RootService::new(scene, 1 << 24);
+
+        let before = service.probe_node(NodeId(3), 0, 24)?;
+        assert!(!before.is_closed_manifold);
+
+        let after = service.probe(0, 24)?;
+        assert!(after.is_manifold);
+        assert!(after.is_closed_manifold);
+        assert!((after.enclosed_volume - 8.0).abs() < 1e-3);
+
+        // Save, reload, and confirm the `.ofxs` round-trip cooks to the exact same hash.
+        let path =
+            std::env::temp_dir().join(format!("pcc-mcp-{}-mesh-repair.ofxs", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        service.save_new(&path)?;
+        let reloaded = RootService::load(&path, 1 << 24)?;
+        let _ = std::fs::remove_file(&path);
+        let reloaded_probe = reloaded.probe(0, 24)?;
+        assert_eq!(reloaded_probe.hash, after.hash);
+        assert!(reloaded_probe.is_closed_manifold);
+        Ok(())
     }
 }

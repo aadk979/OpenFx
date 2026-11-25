@@ -1,6 +1,7 @@
 //! Edge bevel by corner offsetting: every polygon corner becomes its own point, slid inward from
 //! the bevelled edges next to it; bevelled edges gain a strip and vertices a closing polygon.
 
+use crate::common::require_only_polygons;
 use crate::common::{
     D3, SopContext, add, build_geo, cross, dot, length, load_points, load_polygons, normalized,
     polygon_area_vector, scale, sub,
@@ -50,6 +51,7 @@ pub fn poly_bevel(
     if !(offset.is_finite() && offset > 0.0 && min_angle_degrees.is_finite()) {
         return Err(GeoError::InvalidTopology);
     }
+    require_only_polygons(geo)?;
     let topology = TopologyIndex::build(geo);
     if !topology.is_manifold() {
         return Err(GeoError::InvalidTopology);

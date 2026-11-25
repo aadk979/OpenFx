@@ -1,6 +1,7 @@
 //! Isotropic triangle remeshing (Botsch & Kobbelt 2004): split long edges, collapse short ones,
 //! equalize valences by flipping, smooth tangentially, and reproject onto the input surface.
 
+use crate::common::require_only_polygons;
 use crate::common::{OrdF64, SopContext, add, distance, dot, lerp, normalized, scale, sub};
 use crate::modify::triangles_of;
 use crate::spatial::TriBvh;
@@ -270,6 +271,7 @@ pub fn remesh(
     let estimated_triangles = estimated_triangles as usize + geo.prim_count();
     ctx.check_output(estimated_triangles, estimated_triangles.saturating_mul(6))?;
 
+    require_only_polygons(geo)?;
     let mut mesh = TriMesh::from_geo(geo, ctx)?;
     let (reference_points, reference_triangles) = triangles_of(geo)?;
     let reference = TriBvh::build(reference_points, reference_triangles);

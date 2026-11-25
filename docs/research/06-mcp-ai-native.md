@@ -1,5 +1,7 @@
 # 06 — Model Context Protocol (MCP) as a Root-Level Architectural Layer
 
+> **Background, not a specification (2026-11-11).** [`../ARCHITECTURE.md`](../ARCHITECTURE.md) §5 is normative. Built today: 20 tools over stdio. Not built: resources, subscriptions, HTTP, image content, asynchronous jobs, idempotency keys, principals.
+
 > **Scope:** Designing an AI-native DCC where the **Model Context Protocol (MCP 2026-07-28 spec)** is the foundational control, introspection, and observation layer of the engine—not a fragile Python/RPC wrapper bolted onto a GUI.
 
 ---

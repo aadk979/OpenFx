@@ -1040,28 +1040,28 @@ impl GeoDetail {
         TopologyIndex::build(self)
     }
 
-    /// Computes total polygon surface area (sum of triangle fan areas across all `PrimKind::Polygon` faces).
-    #[must_use]
-    pub fn surface_area(&self) -> f32 {
-        let mut area = 0.0f32;
+    /// Visits every polygon as a fan of triangles, with corners in double precision relative to
+    /// `origin`. Measuring near the origin keeps a small shape far away from losing its digits.
+    fn for_each_fan_triangle(&self, origin: [f64; 3], mut visit: impl FnMut([[f64; 3]; 3])) {
+        let corner = |vertex: usize| -> Option<[f64; 3]> {
+            let p = self.point(self.vertex_point(vertex)? as usize)?;
+            Some([
+                f64::from(p.x) - origin[0],
+                f64::from(p.y) - origin[1],
+                f64::from(p.z) - origin[2],
+            ])
+        };
         let mut vtx_cursor = 0usize;
         for run in &*self.prim_runs {
             let arity = run.arity as usize;
             if run.kind == PrimKind::Polygon && arity >= 3 {
                 for _ in 0..run.prim_count {
-                    if let Some(p0_idx) = self.vertex_point(vtx_cursor)
-                        && let Some(p0) = self.point(p0_idx as usize)
-                    {
+                    if let Some(first) = corner(vtx_cursor) {
                         for k in 1..(arity - 1) {
-                            if let (Some(pk_idx), Some(pk1_idx)) = (
-                                self.vertex_point(vtx_cursor + k),
-                                self.vertex_point(vtx_cursor + k + 1),
-                            ) && let (Some(pk), Some(pk1)) =
-                                (self.point(pk_idx as usize), self.point(pk1_idx as usize))
-                                && let (Ok(e1), Ok(e2)) = (pk.sub_checked(p0), pk1.sub_checked(p0))
-                                && let Ok(cross) = e1.cross_checked(e2)
+                            if let (Some(second), Some(third)) =
+                                (corner(vtx_cursor + k), corner(vtx_cursor + k + 1))
                             {
-                                area += 0.5 * cross.length();
+                                visit([first, second, third]);
                             }
                         }
                     }
@@ -1071,41 +1071,59 @@ impl GeoDetail {
                 vtx_cursor += arity * run.prim_count;
             }
         }
-        area
+    }
+
+    /// Where measurements are taken from: the middle of the bounds, or the origin when empty.
+    fn measure_origin(&self) -> [f64; 3] {
+        self.bounds().map_or([0.0; 3], |(low, high)| {
+            [
+                (f64::from(low.x) + f64::from(high.x)) * 0.5,
+                (f64::from(low.y) + f64::from(high.y)) * 0.5,
+                (f64::from(low.z) + f64::from(high.z)) * 0.5,
+            ]
+        })
+    }
+
+    /// Computes total polygon surface area (sum of triangle fan areas across all `PrimKind::Polygon` faces).
+    ///
+    /// Summed in double precision, so that no triangle is skipped for overflowing and a large
+    /// mesh does not lose its small faces. A total beyond `f32` saturates rather than turning
+    /// infinite.
+    #[must_use]
+    pub fn surface_area(&self) -> f32 {
+        let mut area = 0.0f64;
+        self.for_each_fan_triangle(self.measure_origin(), |[a, b, c]| {
+            let e1 = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
+            let e2 = [c[0] - a[0], c[1] - a[1], c[2] - a[2]];
+            let cross = [
+                e1[1] * e2[2] - e1[2] * e2[1],
+                e1[2] * e2[0] - e1[0] * e2[2],
+                e1[0] * e2[1] - e1[1] * e2[0],
+            ];
+            area += 0.5 * (cross[0] * cross[0] + cross[1] * cross[1] + cross[2] * cross[2]).sqrt();
+        });
+        area.min(f64::from(f32::MAX)) as f32
     }
 
     /// Computes enclosed volume of polygon faces using the Divergence Theorem:
     /// $V = \left|\frac{1}{6} \sum \mathbf{p}_0 \cdot (\mathbf{p}_k \times \mathbf{p}_{k+1})\right|$.
+    ///
+    /// Summed in double precision about the middle of the bounds. Measured about the world
+    /// origin in single precision, the terms cancel badly for a small shape far away: a unit cube
+    /// 65,536 units out measured 65,536. A total beyond `f32` saturates rather than turning
+    /// infinite.
     #[must_use]
     pub fn enclosed_volume(&self) -> f32 {
-        let mut signed_six_vol = 0.0f32;
-        let mut vtx_cursor = 0usize;
-        for run in &*self.prim_runs {
-            let arity = run.arity as usize;
-            if run.kind == PrimKind::Polygon && arity >= 3 {
-                for _ in 0..run.prim_count {
-                    if let Some(p0_idx) = self.vertex_point(vtx_cursor)
-                        && let Some(p0) = self.point(p0_idx as usize)
-                    {
-                        for k in 1..(arity - 1) {
-                            if let (Some(pk_idx), Some(pk1_idx)) = (
-                                self.vertex_point(vtx_cursor + k),
-                                self.vertex_point(vtx_cursor + k + 1),
-                            ) && let (Some(pk), Some(pk1)) =
-                                (self.point(pk_idx as usize), self.point(pk1_idx as usize))
-                                && let Ok(cross) = pk.cross_checked(pk1)
-                            {
-                                signed_six_vol += p0.dot(cross);
-                            }
-                        }
-                    }
-                    vtx_cursor += arity;
-                }
-            } else {
-                vtx_cursor += arity * run.prim_count;
-            }
-        }
-        (signed_six_vol / 6.0).abs()
+        let mut signed_six_vol = 0.0f64;
+        self.for_each_fan_triangle(self.measure_origin(), |[a, b, c]| {
+            let cross = [
+                b[1] * c[2] - b[2] * c[1],
+                b[2] * c[0] - b[0] * c[2],
+                b[0] * c[1] - b[1] * c[0],
+            ];
+            signed_six_vol += a[0] * cross[0] + a[1] * cross[1] + a[2] * cross[2];
+        });
+        (signed_six_vol / 6.0).abs().min(f64::from(f32::MAX)) as f32
     }
 
     pub fn compute_normals(&self, memory_limit: usize) -> Result<Self, GeoError> {
@@ -1904,7 +1922,7 @@ impl GeoDetail {
                     !delete
                 })
                 .collect();
-            return self.compact_by_kept_prims(&keep_prim, memory_limit, cancelled);
+            return self.compact_by_kept_prims(&keep_prim, true, memory_limit, cancelled);
         }
         if let Some(pt_group) = self.group(GroupDomain::Point, group_name) {
             let keep_pt: Vec<bool> = (0..self.len())
@@ -1935,29 +1953,59 @@ impl GeoDetail {
         Err(GeoError::AttributeNotFound)
     }
 
-    fn compact_by_kept_prims(
+    /// Keeps exactly the primitives marked in `keep_prim` and the points they use, dropping every
+    /// other point, including points that no primitive uses. Attributes and groups follow the
+    /// elements that remain.
+    pub fn with_only_prims_cancellable(
         &self,
         keep_prim: &[bool],
         memory_limit: usize,
         cancelled: &AtomicBool,
     ) -> Result<Self, GeoError> {
+        if keep_prim.len() != self.prim_count() {
+            return Err(GeoError::AttributeLengthMismatch {
+                expected: self.prim_count(),
+                actual: keep_prim.len(),
+            });
+        }
+        self.compact_by_kept_prims(keep_prim, false, memory_limit, cancelled)
+    }
+
+    /// With `keep_unreferenced`, points that no primitive uses survive: deleting primitives then
+    /// removes only the points those primitives leave behind.
+    fn compact_by_kept_prims(
+        &self,
+        keep_prim: &[bool],
+        keep_unreferenced: bool,
+        memory_limit: usize,
+        cancelled: &AtomicBool,
+    ) -> Result<Self, GeoError> {
         let mut point_used = vec![false; self.len()];
+        let mut referenced = vec![false; self.len()];
         let mut vtx_cursor = 0usize;
         let mut prim_idx = 0usize;
         for run in &*self.prim_runs {
             let arity = run.arity as usize;
             for _ in 0..run.prim_count {
-                if keep_prim.get(prim_idx).copied().unwrap_or(false) {
-                    for k in 0..arity {
-                        if let Some(pt) = self.vertex_point(vtx_cursor + k)
-                            && let Some(slot) = point_used.get_mut(pt as usize)
-                        {
-                            *slot = true;
-                        }
+                let kept = keep_prim.get(prim_idx).copied().unwrap_or(false);
+                for k in 0..arity {
+                    let Some(pt) = self.vertex_point(vtx_cursor + k) else {
+                        continue;
+                    };
+                    if let Some(slot) = referenced.get_mut(pt as usize) {
+                        *slot = true;
+                    }
+                    if kept && let Some(slot) = point_used.get_mut(pt as usize) {
+                        *slot = true;
                     }
                 }
                 prim_idx += 1;
                 vtx_cursor += arity;
+            }
+        }
+        if keep_unreferenced {
+            for (used, referenced) in point_used.iter_mut().zip(&referenced) {
+                *used = *used || !*referenced;
             }
         }
         self.rebuild_compacted(&point_used, keep_prim, memory_limit, cancelled)
@@ -2013,12 +2061,16 @@ impl GeoDetail {
         }
         let mut new_runs: Vec<PrimRun> = Vec::new();
         let mut new_vertex_points: Vec<u32> = Vec::new();
+        let mut keep_vertex = vec![false; self.vertex_count()];
         let mut vtx_cursor = 0usize;
         let mut prim_idx = 0usize;
         for run in &*self.prim_runs {
             let arity = run.arity as usize;
             for _ in 0..run.prim_count {
                 if keep_prim.get(prim_idx).copied().unwrap_or(false) {
+                    for slot in keep_vertex.iter_mut().skip(vtx_cursor).take(arity) {
+                        *slot = true;
+                    }
                     append_prim_run(&mut new_runs, run.kind, run.arity, 1)?;
                     for k in 0..arity {
                         let old_pt = self
@@ -2066,9 +2118,33 @@ impl GeoDetail {
                 let filtered = filter_attribute_column(col, keep_prim)?;
                 out = out.with_domain_attribute(AttrDomain::Prim, name.clone(), filtered)?;
             }
+            for (name, col) in &*self.vertex_attributes {
+                let filtered = filter_attribute_column(col, &keep_vertex)?;
+                out = out.with_domain_attribute(AttrDomain::Vertex, name.clone(), filtered)?;
+            }
         }
         for (name, col) in &*self.detail_attributes {
             out = out.with_domain_attribute(AttrDomain::Detail, name.clone(), col.clone())?;
+        }
+        // Groups follow their elements: a member that survives stays a member, at its new index.
+        let surviving = |group: &ElementGroup, keep: &[bool]| -> Vec<usize> {
+            keep.iter()
+                .enumerate()
+                .filter(|&(_, &kept)| kept)
+                .enumerate()
+                .filter(|&(_, (old, _))| group.contains(old))
+                .map(|(new, _)| new)
+                .collect()
+        };
+        for (name, group) in &*self.point_groups {
+            out = out.with_group(GroupDomain::Point, name.clone(), &surviving(group, keep_pt))?;
+        }
+        for (name, group) in &*self.prim_groups {
+            out = out.with_group(
+                GroupDomain::Prim,
+                name.clone(),
+                &surviving(group, keep_prim),
+            )?;
         }
         Ok(out)
     }
@@ -3542,6 +3618,169 @@ mod tests {
         let clouds = cloud.merged(&cloud, usize::MAX)?;
         let mass = clouds.attribute("mass").and_then(AttributeColumn::as_f32);
         assert_eq!(mass.and_then(|c| c.get(1)).map(|f| f.get()), Some(2.5));
+        Ok(())
+    }
+
+    /// Two triangles sharing an edge, a point no primitive uses, and data on every domain.
+    fn blast_fixture() -> Result<GeoDetail, GeoError> {
+        let points = vec![
+            Vec3::checked(0.0, 0.0, 0.0)?,
+            Vec3::checked(1.0, 0.0, 0.0)?,
+            Vec3::checked(0.0, 1.0, 0.0)?,
+            Vec3::checked(1.0, 1.0, 0.0)?,
+            Vec3::checked(9.0, 9.0, 9.0)?,
+        ];
+        GeoDetail::points(points)
+            .with_primitives(
+                vec![PrimRun {
+                    kind: PrimKind::Polygon,
+                    arity: 3,
+                    prim_count: 2,
+                }],
+                vec![0, 1, 2, 1, 3, 2],
+            )?
+            .with_domain_attribute(
+                AttrDomain::Vertex,
+                "corner",
+                AttributeColumn::i32_values(vec![10, 11, 12, 20, 21, 22]),
+            )?
+            .with_domain_attribute(
+                AttrDomain::Prim,
+                "face",
+                AttributeColumn::i32_values(vec![100, 200]),
+            )?
+            .with_group(GroupDomain::Point, "marked", &[1, 4])?
+            .with_group(GroupDomain::Prim, "first", &[0])?
+            .with_group(GroupDomain::Prim, "second", &[1])
+    }
+
+    fn i32_column(geo: &GeoDetail, domain: AttrDomain, name: &str) -> Vec<i32> {
+        geo.domain_attribute(domain, name)
+            .and_then(AttributeColumn::as_i32)
+            .map(|column| (0..column.len()).filter_map(|i| column.get(i)).collect())
+            .unwrap_or_default()
+    }
+
+    fn members(geo: &GeoDetail, domain: GroupDomain, name: &str) -> Option<Vec<usize>> {
+        let group = geo.group(domain, name)?;
+        Some((0..group.len()).filter(|&i| group.contains(i)).collect())
+    }
+
+    #[test]
+    fn blast_keeps_vertex_attributes_groups_and_unused_points() -> Result<(), GeoError> {
+        let out = blast_fixture()?.blast_group("first", false)?;
+        // Point 0 belonged only to the deleted triangle. Point 4 belonged to nothing and stays.
+        assert_eq!(out.len(), 4);
+        assert_eq!(out.point(3), Some(Vec3::checked(9.0, 9.0, 9.0)?));
+        assert_eq!(out.prim_count(), 1);
+        assert_eq!(
+            (0..3).map(|v| out.vertex_point(v)).collect::<Vec<_>>(),
+            vec![Some(0), Some(2), Some(1)]
+        );
+        assert_eq!(
+            i32_column(&out, AttrDomain::Vertex, "corner"),
+            vec![20, 21, 22]
+        );
+        assert_eq!(i32_column(&out, AttrDomain::Prim, "face"), vec![200]);
+        assert_eq!(
+            members(&out, GroupDomain::Point, "marked"),
+            Some(vec![0, 3])
+        );
+        assert_eq!(members(&out, GroupDomain::Prim, "second"), Some(vec![0]));
+        assert_eq!(members(&out, GroupDomain::Prim, "first"), Some(vec![]));
+        Ok(())
+    }
+
+    #[test]
+    fn blast_by_points_keeps_groups_and_vertex_attributes() -> Result<(), GeoError> {
+        let geo = blast_fixture()?.with_group(GroupDomain::Point, "corner_point", &[0])?;
+        let out = geo.blast_group("corner_point", false)?;
+        // Removing point 0 takes the first triangle with it.
+        assert_eq!((out.len(), out.prim_count()), (4, 1));
+        assert_eq!(
+            i32_column(&out, AttrDomain::Vertex, "corner"),
+            vec![20, 21, 22]
+        );
+        assert_eq!(
+            members(&out, GroupDomain::Point, "marked"),
+            Some(vec![0, 3])
+        );
+        assert_eq!(members(&out, GroupDomain::Prim, "second"), Some(vec![0]));
+        Ok(())
+    }
+
+    #[test]
+    fn with_only_prims_drops_every_other_point() -> Result<(), GeoError> {
+        let geo = blast_fixture()?;
+        let cancelled = AtomicBool::new(false);
+        let out = geo.with_only_prims_cancellable(&[false, true], usize::MAX, &cancelled)?;
+        assert_eq!((out.len(), out.prim_count()), (3, 1));
+        assert_eq!(members(&out, GroupDomain::Point, "marked"), Some(vec![0]));
+        assert_eq!(
+            geo.with_only_prims_cancellable(&[true], usize::MAX, &cancelled)
+                .map(|g| g.len()),
+            Err(GeoError::AttributeLengthMismatch {
+                expected: 2,
+                actual: 1
+            })
+        );
+        Ok(())
+    }
+
+    fn cube_at(offset: f32, size: f32) -> Result<GeoDetail, GeoError> {
+        let corner = |x: f32, y: f32, z: f32| {
+            Vec3::checked(offset + x * size, offset + y * size, offset + z * size)
+        };
+        GeoDetail::points(vec![
+            corner(0.0, 0.0, 0.0)?,
+            corner(1.0, 0.0, 0.0)?,
+            corner(1.0, 1.0, 0.0)?,
+            corner(0.0, 1.0, 0.0)?,
+            corner(0.0, 0.0, 1.0)?,
+            corner(1.0, 0.0, 1.0)?,
+            corner(1.0, 1.0, 1.0)?,
+            corner(0.0, 1.0, 1.0)?,
+        ])
+        .with_primitives(
+            vec![PrimRun {
+                kind: PrimKind::Polygon,
+                arity: 4,
+                prim_count: 6,
+            }],
+            vec![
+                0, 3, 2, 1, 4, 5, 6, 7, 0, 1, 5, 4, 3, 7, 6, 2, 0, 4, 7, 3, 1, 2, 6, 5,
+            ],
+        )
+    }
+
+    #[test]
+    fn measurements_do_not_depend_on_distance_from_the_origin() -> Result<(), GeoError> {
+        // Every corner here is exact in `f32`, so the cube is exactly a unit cube.
+        for offset in [0.0, 1000.0, 65_536.0, -1_048_576.0] {
+            let cube = cube_at(offset, 1.0)?;
+            assert!(
+                (cube.enclosed_volume() - 1.0).abs() < 1e-6,
+                "volume at {offset} was {}",
+                cube.enclosed_volume()
+            );
+            assert!(
+                (cube.surface_area() - 6.0).abs() < 1e-5,
+                "area at {offset} was {}",
+                cube.surface_area()
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn measurements_of_enormous_geometry_stay_finite() -> Result<(), GeoError> {
+        let cube = cube_at(0.0, 3e38)?;
+        assert_eq!(cube.surface_area(), f32::MAX);
+        assert_eq!(cube.enclosed_volume(), f32::MAX);
+        // Large but representable: side 1e10 has area 6e20 and volume 1e30.
+        let cube = cube_at(0.0, 1e10)?;
+        assert!((f64::from(cube.surface_area()) / 6e20 - 1.0).abs() < 1e-6);
+        assert!((f64::from(cube.enclosed_volume()) / 1e30 - 1.0).abs() < 1e-6);
         Ok(())
     }
 }

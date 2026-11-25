@@ -1,11 +1,13 @@
 //! Half-space clipping with watertight capping, and Voronoi fracture built on top of it.
 
+use crate::common::require_only_polygons;
 use crate::common::{
     D3, OrdF64, SopContext, any_perpendicular, build_geo, cross, distance, dot, has_repeated_faces,
     lerp, load_points, normalized, scale, sub,
 };
 use crate::earclip::{P2, bridge_holes, contains_point, ear_clip, signed_area};
 use crate::modify::triangles_of;
+use crate::repair::mesh_repair;
 use pcc_geo::{AttrDomain, AttributeColumn, GeoDetail, GeoError, PrimKind, TopologyIndex};
 use std::collections::BTreeMap;
 
@@ -255,6 +257,7 @@ pub fn clip_halfspace(
 ) -> Result<GeoDetail, GeoError> {
     let unit = normalized(normal).ok_or(GeoError::InvalidTopology)?;
     ctx.poll()?;
+    require_only_polygons(geo)?;
     let (points, triangles) = triangles_of(geo)?;
     let tolerance = extent_of(&points) * 1e-7;
     let soup = Soup { points, triangles };
@@ -346,7 +349,7 @@ pub fn voronoi_fracture(
             prim_piece.push(tag);
         }
     }
-    build_geo(&out_points, &out_prims, ctx)?
+    let pieces = build_geo(&out_points, &out_prims, ctx)?
         .with_domain_attribute(
             AttrDomain::Point,
             "piece",
@@ -356,7 +359,10 @@ pub fn voronoi_fracture(
             AttrDomain::Prim,
             "piece",
             AttributeColumn::i32_values(prim_piece),
-        )
+        )?;
+    // A surface that touches itself can cut to loops that coincide, and their walls and caps then
+    // share an edge. Clean input never does, so this changes nothing there.
+    mesh_repair(&pieces, 0, ctx)
 }
 
 #[cfg(test)]

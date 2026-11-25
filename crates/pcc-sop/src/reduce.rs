@@ -1,5 +1,6 @@
 //! Garland-Heckbert quadric error metric decimation with boundary-preserving constraint planes.
 
+use crate::common::require_only_polygons;
 use crate::common::{D3, OrdF64, SopContext, cross, distance, dot, lerp, normalized, sub};
 use crate::trimesh::TriMesh;
 use pcc_geo::{GeoDetail, GeoError};
@@ -133,6 +134,7 @@ pub fn poly_reduce(
     if !(target_ratio.is_finite() && target_ratio > 0.0 && target_ratio <= 1.0) {
         return Err(GeoError::InvalidTopology);
     }
+    require_only_polygons(geo)?;
     let mut mesh = TriMesh::from_geo(geo, ctx)?;
     ctx.check_output(mesh.verts.len() * 8, mesh.live_tris * 12)?;
     let target = ((mesh.live_tris as f64 * target_ratio).ceil() as usize).max(4);

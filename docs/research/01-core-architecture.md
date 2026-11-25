@@ -1,5 +1,7 @@
 # 01 — Core Engine Architecture
 
+> **Superseded as a specification (2026-11-11).** [`../ARCHITECTURE.md`](../ARCHITECTURE.md) is normative, including over the "normative" audit addendum below. This document is background. It describes much that is not built, and [ADR 017](../adr/017-architecture-revision.md) lists the parts deliberately not adopted (`u64` indices, aligned page allocation, roaring groups, inverse-command undo).
+
 > **Scope:** Node-graph execution engine, in-memory geometry representation (`GeoDetail`), multithreading & determinism, out-of-core caching, undo/redo, scene serialization, plugin ABI, and the root command bus that unifies UI, CLI, Python, and MCP.
 
 ---

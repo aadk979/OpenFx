@@ -1105,15 +1105,9 @@ impl GeoDetail {
         area.min(f64::from(f32::MAX)) as f32
     }
 
-    /// Computes enclosed volume of polygon faces using the Divergence Theorem:
-    /// $V = \left|\frac{1}{6} \sum \mathbf{p}_0 \cdot (\mathbf{p}_k \times \mathbf{p}_{k+1})\right|$.
-    ///
-    /// Summed in double precision about the middle of the bounds. Measured about the world
-    /// origin in single precision, the terms cancel badly for a small shape far away: a unit cube
-    /// 65,536 units out measured 65,536. A total beyond `f32` saturates rather than turning
-    /// infinite.
-    #[must_use]
-    pub fn enclosed_volume(&self) -> f32 {
+    /// Computes six times the signed enclosed volume of polygon faces in double precision about
+    /// `measure_origin()`. Positive for outward right-handed shells, negative for inward ones.
+    fn signed_six_volume(&self) -> f64 {
         let mut signed_six_vol = 0.0f64;
         self.for_each_fan_triangle(self.measure_origin(), |[a, b, c]| {
             let cross = [
@@ -1123,7 +1117,21 @@ impl GeoDetail {
             ];
             signed_six_vol += a[0] * cross[0] + a[1] * cross[1] + a[2] * cross[2];
         });
-        (signed_six_vol / 6.0).abs().min(f64::from(f32::MAX)) as f32
+        signed_six_vol
+    }
+
+    /// Computes enclosed volume of polygon faces using the Divergence Theorem:
+    /// $V = \left|\frac{1}{6} \sum \mathbf{p}_0 \cdot (\mathbf{p}_k \times \mathbf{p}_{k+1})\right|$.
+    ///
+    /// Summed in double precision about the middle of the bounds. Measured about the world
+    /// origin in single precision, the terms cancel badly for a small shape far away: a unit cube
+    /// 65,536 units out measured 65,536. A total beyond `f32` saturates rather than turning
+    /// infinite.
+    #[must_use]
+    pub fn enclosed_volume(&self) -> f32 {
+        (self.signed_six_volume() / 6.0)
+            .abs()
+            .min(f64::from(f32::MAX)) as f32
     }
 
     pub fn compute_normals(&self, memory_limit: usize) -> Result<Self, GeoError> {
@@ -3781,6 +3789,51 @@ mod tests {
         let cube = cube_at(0.0, 1e10)?;
         assert!((f64::from(cube.surface_area()) / 6e20 - 1.0).abs() < 1e-6);
         assert!((f64::from(cube.enclosed_volume()) / 1e30 - 1.0).abs() < 1e-6);
+        Ok(())
+    }
+
+    #[test]
+    fn measure_origin_fan_triangles_tilted_area_and_signed_volume_are_exact() -> Result<(), GeoError>
+    {
+        // Asymmetric box with distinct midpoints on every axis.
+        let asym = GeoDetail::points(vec![
+            Vec3::checked(2.0, 4.0, 6.0)?,
+            Vec3::checked(10.0, 14.0, 20.0)?,
+        ]);
+        assert_eq!(asym.measure_origin(), [6.0, 9.0, 13.0]);
+        assert_eq!(GeoDetail::points(Vec::new()).measure_origin(), [0.0; 3]);
+
+        // Fan triangle emission subtracts the supplied origin on every axis.
+        let tilted = GeoDetail::points(vec![
+            Vec3::checked(1.0, 2.0, 3.0)?,
+            Vec3::checked(2.0, 4.0, 6.0)?,
+            Vec3::checked(5.0, 3.0, 5.0)?,
+        ])
+        .with_primitives(
+            vec![PrimRun {
+                kind: PrimKind::Polygon,
+                arity: 3,
+                prim_count: 1,
+            }],
+            vec![0, 1, 2],
+        )?;
+        let mut emitted = Vec::new();
+        tilted.for_each_fan_triangle([1.0, 2.0, 3.0], |tri| emitted.push(tri));
+        assert_eq!(
+            emitted,
+            vec![[[0.0, 0.0, 0.0], [1.0, 2.0, 3.0], [4.0, 1.0, 2.0]]]
+        );
+
+        // Tilted triangle has non-zero cross-product components on all 3 axes:
+        // e1 = (1, 2, 3), e2 = (4, 1, 2) => e1 x e2 = (1, 10, -7), |cross| = sqrt(150).
+        let expected_area = (0.5 * 150.0_f64.sqrt()) as f32;
+        assert!((tilted.surface_area() - expected_area).abs() < 1e-5);
+
+        // Outward cube has positive signed volume; reversed cube has negative signed volume.
+        let cube = cube_at(0.0, 2.0)?;
+        assert!((cube.signed_six_volume() - 48.0).abs() < 1e-6);
+        let flipped = cube.with_reversed_winding()?;
+        assert!((flipped.signed_six_volume() + 48.0).abs() < 1e-6);
         Ok(())
     }
 }

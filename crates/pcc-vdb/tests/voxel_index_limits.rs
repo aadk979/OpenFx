@@ -41,10 +41,11 @@ fn geometry_beyond_the_voxel_index_range_is_refused() -> Result<(), GeoError> {
         voxelize(&shell(1e10, 4096.0)?, 0.25),
         Err(GeoError::LimitExceeded)
     );
-    // Exactly at the limit is refused too: the bound is exclusive.
-    let limit = (i32::MAX / 2) as f32;
+    // Exactly at the exclusive bound (|index| == 1 << 30):
+    // bmin = -2^29 with voxel_size = 0.5 gives min_v = -2^30 while max_v = -2^30 + 128.
+    let exact_edge = -((1_u32 << 29) as f32);
     assert_eq!(
-        voxelize(&shell(limit, 4.0)?, 1.0),
+        voxelize(&shell(exact_edge, 64.0)?, 0.5),
         Err(GeoError::LimitExceeded)
     );
     Ok(())

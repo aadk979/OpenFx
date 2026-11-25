@@ -749,4 +749,97 @@ mod tests {
         assert!(!Status::Rejected.is_failure() && !Status::TimedOut.is_failure());
         assert_eq!(Status::parse("nonsense"), None);
     }
+
+    #[test]
+    fn repair_oracle_and_summary_catch_pinched_growth_and_report_counts() -> Result<(), GeoError> {
+        let closed = polygons(&CORNERS, &TETRAHEDRON)?;
+        let facts = input_facts(&closed);
+        assert_eq!(repair_violation(&closed, &closed, facts, &closed), None);
+        // Zero-area input (point cloud) must not trip the area-growth check (`0.0 > 0.0` is false).
+        let cloud = GeoDetail::points(vec![Vec3::ZERO]);
+        assert_eq!(
+            repair_violation(&cloud, &cloud, input_facts(&cloud), &cloud),
+            None
+        );
+
+        // Pinched vertex with manifold edges must be caught by `repair_violation`.
+        let mut points = CORNERS.to_vec();
+        points.extend_from_slice(&[[-1., 0., 0.], [0., -1., 0.], [0., 0., -1.]]);
+        let pinched = polygons(
+            &points,
+            &[
+                [0, 2, 1],
+                [0, 1, 3],
+                [1, 2, 3],
+                [0, 3, 2],
+                [0, 5, 4],
+                [0, 4, 6],
+                [4, 5, 6],
+                [0, 6, 5],
+            ],
+        )?;
+        assert!(
+            repair_violation(&pinched, &pinched, input_facts(&pinched), &pinched)
+                .is_some_and(|msg| msg.contains("1 points"))
+        );
+
+        // Area growth above the 0.1% slack is rejected; equal area is accepted.
+        // Same vertex positions as `closed`, plus one extra small shell increasing total area.
+        let mut extra_pts = CORNERS.to_vec();
+        extra_pts.extend_from_slice(&[
+            [2.0, 0.0, 0.0],
+            [2.1, 0.0, 0.0],
+            [2.0, 0.1, 0.0],
+            [2.0, 0.0, 0.1],
+        ]);
+        let larger_same_prefix = polygons(
+            &extra_pts,
+            &[
+                [0, 2, 1],
+                [0, 1, 3],
+                [1, 2, 3],
+                [0, 3, 2],
+                [4, 6, 5],
+                [4, 5, 7],
+                [5, 6, 7],
+                [4, 7, 6],
+            ],
+        )?;
+        assert!(
+            repair_violation(&larger_same_prefix, &closed, facts, &larger_same_prefix)
+                .is_some_and(|msg| msg.contains("area grew"))
+        );
+
+        // A clean closed input must not be changed, while a pinched closed input is allowed to change.
+        let closed_reversed = closed.with_reversed_winding()?;
+        assert!(
+            repair_violation(&closed_reversed, &closed, facts, &closed_reversed)
+                .is_some_and(|msg| msg.contains("clean input was changed"))
+        );
+        let cancelled = AtomicBool::new(false);
+        let ctx = SopContext::new(MEMORY_LIMIT, &cancelled);
+        let repaired_pinched = mesh_repair(&pinched, 0, &ctx)?;
+        assert_eq!(
+            repair_violation(
+                &repaired_pinched,
+                &pinched,
+                input_facts(&pinched),
+                &repaired_pinched
+            ),
+            None
+        );
+
+        // Running `mesh_repair` through `dispatch` on a doubled tetrahedron succeeds and records
+        // `repair_summary` details.
+        let mut doubled_faces = TETRAHEDRON.to_vec();
+        doubled_faces.push(TETRAHEDRON[0]);
+        let doubled = polygons(&CORNERS, &doubled_faces)?;
+        let out = run_operator("mesh_repair", &doubled, input_facts(&doubled), &cancelled);
+        assert_eq!(out.status, Status::Ok);
+        assert!(out.detail.contains("area_kept="), "{}", out.detail);
+        assert!(out.detail.contains("duplicate_faces=1"), "{}", out.detail);
+        let summary = repair_summary(&closed, &closed);
+        assert!(summary.starts_with("area_kept=1.000000"), "{summary}");
+        Ok(())
+    }
 }

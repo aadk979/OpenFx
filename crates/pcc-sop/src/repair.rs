@@ -11,7 +11,7 @@ use crate::common::{
 use pcc_geo::{
     AttrDomain, AttributeColumn, GeoDetail, GeoError, GroupDomain, PrimKind, TopologyIndex,
 };
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::ops::Range;
 
 /// Largest hole that can be filled: the triangulation costs the cube of its edge count.
@@ -22,6 +22,11 @@ pub const FILLED_GROUP: &str = "repair_filled";
 
 const NO_POINT: u32 = u32::MAX;
 const NO_SIDE: u32 = u32::MAX;
+
+fn is_clean_manifold(geo: &GeoDetail) -> bool {
+    let topology = TopologyIndex::build(geo);
+    topology.is_manifold() && topology.non_manifold_vertex_count(geo) == 0
+}
 
 /// One polygon being repaired, and where its data came from in the input.
 struct Face {
@@ -154,8 +159,7 @@ pub fn mesh_repair(
     }
     let out = report.write(build_output(geo, &built, &sources, ctx)?)?;
 
-    let topology = TopologyIndex::build(&out);
-    if !topology.is_manifold() || topology.non_manifold_vertex_count(&out) != 0 {
+    if !is_clean_manifold(&out) {
         return Err(GeoError::InvalidTopology);
     }
     Ok(out)
@@ -222,14 +226,8 @@ fn remove_repeated(
     let mut order: Vec<usize> = (0..faces.len()).collect();
     order.sort_unstable_by(|&a, &b| keys[a].cmp(&keys[b]).then(a.cmp(&b)));
     let mut keep = vec![true; faces.len()];
-    let mut start = 0usize;
-    while start < order.len() {
-        ctx.poll_every(start)?;
-        let mut end = start + 1;
-        while end < order.len() && keys[order[end]] == keys[order[start]] {
-            end += 1;
-        }
-        let group = &order[start..end];
+    for (group_index, group) in order.chunk_by(|&a, &b| keys[a] == keys[b]).enumerate() {
+        ctx.poll_every(group_index)?;
         if let [first, rest @ ..] = group
             && !rest.is_empty()
         {
@@ -239,19 +237,21 @@ fn remove_repeated(
                 .collect();
             let forward = same.iter().filter(|&&is_same| is_same).count();
             let backward = group.len() - forward;
-            if forward == backward {
-                report.back_to_back += group.len();
-                group.iter().for_each(|&face| keep[face] = false);
-            } else {
-                report.duplicate += group.len() - 1;
-                let majority = forward > backward;
-                let survivor = same.iter().position(|&is_same| is_same == majority);
-                for (at, &face) in group.iter().enumerate() {
-                    keep[face] = Some(at) == survivor;
+            match forward.cmp(&backward) {
+                std::cmp::Ordering::Equal => {
+                    report.back_to_back += group.len();
+                    group.iter().for_each(|&face| keep[face] = false);
+                }
+                ordering => {
+                    report.duplicate += group.len() - 1;
+                    let majority = ordering == std::cmp::Ordering::Greater;
+                    let survivor = same.iter().position(|&is_same| is_same == majority);
+                    for (at, &face) in group.iter().enumerate() {
+                        keep[face] = Some(at) == survivor;
+                    }
                 }
             }
         }
-        start = end;
     }
     Ok(faces
         .into_iter()
@@ -266,10 +266,14 @@ fn build_sides(faces: &[Face]) -> Vec<Side> {
         let count = face.points.len();
         for k in 0..count {
             let (from, to) = (face.points[k], face.points[(k + 1) % count]);
+            let (lo, hi, forward) = match from.cmp(&to) {
+                std::cmp::Ordering::Less => (from, to, true),
+                _ => (to, from, false),
+            };
             sides.push(Side {
-                lo: from.min(to),
-                hi: from.max(to),
-                forward: from < to,
+                lo,
+                hi,
+                forward,
                 face: index as u32,
                 corner: k as u32,
             });
@@ -281,17 +285,11 @@ fn build_sides(faces: &[Face]) -> Vec<Side> {
 
 fn edge_groups(sides: &[Side]) -> Vec<Range<usize>> {
     let mut groups = Vec::new();
-    let mut start = 0usize;
-    while start < sides.len() {
-        let mut end = start + 1;
-        while end < sides.len()
-            && sides[end].lo == sides[start].lo
-            && sides[end].hi == sides[start].hi
-        {
-            end += 1;
-        }
-        groups.push(start..end);
-        start = end;
+    let mut offset = 0usize;
+    for chunk in sides.chunk_by(|a, b| a.lo == b.lo && a.hi == b.hi) {
+        let end = offset + chunk.len();
+        groups.push(offset..end);
+        offset = end;
     }
     groups
 }
@@ -472,21 +470,31 @@ fn match_brackets(
     let mut pairs = Vec::new();
     let mut taken = vec![false; count];
     let mut open: Vec<usize> = Vec::new();
-    // Two sweeps, because a bracket can wrap past the angle where the sort began.
-    for step in 0..2 * count {
-        let at = step % count;
-        if taken[at] {
-            continue;
-        }
+    let is_closer = |at: usize| {
         let side = sides[order[at]];
-        if side.forward ^ flips[side.face as usize] ^ inverted {
+        side.forward ^ flips[side.face as usize] ^ inverted
+    };
+    // First sweep matches brackets in angular order and collects unmatched openers.
+    for at in 0..count {
+        if is_closer(at) {
             if let Some(opener) = open.pop() {
                 taken[opener] = true;
                 taken[at] = true;
                 pairs.push((order[opener] as u32, order[at] as u32));
             }
-        } else if step < count {
+        } else {
             open.push(at);
+        }
+    }
+    // Second sweep matches remaining openers with closers that wrapped past the sort seam.
+    for at in 0..count {
+        if !taken[at]
+            && is_closer(at)
+            && let Some(opener) = open.pop()
+        {
+            taken[opener] = true;
+            taken[at] = true;
+            pairs.push((order[opener] as u32, order[at] as u32));
         }
     }
     pairs
@@ -512,22 +520,19 @@ fn side_corners(side: Side, faces: &[Face], bases: &[u32]) -> (u32, u32) {
     if side.forward { (from, to) } else { (to, from) }
 }
 
-fn find(parents: &mut [u32], mut at: u32) -> u32 {
-    while parents[at as usize] != at {
-        let grandparent = parents[parents[at as usize] as usize];
-        parents[at as usize] = grandparent;
-        at = grandparent;
+fn find(parents: &mut [u32], at: u32) -> u32 {
+    let parent = parents[at as usize];
+    if parent == at {
+        return at;
     }
-    at
+    let root = find(parents, parent);
+    parents[at as usize] = root;
+    root
 }
 
 fn union(parents: &mut [u32], a: u32, b: u32) {
     let (a, b) = (find(parents, a), find(parents, b));
-    if a < b {
-        parents[b as usize] = a;
-    } else {
-        parents[a as usize] = b;
-    }
+    parents[b as usize] = a;
 }
 
 /// Gives each corner its output point: corners joined through paired edges share one, and any point
@@ -566,7 +571,7 @@ fn assign_points(
         ctx.poll()?;
         let mut parents: Vec<u32> = (0..corners as u32).collect();
         for (index, &other) in partner.iter().enumerate() {
-            if other != NO_SIDE && (index as u32) < other {
+            if other != NO_SIDE {
                 let (a_lo, a_hi) = side_corners(sides[index], faces, bases);
                 let (b_lo, b_hi) = side_corners(sides[other as usize], faces, bases);
                 union(&mut parents, a_lo, b_lo);
@@ -621,47 +626,42 @@ fn cut_clashes(
     ids: &[u32],
     side_from: &[u32],
 ) -> Clashes {
-    // (lower point, upper point, runs from lower to upper, index into sides)
-    let mut uses: Vec<(u32, u32, bool, u32)> = sides
-        .iter()
-        .enumerate()
-        .map(|(index, side)| {
-            let (lo_corner, hi_corner) = side_corners(*side, faces, bases);
-            let (a, b) = (ids[lo_corner as usize], ids[hi_corner as usize]);
-            let lower_first = a < b;
-            let forward = side.forward ^ flips[side.face as usize];
-            (a.min(b), a.max(b), forward == lower_first, index as u32)
-        })
-        .collect();
-    uses.sort_unstable_by_key(|entry| (entry.0, entry.1, entry.3));
+    // Group sides by output edge `(lo, hi)` -> `Vec<(runs_forward, side_index)>`.
+    let mut by_edge: BTreeMap<(u32, u32), Vec<(bool, u32)>> = BTreeMap::new();
+    for (index, side) in sides.iter().enumerate() {
+        let (lo_corner, hi_corner) = side_corners(*side, faces, bases);
+        let (a, b) = (ids[lo_corner as usize], ids[hi_corner as usize]);
+        let (lo, hi, same_order) = match a.cmp(&b) {
+            std::cmp::Ordering::Less => (a, b, true),
+            _ => (b, a, false),
+        };
+        let forward = side.forward ^ flips[side.face as usize] ^ same_order;
+        by_edge
+            .entry((lo, hi))
+            .or_default()
+            .push((forward, index as u32));
+    }
     let mut found = false;
     let mut cut = false;
-    let mut start = 0usize;
-    while start < uses.len() {
-        let mut end = start + 1;
-        while end < uses.len() && uses[end].0 == uses[start].0 && uses[end].1 == uses[start].1 {
-            end += 1;
-        }
-        let group = &uses[start..end];
-        let clean = group.len() == 1 || (group.len() == 2 && group[0].2 != group[1].2);
+    for group in by_edge.values() {
+        let clean = group.len() == 1 || (group.len() == 2 && group[0].0 != group[1].0);
         if !clean {
             found = true;
             let kept = group
                 .iter()
-                .find(|entry| {
-                    let other = partner[entry.3 as usize];
-                    group.iter().any(|candidate| candidate.3 == other)
+                .find(|&&(_, side_idx)| {
+                    let other = partner[side_idx as usize];
+                    group.iter().any(|&(_, candidate)| candidate == other)
                 })
-                .map_or(group[0].3, |entry| entry.3);
+                .map_or(group[0].1, |&(_, side_idx)| side_idx);
             let kept_partner = partner[kept as usize];
-            for entry in group {
-                if entry.3 != kept && entry.3 != kept_partner {
-                    let side = sides[entry.3 as usize];
+            for &(_, side_idx) in group {
+                if side_idx != kept && side_idx != kept_partner {
+                    let side = sides[side_idx as usize];
                     cut |= drop_other_join(side, faces, partner, bases, side_from);
                 }
             }
         }
-        start = end;
     }
     match (found, cut) {
         (false, _) => Clashes::None,
@@ -828,14 +828,9 @@ fn find_boundary(built: &Built) -> Vec<BoundaryEdge> {
     }
     uses.sort_unstable();
     let mut boundary = Vec::new();
-    let mut start = 0usize;
-    while start < uses.len() {
-        let mut end = start + 1;
-        while end < uses.len() && uses[end].0 == uses[start].0 && uses[end].1 == uses[start].1 {
-            end += 1;
-        }
-        if end == start + 1 {
-            let (face, corner) = (uses[start].2 as usize, uses[start].3 as usize);
+    for group in uses.chunk_by(|a, b| (a.0, a.1) == (b.0, b.1)) {
+        if let [only] = group {
+            let (face, corner) = (only.2 as usize, only.3 as usize);
             let points = &built.faces[face];
             boundary.push(BoundaryEdge {
                 from: points[corner],
@@ -844,7 +839,6 @@ fn find_boundary(built: &Built) -> Vec<BoundaryEdge> {
                 vertex: built.vertex_sources[built.vertex_starts[face] + corner],
             });
         }
-        start = end;
     }
     boundary
 }
@@ -872,9 +866,7 @@ fn fill_one_hole(
     ctx.check_output(area_cells, area_cells)?;
     let points: Vec<D3> = chain.iter().map(|edge| position_of(edge.from)).collect();
     let usable = |i: usize, k: usize, edges: &HashSet<(u32, u32)>| {
-        k == i + 1
-            || (i == 0 && k == count - 1)
-            || !edges.contains(&edge_key(chain[i].from, chain[k].from))
+        (i == 0 && k == count - 1) || !edges.contains(&edge_key(chain[i].from, chain[k].from))
     };
     // cost[i][k] is the least area spanning corners i to k; choice holds the corner achieving it.
     let mut cost = vec![0.0f64; area_cells];
@@ -906,7 +898,10 @@ fn fill_one_hole(
         return Ok(false);
     }
     let mut stack = vec![(0usize, count - 1)];
-    while let Some((i, k)) = stack.pop() {
+    for _ in 0..area_cells {
+        let Some((i, k)) = stack.pop() else {
+            break;
+        };
         if k <= i + 1 {
             continue;
         }
@@ -1010,4 +1005,623 @@ fn build_output(
         out = out.with_group(GroupDomain::Prim, FILLED_GROUP, &filled)?;
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pcc_geo::PrimRun;
+    use pcc_math::Vec3;
+    use std::sync::atomic::AtomicBool;
+
+    fn poly_geo(points: &[[f32; 3]], faces: &[&[u32]]) -> Result<GeoDetail, GeoError> {
+        let positions = points
+            .iter()
+            .map(|p| Vec3::checked(p[0], p[1], p[2]))
+            .collect::<Result<Vec<_>, _>>()?;
+        let runs: Vec<PrimRun> = faces
+            .iter()
+            .map(|f| PrimRun {
+                kind: PrimKind::Polygon,
+                arity: f.len() as u32,
+                prim_count: 1,
+            })
+            .collect();
+        let verts: Vec<u32> = faces.iter().flat_map(|f| f.iter().copied()).collect();
+        GeoDetail::points(positions).with_primitives(runs, verts)
+    }
+
+    #[test]
+    fn clean_manifold_checks_both_edges_and_pinched_vertices() -> Result<(), GeoError> {
+        let tet = poly_geo(
+            &[[0., 0., 0.], [1., 0., 0.], [0., 1., 0.], [0., 0., 1.]],
+            &[&[0, 2, 1], &[0, 1, 3], &[1, 2, 3], &[0, 3, 2]],
+        )?;
+        assert!(is_clean_manifold(&tet));
+
+        // Three triangles sharing edge (0, 1): non-manifold edge, no pinched vertex.
+        let three_fins = poly_geo(
+            &[
+                [0., 0., 0.],
+                [1., 0., 0.],
+                [0., 1., 0.],
+                [0., -1., 0.],
+                [0., 0., 1.],
+            ],
+            &[&[0, 1, 2], &[1, 0, 3], &[0, 1, 4]],
+        )?;
+        assert!(!is_clean_manifold(&three_fins));
+
+        // Two tetrahedra meeting only at origin: all edges manifold, origin pinched.
+        let pinched = poly_geo(
+            &[
+                [0., 0., 0.],
+                [1., 0., 0.],
+                [0., 1., 0.],
+                [0., 0., 1.],
+                [-1., 0., 0.],
+                [0., -1., 0.],
+                [0., 0., -1.],
+            ],
+            &[
+                &[0, 2, 1],
+                &[0, 1, 3],
+                &[1, 2, 3],
+                &[0, 3, 2],
+                &[0, 5, 4],
+                &[0, 4, 6],
+                &[4, 5, 6],
+                &[0, 6, 5],
+            ],
+        )?;
+        assert!(!is_clean_manifold(&pinched));
+        Ok(())
+    }
+
+    #[test]
+    fn same_direction_and_orient_tie_preserve_first_face_winding() -> Result<(), GeoError> {
+        assert!(same_direction(&[0, 1, 2, 3], &[2, 3, 0, 1]));
+        assert!(!same_direction(&[0, 1, 2, 3], &[0, 3, 2, 1]));
+        assert!(same_direction(&[0, 1, 2], &[1, 2, 0]));
+        assert!(!same_direction(&[0, 1, 2], &[0, 2, 1]));
+
+        // Two equal-area triangles sharing edge (0, 1) with conflicting windings: tie keeps
+        // face 0's original winding (`flipped == kept` must NOT invert the patch).
+        let geo = poly_geo(
+            &[[0., 0., 0.], [1., 0., 0.], [0., 1., 0.], [0., -1., 0.]],
+            &[&[0, 1, 2], &[0, 1, 3]],
+        )?;
+        let cancel = AtomicBool::new(false);
+        let repaired = mesh_repair(&geo, 0, &SopContext::new(1 << 20, &cancel))?;
+        assert_eq!(repaired.vertex_point(0), Some(0));
+        assert_eq!(repaired.vertex_point(1), Some(1));
+        assert_eq!(repaired.vertex_point(2), Some(2));
+        Ok(())
+    }
+
+    #[test]
+    fn match_brackets_and_pair_around_edge_wrap_and_prefer_same_patch() {
+        // Four sides around edge (0, 1) in angular order: [F0, B1, F2, B3].
+        // With inverted=false: B opens, F closes -> B1 pairs with F2, and B3 wraps to F0!
+        let sides = vec![
+            Side {
+                lo: 0,
+                hi: 1,
+                forward: true,
+                face: 0,
+                corner: 0,
+            },
+            Side {
+                lo: 0,
+                hi: 1,
+                forward: false,
+                face: 1,
+                corner: 0,
+            },
+            Side {
+                lo: 0,
+                hi: 1,
+                forward: true,
+                face: 2,
+                corner: 0,
+            },
+            Side {
+                lo: 0,
+                hi: 1,
+                forward: false,
+                face: 3,
+                corner: 0,
+            },
+        ];
+        let order = [0, 1, 2, 3];
+        let flips = [false; 4];
+        let solid = match_brackets(&sides, &order, &flips, false);
+        assert_eq!(solid, vec![(1, 2), (3, 0)]);
+        let inverted = match_brackets(&sides, &order, &flips, true);
+        assert_eq!(inverted, vec![(0, 1), (2, 3)]);
+        // An unmatched opener at index 0 must NOT pair with itself on the second sweep.
+        let unmatched = match_brackets(&sides, &[1, 3, 2], &flips, false);
+        assert_eq!(unmatched, vec![(3, 2)]);
+
+        // Now verify `pair_around_edge`: 4 triangles around the Z-axis (0,0,0)->(0,0,1)
+        // at angles 0, 90, 180, 270 degrees.
+        let positions: Vec<D3> = vec![
+            [0.0, 0.0, 0.0],
+            [0.0, 0.0, 1.0],
+            [1.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0],
+            [-1.0, 0.0, 0.0],
+            [0.0, -1.0, 0.0],
+        ];
+        let faces = vec![
+            Face {
+                prim: 0,
+                points: vec![0, 1, 2],
+                vertices: vec![0, 1, 2],
+            },
+            Face {
+                prim: 1,
+                points: vec![1, 0, 3],
+                vertices: vec![3, 4, 5],
+            },
+            Face {
+                prim: 2,
+                points: vec![0, 1, 4],
+                vertices: vec![6, 7, 8],
+            },
+            Face {
+                prim: 3,
+                points: vec![1, 0, 5],
+                vertices: vec![9, 10, 11],
+            },
+        ];
+        // When patches match `inverted` ((0,1) same patch, (2,3) same patch), choose inverted.
+        let oriented_inv = Oriented {
+            flips: vec![false; 4],
+            patches: vec![0, 0, 1, 1],
+            conflicts: vec![false],
+        };
+        let mut pairs_inv = Vec::new();
+        pair_around_edge(
+            &faces,
+            &sides,
+            0..4,
+            &oriented_inv,
+            &positions,
+            &mut pairs_inv,
+        );
+        assert_eq!(pairs_inv.len(), 2);
+        let pair_patches: Vec<(u32, u32)> = pairs_inv
+            .iter()
+            .map(|&(a, b)| {
+                (
+                    oriented_inv.patches[a as usize],
+                    oriented_inv.patches[b as usize],
+                )
+            })
+            .collect();
+        assert!(pair_patches.iter().all(|&(pa, pb)| pa == pb));
+
+        // On an exact tie (all distinct patches: 0 vs 0 within-patch pairs), choose `solid`.
+        let oriented_tie = Oriented {
+            flips: vec![false; 4],
+            patches: vec![0, 1, 2, 3],
+            conflicts: vec![false],
+        };
+        let mut pairs_tie = Vec::new();
+        pair_around_edge(
+            &faces,
+            &sides,
+            0..4,
+            &oriented_tie,
+            &positions,
+            &mut pairs_tie,
+        );
+        assert_eq!(pairs_tie.len(), 2);
+        assert_ne!(pairs_tie, pairs_inv);
+    }
+
+    #[test]
+    fn cut_clashes_and_drop_other_join_resolve_unpaired_shared_edges() {
+        // Put the UNPAIRED clashing face FIRST (face 0: [0,1,4]) and the PAIRED manifold faces
+        // after it (face 1: [0,1,2] and face 2: [1,0,3]) so `cut_clashes` must locate the paired
+        // faces rather than falling back to `group[0]`.
+        let faces = vec![
+            Face {
+                prim: 0,
+                points: vec![0, 1, 4],
+                vertices: vec![0, 1, 2],
+            },
+            Face {
+                prim: 1,
+                points: vec![0, 1, 2],
+                vertices: vec![3, 4, 5],
+            },
+            Face {
+                prim: 2,
+                points: vec![1, 0, 3],
+                vertices: vec![6, 7, 8],
+            },
+        ];
+        let bases = vec![0, 3, 6];
+        let sides = build_sides(&faces);
+        let mut side_from = vec![NO_SIDE; 9];
+        for (index, side) in sides.iter().enumerate() {
+            side_from[(bases[side.face as usize] + side.corner) as usize] = index as u32;
+        }
+        let s_f0_01 = side_from[0];
+        let s_f0_40 = side_from[2];
+        let s_f1_01 = side_from[3];
+        let s_f1_20 = side_from[5];
+        let s_f2_10 = side_from[6];
+        let s_f2_03 = side_from[7];
+        let s_f2_31 = side_from[8];
+
+        // Partner (f1, f2) on edge (0,1), partner f0's edge (4,0) with an unrelated edge (f2's
+        // (3,1)), and partner f1's edge (2,0) with f2's (0,3) so cutting `kept` instead of f0
+        // would cut a completely different edge.
+        let mut partner = vec![NO_SIDE; sides.len()];
+        partner[s_f1_01 as usize] = s_f2_10;
+        partner[s_f2_10 as usize] = s_f1_01;
+        partner[s_f0_40 as usize] = s_f2_31;
+        partner[s_f2_31 as usize] = s_f0_40;
+        partner[s_f1_20 as usize] = s_f2_03;
+        partner[s_f2_03 as usize] = s_f1_20;
+
+        let ids = vec![0, 1, 4, 0, 1, 2, 1, 0, 3];
+        let flips = vec![false; 3];
+        let result = cut_clashes(
+            &faces,
+            &sides,
+            &mut partner,
+            &flips,
+            &bases,
+            &ids,
+            &side_from,
+        );
+        assert!(matches!(result, Clashes::Cut));
+        // The paired manifold edge (f1, f2) and f1's own join stayed intact; f0's join was cut!
+        assert_eq!(partner[s_f1_01 as usize], s_f2_10);
+        assert_eq!(partner[s_f2_10 as usize], s_f1_01);
+        assert_eq!(partner[s_f1_20 as usize], s_f2_03);
+        assert_eq!(partner[s_f0_40 as usize], NO_SIDE);
+        assert_eq!(partner[s_f2_31 as usize], NO_SIDE);
+
+        // Two-face clean edge vs two-face same-winding clash where `ids` reverses `(a, b)` order
+        // on one face (`a < b` vs `a > b`).
+        let two_faces = vec![
+            Face {
+                prim: 0,
+                points: vec![0, 1, 2],
+                vertices: vec![0, 1, 2],
+            },
+            Face {
+                prim: 1,
+                points: vec![1, 0, 3],
+                vertices: vec![3, 4, 5],
+            },
+        ];
+        let two_bases = vec![0, 3];
+        let two_sides = build_sides(&two_faces);
+        let mut two_side_from = vec![NO_SIDE; 6];
+        for (index, side) in two_sides.iter().enumerate() {
+            two_side_from[(two_bases[side.face as usize] + side.corner) as usize] = index as u32;
+        }
+        let mut two_partner = vec![NO_SIDE; two_sides.len()];
+        // Corner IDs give a=5, b=2 (`a > b`) on face 0 and a=2, b=5 (`a < b`) on face 1:
+        // face 0 runs 5->2 (backward) and face 1 runs 5->2 (backward) — SAME direction = CLASH!
+        // Because neither face has any join, `cut_clashes` must detect the clash (`Stuck`).
+        let same_dir_clash_ids = vec![5, 2, 7, 5, 2, 8];
+        assert!(matches!(
+            cut_clashes(
+                &two_faces,
+                &two_sides,
+                &mut two_partner,
+                &[false, false],
+                &two_bases,
+                &same_dir_clash_ids,
+                &two_side_from,
+            ),
+            Clashes::Stuck
+        ));
+        // Opposite windings on the same reversed IDs: face 0 runs 5->2, face 1 runs 2->5 = CLEAN!
+        let opposite_dir_ids = vec![5, 2, 7, 2, 5, 8];
+        assert!(matches!(
+            cut_clashes(
+                &two_faces,
+                &two_sides,
+                &mut two_partner,
+                &[false, false],
+                &two_bases,
+                &opposite_dir_ids,
+                &two_side_from,
+            ),
+            Clashes::None
+        ));
+
+        // Test `drop_other_join` directly for a backward side (`forward == false`), for fallback
+        // to `this` at a non-zero corner (`base = 6, corner = 1`: `6+1 != 6-1 != 6*1`), and for
+        // returning `false` when neither edge is joined.
+        partner.fill(NO_SIDE);
+        partner[s_f2_03 as usize] = s_f1_20;
+        partner[s_f1_20 as usize] = s_f2_03;
+        assert!(drop_other_join(
+            sides[s_f2_10 as usize],
+            &faces,
+            &mut partner,
+            &bases,
+            &side_from,
+        ));
+        assert_eq!(partner[s_f2_03 as usize], NO_SIDE);
+
+        // Fallback to `this` on corner 1 (`s_f2_03`, where `base = 6, corner = 1`).
+        partner[s_f2_03 as usize] = s_f0_01;
+        partner[s_f0_01 as usize] = s_f2_03;
+        assert!(drop_other_join(
+            sides[s_f2_03 as usize],
+            &faces,
+            &mut partner,
+            &bases,
+            &side_from,
+        ));
+        assert_eq!(partner[s_f2_03 as usize], NO_SIDE);
+
+        // With neither joined, returns false (which turns into `Clashes::Stuck`).
+        assert!(!drop_other_join(
+            sides[s_f2_31 as usize],
+            &faces,
+            &mut partner,
+            &bases,
+            &side_from,
+        ));
+        assert!(matches!(
+            cut_clashes(
+                &faces,
+                &sides,
+                &mut partner,
+                &flips,
+                &bases,
+                &ids,
+                &side_from
+            ),
+            Clashes::Stuck
+        ));
+    }
+
+    #[test]
+    fn fill_holes_handles_split_points_and_minimum_area_pentagon() -> Result<(), GeoError> {
+        let cancel = AtomicBool::new(false);
+        let ctx = SopContext::new(1 << 24, &cancel);
+
+        // 1. Direct `fill_holes` test with a split point at `index = original_count + 2`
+        //    (`6 - 4 = 2`, whereas `6 / 4 = 1`): corner 2 of the chevron hole is split point 6
+        //    (source 2 = (0.2, 0.2, 0), giving diagonal (0, 6) and area 0.4; source 1 = (2, 0, 0)
+        //    would flip the optimal diagonal to (1, 3)).
+        let split_positions: Vec<D3> = vec![
+            [0.0, 0.0, 0.0], // 0
+            [2.0, 0.0, 0.0], // 1
+            [0.2, 0.2, 0.0], // 2
+            [0.0, 2.0, 0.0], // 3
+        ];
+        // A single reversed quad face [0, 3, 6, 1] leaves one boundary loop 0 -> 1 -> 6 -> 3 -> 0
+        // (using split point 6 -> sources[6 - 4] = sources[2] = 2).
+        let split_sources = vec![0u32, 1u32, 2u32];
+        let mut split_built = Built {
+            faces: vec![vec![0, 3, 6, 1]],
+            prim_sources: vec![0],
+            vertex_sources: vec![0, 1, 2, 3],
+            vertex_starts: vec![0],
+            kept_faces: 1,
+        };
+        let mut split_report = Report::default();
+        fill_holes(
+            &mut split_built,
+            &split_positions,
+            &split_sources,
+            8,
+            &mut split_report,
+            &ctx,
+        )?;
+        assert_eq!(split_report.filled_holes, 1);
+        assert_eq!(split_built.faces.len(), 3);
+        // Optimal diagonal on the chevron uses split point 6 paired with 0 (NOT 1 paired with 3).
+        assert!(
+            split_built.faces[1..]
+                .iter()
+                .all(|f| f.contains(&0) && f.contains(&6)),
+            "expected diagonal (0, 6), got {:?}",
+            &split_built.faces[1..]
+        );
+
+        // 2. Concave chevron quad where diagonal (0, 2) (`middle = 2`, area 0.4) strictly beats
+        //    diagonal (1, 3) (`middle = 1`, area 3.6): kills `cost[...] + area` -> `*`.
+        let chevron: Vec<D3> = vec![
+            [0.0, 0.0, 0.0],
+            [2.0, 0.0, 0.0],
+            [0.2, 0.2, 0.0],
+            [0.0, 2.0, 0.0],
+        ];
+        let quad_chain: Vec<BoundaryEdge> = (0..4)
+            .map(|i| BoundaryEdge {
+                from: i as u32,
+                to: ((i + 1) % 4) as u32,
+                prim: 0,
+                vertex: i,
+            })
+            .collect();
+        let mut built_chevron = Built {
+            faces: Vec::new(),
+            prim_sources: Vec::new(),
+            vertex_sources: Vec::new(),
+            vertex_starts: Vec::new(),
+            kept_faces: 0,
+        };
+        let mut chevron_edges: HashSet<(u32, u32)> = (0..4)
+            .map(|i| edge_key(i as u32, ((i + 1) % 4) as u32))
+            .collect();
+        let triangles = HashSet::new();
+        assert!(fill_one_hole(
+            &mut built_chevron,
+            &quad_chain,
+            &|p| chevron[p as usize],
+            &mut chevron_edges,
+            &triangles,
+            &ctx,
+        )?);
+        let chevron_area: f64 = built_chevron
+            .faces
+            .iter()
+            .map(|f| {
+                0.5 * length(cross(
+                    sub(chevron[f[1] as usize], chevron[f[0] as usize]),
+                    sub(chevron[f[2] as usize], chevron[f[0] as usize]),
+                ))
+            })
+            .sum();
+        assert!(
+            (chevron_area - 0.4).abs() < 1e-9,
+            "expected optimal chevron area 0.4, got {chevron_area}"
+        );
+
+        // 3. Flat unit square tie-break: `<` picks `middle = 1` first (`[1, 0, 3]`), while `<=`
+        //    would overwrite with `middle = 2`.
+        let square: Vec<D3> = vec![
+            [0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [1.0, 1.0, 0.0],
+            [0.0, 1.0, 0.0],
+        ];
+        let mut built_sq = Built {
+            faces: Vec::new(),
+            prim_sources: Vec::new(),
+            vertex_sources: Vec::new(),
+            vertex_starts: Vec::new(),
+            kept_faces: 0,
+        };
+        let mut sq_edges: HashSet<(u32, u32)> = (0..4)
+            .map(|i| edge_key(i as u32, ((i + 1) % 4) as u32))
+            .collect();
+        assert!(fill_one_hole(
+            &mut built_sq,
+            &quad_chain,
+            &|p| square[p as usize],
+            &mut sq_edges,
+            &triangles,
+            &ctx,
+        )?);
+        assert_eq!(built_sq.faces[0], vec![1, 0, 3]);
+
+        // 4. Unfillable 4-sided hole (both diagonals already present in `edges`): returns `false`.
+        let mut built_unfillable = Built {
+            faces: Vec::new(),
+            prim_sources: Vec::new(),
+            vertex_sources: Vec::new(),
+            vertex_starts: Vec::new(),
+            kept_faces: 0,
+        };
+        let mut all_edges: HashSet<(u32, u32)> = (0..4)
+            .map(|i| edge_key(i as u32, ((i + 1) % 4) as u32))
+            .collect();
+        all_edges.insert(edge_key(0, 2));
+        all_edges.insert(edge_key(1, 3));
+        assert!(!fill_one_hole(
+            &mut built_unfillable,
+            &quad_chain,
+            &|p| square[p as usize],
+            &mut all_edges,
+            &triangles,
+            &ctx,
+        )?);
+
+        // 5. Blocking diagonal (2, 4) on a bent pentagon forces a higher-area triangulation.
+        let pts: Vec<D3> = vec![
+            [0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [1.0, 1.0, 0.0],
+            [0.0, 1.0, 2.0],
+            [0.0, 1.0, 0.0],
+        ];
+        let chain: Vec<BoundaryEdge> = (0..5)
+            .map(|i| BoundaryEdge {
+                from: i as u32,
+                to: ((i + 1) % 5) as u32,
+                prim: 0,
+                vertex: i,
+            })
+            .collect();
+        let mut built_blocked = Built {
+            faces: Vec::new(),
+            prim_sources: Vec::new(),
+            vertex_sources: Vec::new(),
+            vertex_starts: Vec::new(),
+            kept_faces: 0,
+        };
+        let mut blocked_edges: HashSet<(u32, u32)> = (0..5)
+            .map(|i| edge_key(i as u32, ((i + 1) % 5) as u32))
+            .collect();
+        blocked_edges.insert(edge_key(2, 4));
+        assert!(fill_one_hole(
+            &mut built_blocked,
+            &chain,
+            &|p| pts[p as usize],
+            &mut blocked_edges,
+            &triangles,
+            &ctx,
+        )?);
+        let blocked_area: f64 = built_blocked
+            .faces
+            .iter()
+            .map(|f| {
+                0.5 * length(cross(
+                    sub(pts[f[1] as usize], pts[f[0] as usize]),
+                    sub(pts[f[2] as usize], pts[f[0] as usize]),
+                ))
+            })
+            .sum();
+        assert!(blocked_area > 2.1, "got {blocked_area}");
+
+        // 6. Scaled 5-sided chevron-tent where `middle = 2` has both `cost[0..2] > 1` and
+        //    `cost[2..4] > 1` (true total ~39.8, vs `m = 1` > 76), whereas replacing the first `+`
+        //    with `*` inflates `m = 2` to `3.6 * 32.6 + 3.6 > 120` and drops `m = 1` to `36.0`.
+        let scaled_pent: Vec<D3> = vec![
+            [0.0, 0.0, 0.0],
+            [6.0, 0.0, 0.0],
+            [0.6, 0.6, 0.0],
+            [0.3, 3.3, 6.0],
+            [0.0, 6.0, 0.0],
+        ];
+        let mut built_pent = Built {
+            faces: Vec::new(),
+            prim_sources: Vec::new(),
+            vertex_sources: Vec::new(),
+            vertex_starts: Vec::new(),
+            kept_faces: 0,
+        };
+        let mut pent_edges: HashSet<(u32, u32)> = (0..5)
+            .map(|i| edge_key(i as u32, ((i + 1) % 5) as u32))
+            .collect();
+        assert!(fill_one_hole(
+            &mut built_pent,
+            &chain,
+            &|p| scaled_pent[p as usize],
+            &mut pent_edges,
+            &triangles,
+            &ctx,
+        )?);
+        let pent_area: f64 = built_pent
+            .faces
+            .iter()
+            .map(|f| {
+                0.5 * length(cross(
+                    sub(scaled_pent[f[1] as usize], scaled_pent[f[0] as usize]),
+                    sub(scaled_pent[f[2] as usize], scaled_pent[f[0] as usize]),
+                ))
+            })
+            .sum();
+        assert!(
+            pent_area < 21.0,
+            "expected optimal area ~19.9, got {pent_area}"
+        );
+        Ok(())
+    }
 }

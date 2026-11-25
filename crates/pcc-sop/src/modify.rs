@@ -668,4 +668,18 @@ mod tests {
         }
         Ok(())
     }
+
+    #[test]
+    fn degenerate_quad_falls_back_to_fan_triangulation() {
+        let points = [
+            [0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [2.0, 0.0, 0.0],
+            [3.0, 0.0, 0.0],
+        ];
+        assert_eq!(
+            triangulate_corners(&points, &[0, 1, 2, 3]),
+            vec![[0, 1, 2], [0, 2, 3]]
+        );
+    }
 }

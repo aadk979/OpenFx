@@ -100,7 +100,7 @@ impl VdbOps for VdbGrid {
         // voxels and its extent would overflow. Half the index range leaves room for neighbours.
         let voxel_index = |value: f32, round: fn(f64) -> f64| -> Result<i32, GeoError> {
             let index = round(f64::from(value) / f64::from(voxel_size));
-            if index.abs() < f64::from(i32::MAX / 2) {
+            if index.abs() < f64::from(1_i32 << 30) {
                 Ok(index as i32)
             } else {
                 Err(GeoError::LimitExceeded)
